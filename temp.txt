@@ -1,0 +1,15 @@
+.gitignore
+LICENSE
+README.md
+app.js
+data/proxy.db
+data/proxy.db-shm
+data/proxy.db-wal
+package-lock.json
+package.json
+proxyServer.js
+public/css/index.css
+public/index.html
+public/js/index.js
+version.js
+version.txt

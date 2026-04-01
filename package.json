@@ -1,0 +1,58 @@
+{
+  "name": "zwfw-load",
+  "version": "1.1.4",
+  "description": "代理负载均衡管理系统",
+  "main": "app.js",
+  "scripts": {
+    "start": "node app.js",
+    "dev": "nodemon app.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "proxy",
+    "load-balancer",
+    "socks",
+    "http-proxy"
+  ],
+  "author": "linmew",
+  "license": "MIT",
+  "bin": "app.js",
+  "pkg": {
+    "targets": [
+      "node18-win-x64",
+      "node18-macos-x64",
+      "node18-linux-x64"
+    ],
+    "outputPath": "dist",
+    "assets": [
+      "public/**/*",
+      "data/**/*",
+      "node_modules/axios/package.json"
+    ],
+    "binaries": [
+      "node_modules/sqlite3/build/**/node_sqlite3.node"
+    ],
+    "scripts": [
+      "node_modules/axios/**/axios.cjs",
+      "node_modules/axios/index.js"
+    ]
+  },
+  "dependencies": {
+    "@yao-pkg/pkg-fetch": "^3.5.31",
+    "axios": "^1.11.0",
+    "compression": "^1.8.1",
+    "express": "^5.1.0",
+    "hpagent": "^1.2.0",
+    "socks": "^2.8.7",
+    "socks-proxy-agent": "^8.0.5",
+    "sqlite": "^5.1.1",
+    "sqlite3": "^5.1.7",
+    "ws": "^8.18.3"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.10"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

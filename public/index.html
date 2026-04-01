@@ -1,0 +1,720 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="api-base" content="" />
+    <title>代理配置管理系统</title>
+    <meta name="description" content="基于Express的代理智能负载系统，支持HTTP/SOCKS代理配置、负载均衡、健康检查及数据可视化。" />
+    <!-- 预连接到关键域名，减少DNS查询时间 -->
+    <link rel="preconnect" href="https://paimons.cn" />
+    <link rel="dns-prefetch" href="https://paimons.cn" />
+    <!-- 预加载关键CSS，提升LCP -->
+    <link rel="preload" href="https://paimons.cn/common/fontawesome/css/all.css" as="style" />
+    <link rel="preload" href="css/index.css" as="style" />
+    <!-- 站点图标异步加载 -->
+    <link rel="icon" type="image/x-icon" href="https://paimons.cn/tools/tamper/favicon_zj.png" />
+    <!-- 延迟加载非关键CSS -->
+    <link rel="stylesheet" href="https://paimons.cn/common/fontawesome/css/all.css" media="print" onload="this.media='all'" />
+    <noscript><link rel="stylesheet" href="https://paimons.cn/common/fontawesome/css/all.css" /></noscript>
+
+    <link rel="stylesheet" href="css/index.css" />
+    <script src="https://paimons.cn/common/js/tailwind.js"></script>
+    <!-- ECharts -->
+    <script src="https://paimons.cn/common/js/echarts/echarts.min.js"></script>
+    <!-- SweetAlert2 -->
+    <script src="https://paimons.cn/common/js/sweetalert2.min.js"></script>
+  </head>
+  <body class="bg-gray-50">
+    <div class="flex h-screen">
+      <!-- 侧边栏 -->
+      <div class="w-64 bg-white shadow-lg flex flex-col">
+        <div class="p-5 border-b">
+          <h1 class="text-xl font-bold text-gray-800">
+            <i class="fas fa-network-wired mr-2 text-blue-500"></i>
+            代理管理系统
+          </h1>
+        </div>
+        <nav class="flex-1 py-4">
+          <div class="sidebar-item active" onclick="showSection('proxy-list')">
+            <i class="fas fa-server"></i>
+            <span>代理配置</span>
+          </div>
+          <div class="sidebar-item" onclick="showSection('dns-mappings')">
+            <i class="fas fa-network-wired"></i>
+            <span>DNS映射</span>
+          </div>
+          <div class="sidebar-item" onclick="showSection('test-settings')">
+            <i class="fas fa-balance-scale"></i>
+            <span>负载设置</span>
+          </div>
+          <div class="sidebar-item" onclick="showSection('advanced-config')">
+            <i class="fas fa-cog"></i>
+            <span>高级配置</span>
+          </div>
+          <div class="sidebar-item" onclick="showSection('system-status')">
+            <i class="fas fa-chart-line"></i>
+            <span>系统状态</span>
+          </div>
+        </nav>
+        <div class="p-4 border-t">
+          <div class="text-xs text-gray-500 space-y-1">
+            <div>
+              <i class="fas fa-plug mr-1"></i>
+              服务端口: <span id="proxy-port-display">5678</span>
+            </div>
+            <div>
+              <i class="fas fa-code-branch mr-1"></i>
+              版本: <span id="version-display">加载中...</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 主内容区 -->
+      <div class="flex-1 flex flex-col">
+        <!-- 顶部导航栏 -->
+        <header class="bg-white shadow-sm border-b px-6 py-4">
+          <div class="flex justify-between items-center">
+            <h2 class="text-lg font-semibold text-gray-800" id="page-title">代理配置管理</h2>
+            <div class="flex items-center space-x-4">
+              <span class="text-sm text-gray-600" id="status-indicator">
+                <i class="fas fa-circle text-green-500 text-xs mr-1"></i>
+                系统运行中
+              </span>
+              <button onclick="refreshProxyList()" class="btn-primary"><i class="fas fa-sync-alt mr-1"></i>刷新</button>
+            </div>
+          </div>
+        </header>
+
+        <!-- 内容区域 -->
+        <main class="flex-1 p-6 overflow-auto">
+          <!-- 代理列表区域 -->
+          <div id="proxy-list" class="section">
+            <div class="mb-6 flex flex-wrap items-center gap-3">
+              <button onclick="showAddProxyModal()" class="btn-primary"><i class="fas fa-plus mr-2"></i>新增代理配置</button>
+              <button id="batch-test-btn" onclick="testAllProxies()" class="btn-success">
+                <i class="fas fa-bolt mr-2"></i>一键连通性测试
+              </button>
+              <div class="filter-tabs" id="proxy-filter-tabs">
+                <button class="filter-tab active" type="button" data-filter="all" onclick="applyProxyFilter('all')">
+                  <span class="filter-tab-label">全部</span>
+                  <span class="filter-tab-count" data-count-for="all">0</span>
+                </button>
+                <button class="filter-tab" type="button" data-filter="enabled" onclick="applyProxyFilter('enabled')">
+                  <span class="filter-tab-label">已启用</span>
+                  <span class="filter-tab-count" data-count-for="enabled">0</span>
+                </button>
+                <button class="filter-tab" type="button" data-filter="active" onclick="applyProxyFilter('active')">
+                  <span class="filter-tab-label">在线</span>
+                  <span class="filter-tab-count" data-count-for="active">0</span>
+                </button>
+                <button class="filter-tab" type="button" data-filter="inactive" onclick="applyProxyFilter('inactive')">
+                  <span class="filter-tab-label">离线</span>
+                  <span class="filter-tab-count" data-count-for="inactive">0</span>
+                </button>
+                <button class="filter-tab" type="button" data-filter="testing" onclick="applyProxyFilter('testing')">
+                  <span class="filter-tab-label">测试中</span>
+                  <span class="filter-tab-count" data-count-for="testing">0</span>
+                </button>
+                <button class="filter-tab" type="button" data-filter="disabled" onclick="applyProxyFilter('disabled')">
+                  <span class="filter-tab-label">未启用</span>
+                  <span class="filter-tab-count" data-count-for="disabled">0</span>
+                </button>
+              </div>
+            </div>
+
+            <div class="grid grid-cols-1 gap-4" id="proxy-cards">
+              <!-- 代理卡片将动态插入这里 -->
+            </div>
+          </div>
+
+          <!-- DNS映射区域 -->
+          <div id="dns-mappings" class="section hidden">
+            <div class="mb-6">
+              <button onclick="showAddDNSModal()" class="btn-primary"><i class="fas fa-plus mr-2"></i>新增DNS映射</button>
+              <div class="inline-block ml-4 text-sm text-gray-600">
+                <i class="fas fa-info-circle mr-1"></i>
+                DNS映射可以将域名解析到指定IP，无需修改系统hosts文件
+              </div>
+            </div>
+
+            <div class="card">
+              <table class="w-full">
+                <thead>
+                  <tr class="border-b">
+                    <th class="text-left py-3 px-4">域名</th>
+                    <th class="text-left py-3 px-4">IP地址</th>
+                    <th class="text-left py-3 px-4">说明</th>
+                    <th class="text-center py-3 px-4">状态</th>
+                    <th class="text-center py-3 px-4">操作</th>
+                  </tr>
+                </thead>
+                <tbody id="dns-table-body">
+                  <!-- DNS映射列表将动态插入这里 -->
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- 负载设置区域 -->
+          <div id="test-settings" class="section hidden">
+            <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+              <!-- 负载均衡配置 -->
+              <div class="card">
+                <h3 class="text-lg font-semibold mb-4"><i class="fas fa-balance-scale mr-2 text-blue-500"></i>负载均衡配置</h3>
+                <div class="space-y-4">
+                  <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-2">负载均衡模式</label>
+                    <select id="load-mode" class="input-field w-full" onchange="togglePriorityMode()">
+                      <option value="auto">自动模式（智能负载）</option>
+                      <option value="manual">手动模式（优先级排序）</option>
+                    </select>
+                    <p class="text-xs text-gray-500 mt-1">
+                      自动模式：根据成功率和响应时间智能负载<br />
+                      手动模式：按照设定的优先级顺序使用代理
+                    </p>
+                  </div>
+                  <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-2">负载均衡算法（自动模式）</label>
+                    <select id="algorithm" class="input-field w-full">
+                      <option value="adaptive">自适应算法</option>
+                      <option value="weighted_round_robin">加权轮询</option>
+                      <option value="least_connections">最小连接数</option>
+                      <option value="sticky_host">会话粘滞（按域名）</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-2">全局默认测试地址</label>
+                    <input type="text" id="test-url" class="input-field w-full" value="https://cms.zjzwfw.gov.cn/favicon.ico" />
+                    <p class="text-xs text-gray-500 mt-1">代理未单独配置测试地址时使用此默认值</p>
+                  </div>
+                  <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-2">全局默认超时时间（秒）</label>
+                    <input type="number" id="test-timeout" class="input-field w-32" value="10" min="1" max="60" />
+                    <p class="text-xs text-gray-500 mt-1">代理未单独配置超时时间时使用此默认值</p>
+                  </div>
+                  <button onclick="saveTestSettings()" class="btn-primary"><i class="fas fa-save mr-2"></i>保存设置</button>
+                </div>
+              </div>
+
+              <!-- 代理优先级面板 -->
+              <div id="priority-panel" class="card hidden">
+                <h3 class="text-lg font-semibold mb-4"><i class="fas fa-sort-amount-up mr-2 text-amber-500"></i>代理优先级设置</h3>
+                <p class="text-sm text-gray-600 mb-4">拖动调整顺序，数字越小优先级越高</p>
+                <div id="priority-list" class="space-y-2">
+                  <!-- 动态生成优先级列表 -->
+                </div>
+                <button onclick="savePriorities()" class="btn-primary mt-4"><i class="fas fa-save mr-2"></i>保存优先级</button>
+              </div>
+            </div>
+
+            <!-- 代理分组管理 -->
+            <div class="card mt-6">
+              <div class="flex items-center justify-between mb-4">
+                <h3 class="text-lg font-semibold"><i class="fas fa-layer-group mr-2 text-green-500"></i>代理分组</h3>
+                <button onclick="showGroupModal()" class="btn-primary text-sm"><i class="fas fa-plus mr-1"></i>新增分组</button>
+              </div>
+              <p class="text-sm text-gray-600 mb-4">
+                将特定域名绑定到指定代理组，请求命中域名时仅在该组内负载均衡，减少无效尝试。
+              </p>
+              <div id="proxy-groups-list" class="space-y-3">
+                <!-- 动态填充分组卡片 -->
+              </div>
+              <div id="no-proxy-groups" class="text-center py-8 text-gray-500 hidden">
+                <i class="fas fa-layer-group text-3xl mb-2"></i>
+                <p>暂无代理分组，点击上方按钮创建</p>
+              </div>
+            </div>
+          </div>
+
+          <!-- 高级配置区域 -->
+          <div id="advanced-config" class="section hidden">
+            <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+              <!-- 基础配置 -->
+              <div class="card">
+                <h3 class="text-lg font-semibold mb-4"><i class="fas fa-sliders-h mr-2 text-blue-500"></i>基础配置</h3>
+                <div class="space-y-4">
+                  <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-2">代理服务端口</label>
+                    <input type="number" id="proxy-port" class="input-field w-full" value="5678" min="1024" max="65535" />
+                    <p class="text-xs text-gray-500 mt-1">SOCKS5代理服务监听端口（修改后需重启）</p>
+                  </div>
+                  <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-2">定期测试间隔（分钟）</label>
+                    <input type="number" id="periodic-test-interval" class="input-field w-full" value="5" min="1" max="60" />
+                    <p class="text-xs text-gray-500 mt-1">自动测试所有代理的时间间隔</p>
+                  </div>
+                  <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-2">日志保留天数</label>
+                    <input type="number" id="log-retention-days" class="input-field w-full" value="7" min="1" max="90" />
+                    <p class="text-xs text-gray-500 mt-1">请求日志的保留时间</p>
+                  </div>
+                  <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-2">统计数据保留天数</label>
+                    <input type="number" id="stats-retention-days" class="input-field w-full" value="30" min="7" max="365" />
+                  </div>
+                </div>
+              </div>
+
+              <!-- 连接池配置 -->
+              <div class="card">
+                <h3 class="text-lg font-semibold mb-4"><i class="fas fa-database mr-2 text-green-500"></i>连接池配置</h3>
+                <div class="space-y-4">
+                  <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-2">最大连接数</label>
+                    <input type="number" id="pool-max-size" class="input-field w-full" value="50" min="10" max="500" />
+                    <p class="text-xs text-gray-500 mt-1">每个代理的最大并发连接数</p>
+                  </div>
+                  <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-2">连接空闲时间（秒）</label>
+                    <input type="number" id="pool-idle-timeout" class="input-field w-full" value="30" min="5" max="300" />
+                    <p class="text-xs text-gray-500 mt-1">空闲连接的最大保持时间</p>
+                  </div>
+                  <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-2">连接等待超时（秒）</label>
+                    <input type="number" id="pool-wait-timeout" class="input-field w-full" value="10" min="1" max="60" />
+                  </div>
+                </div>
+              </div>
+
+              <!-- 熔断器配置 -->
+              <div class="card">
+                <h3 class="text-lg font-semibold mb-4"><i class="fas fa-shield-alt mr-2 text-red-500"></i>熔断器配置</h3>
+                <div class="space-y-4">
+                  <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-2">失败阈值</label>
+                    <input type="number" id="circuit-failure-threshold" class="input-field w-full" value="5" min="1" max="20" />
+                    <p class="text-xs text-gray-500 mt-1">触发熔断的连续失败次数</p>
+                  </div>
+                  <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-2">熔断时长（秒）</label>
+                    <input type="number" id="circuit-timeout" class="input-field w-full" value="60" min="10" max="600" />
+                    <p class="text-xs text-gray-500 mt-1">熔断后的恢复等待时间</p>
+                  </div>
+                  <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-2">半开尝试次数</label>
+                    <input type="number" id="circuit-half-open-attempts" class="input-field w-full" value="2" min="1" max="10" />
+                    <p class="text-xs text-gray-500 mt-1">半开状态下的成功尝试要求</p>
+                  </div>
+                </div>
+              </div>
+
+              <!-- 健康检查配置 -->
+              <div class="card">
+                <h3 class="text-lg font-semibold mb-4"><i class="fas fa-heartbeat mr-2 text-pink-500"></i>健康检查配置</h3>
+                <div class="space-y-4">
+                  <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-2">检查间隔（秒）</label>
+                    <input type="number" id="health-check-interval" class="input-field w-full" value="30" min="10" max="300" />
+                  </div>
+                  <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-2">降级阈值</label>
+                    <input type="number" id="health-degrade-threshold" class="input-field w-full" value="0.5" min="0.1" max="1" step="0.1" />
+                    <p class="text-xs text-gray-500 mt-1">成功率低于此值时降级</p>
+                  </div>
+                  <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-2">恢复阈值</label>
+                    <input type="number" id="health-recover-threshold" class="input-field w-full" value="0.8" min="0.1" max="1" step="0.1" />
+                    <p class="text-xs text-gray-500 mt-1">成功率高于此值时恢复</p>
+                  </div>
+                </div>
+              </div>
+
+              <!-- 快速失败配置 -->
+              <div class="card">
+                <h3 class="text-lg font-semibold mb-4"><i class="fas fa-bolt mr-2 text-yellow-500"></i>快速失败配置</h3>
+                <div class="space-y-4">
+                  <div class="flex items-center justify-between p-3 bg-gray-50 rounded-lg">
+                    <div>
+                      <label class="block text-sm font-medium text-gray-700">启用快速失败</label>
+                      <p class="text-xs text-gray-500 mt-1">自动尝试多个代理直到成功</p>
+                    </div>
+                    <label class="relative inline-flex items-center cursor-pointer">
+                      <input type="checkbox" id="failfast-enabled" class="sr-only peer" checked />
+                      <div
+                        class="w-11 h-6 bg-gray-200 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-blue-300 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-600"
+                      ></div>
+                    </label>
+                  </div>
+                  <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-2">最大尝试次数</label>
+                    <input type="number" id="failfast-max-attempts" class="input-field w-full" value="3" min="1" max="10" />
+                  </div>
+                  <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-2">单次超时（毫秒）</label>
+                    <input type="number" id="failfast-attempt-timeout" class="input-field w-full" value="10000" min="1000" max="30000" step="1000" />
+                  </div>
+                  <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-2">总超时（毫秒）</label>
+                    <input type="number" id="failfast-total-timeout" class="input-field w-full" value="30000" min="5000" max="60000" step="1000" />
+                  </div>
+                </div>
+              </div>
+
+              <!-- 算法权重配置 -->
+              <div class="card">
+                <h3 class="text-lg font-semibold mb-4"><i class="fas fa-balance-scale mr-2 text-purple-500"></i>算法权重配置</h3>
+                <p class="text-sm text-gray-600 mb-4">调整自适应算法的评分权重（总和应为1.0）</p>
+                <div class="space-y-3">
+                  <div>
+                    <label class="flex justify-between text-sm">
+                      <span>响应时间权重</span>
+                      <span id="weight-response-value">0.25</span>
+                    </label>
+                    <input type="range" id="weight-response" class="w-full" min="0" max="100" value="25" oninput="updateWeightDisplay('response')" />
+                  </div>
+                  <div>
+                    <label class="flex justify-between text-sm">
+                      <span>成功率权重</span>
+                      <span id="weight-success-value">0.20</span>
+                    </label>
+                    <input type="range" id="weight-success" class="w-full" min="0" max="100" value="20" oninput="updateWeightDisplay('success')" />
+                  </div>
+                  <div>
+                    <label class="flex justify-between text-sm">
+                      <span>带宽权重</span>
+                      <span id="weight-bandwidth-value">0.15</span>
+                    </label>
+                    <input type="range" id="weight-bandwidth" class="w-full" min="0" max="100" value="15" oninput="updateWeightDisplay('bandwidth')" />
+                  </div>
+                  <div>
+                    <label class="flex justify-between text-sm">
+                      <span>连接数权重</span>
+                      <span id="weight-connections-value">0.15</span>
+                    </label>
+                    <input type="range" id="weight-connections" class="w-full" min="0" max="100" value="15" oninput="updateWeightDisplay('connections')" />
+                  </div>
+                  <div>
+                    <label class="flex justify-between text-sm">
+                      <span>稳定性权重</span>
+                      <span id="weight-stability-value">0.15</span>
+                    </label>
+                    <input type="range" id="weight-stability" class="w-full" min="0" max="100" value="15" oninput="updateWeightDisplay('stability')" />
+                  </div>
+                  <div>
+                    <label class="flex justify-between text-sm">
+                      <span>近期表现权重</span>
+                      <span id="weight-recent-value">0.10</span>
+                    </label>
+                    <input type="range" id="weight-recent" class="w-full" min="0" max="100" value="10" oninput="updateWeightDisplay('recent')" />
+                  </div>
+                  <div class="pt-2 border-t">
+                    <div class="flex justify-between text-sm font-medium">
+                      <span>总和</span>
+                      <span id="weight-total" class="text-blue-600">1.00</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- 保存按钮 -->
+            <div class="mt-6 flex justify-center gap-4">
+              <button onclick="saveAdvancedConfig()" class="btn-primary px-8 py-3"><i class="fas fa-save mr-2"></i>保存配置</button>
+              <button onclick="resetAdvancedConfig()" class="px-8 py-3 text-gray-600 hover:text-gray-800 border border-gray-300 rounded-md hover:bg-gray-50"><i class="fas fa-undo mr-2"></i>恢复默认</button>
+              <button onclick="exportConfig()" class="px-8 py-3 text-blue-600 hover:text-blue-800 border border-blue-300 rounded-md hover:bg-blue-50"><i class="fas fa-download mr-2"></i>导出配置</button>
+            </div>
+          </div>
+
+          <!-- 系统状态区域 -->
+          <div id="system-status" class="section hidden">
+            <!-- KPI 概览 -->
+            <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-4">
+              <div class="card">
+                <div class="flex items-center justify-between">
+                  <div>
+                    <p class="text-sm text-gray-600">活跃代理</p>
+                    <p class="text-2xl font-bold text-green-600" id="active-proxies">0</p>
+                  </div>
+                  <i class="fas fa-check-circle text-3xl text-green-500"></i>
+                </div>
+              </div>
+              <div class="card">
+                <div class="flex items-center justify-between">
+                  <div>
+                    <p class="text-sm text-gray-600">总请求数(24h)</p>
+                    <p class="text-2xl font-bold text-blue-600" id="total-requests">0</p>
+                    <div class="kpi-delta text-gray-500" id="kpi-total-delta"></div>
+                  </div>
+                  <i class="fas fa-exchange-alt text-3xl text-blue-500"></i>
+                </div>
+              </div>
+              <div class="card">
+                <div class="flex items-center justify-between">
+                  <div>
+                    <p class="text-sm text-gray-600">失败请求(24h)</p>
+                    <p class="text-2xl font-bold text-red-600" id="failed-requests">0</p>
+                    <div class="kpi-delta text-gray-500" id="kpi-failed-delta"></div>
+                  </div>
+                  <i class="fas fa-times-circle text-3xl text-red-500"></i>
+                </div>
+              </div>
+              <div class="card">
+                <div class="flex items-center justify-between">
+                  <div>
+                    <p class="text-sm text-gray-600">平均响应(ms)</p>
+                    <p class="text-2xl font-bold text-amber-600" id="avg-rt">0</p>
+                    <div class="kpi-delta text-gray-500" id="kpi-rt-delta"></div>
+                  </div>
+                  <i class="fas fa-gauge-high text-3xl text-amber-500"></i>
+                </div>
+              </div>
+            </div>
+
+            <!-- 图表区 -->
+            <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <div class="card"><div id="chart-traffic" class="chart-box"></div></div>
+              <div class="card"><div id="chart-latency" class="chart-box"></div></div>
+              <div class="card"><div id="chart-proxy-usage" class="chart-box"></div></div>
+              <div class="card"><div id="chart-targets" class="chart-box"></div></div>
+            </div>
+
+            <!-- 流量日志 -->
+            <div class="card mt-4">
+              <h3 class="text-lg font-semibold mb-4">
+                <i class="fas fa-list-check text-blue-500 mr-2"></i>
+                流量日志（最近100条）
+              </h3>
+              <div class="overflow-x-auto traffic-log-scroll">
+                <table class="w-full text-sm traffic-log-table">
+                  <thead>
+                    <tr class="border-b">
+                      <th class="text-left py-2 px-3">时间</th>
+                      <th class="text-left py-2 px-3">目标资源</th>
+                      <th class="text-left py-2 px-3">代理配置</th>
+                      <th class="text-center py-2 px-3">状态</th>
+                      <th class="text-right py-2 px-3">响应</th>
+                      <th class="text-left py-2 px-3">错误信息</th>
+                    </tr>
+                  </thead>
+                  <tbody id="traffic-log-list">
+                    <!-- 动态填充 -->
+                  </tbody>
+                </table>
+                <div id="no-traffic-logs" class="text-center py-8 text-gray-500 hidden">
+                  <i class="fas fa-wave-square text-3xl mb-2"></i>
+                  <p>暂无流量日志</p>
+                </div>
+              </div>
+            </div>
+
+            <!-- 失败请求统计 -->
+            <div class="card mt-4">
+              <h3 class="text-lg font-semibold mb-4">
+                <i class="fas fa-exclamation-triangle text-red-500 mr-2"></i>
+                失败请求资源排行（24小时）
+              </h3>
+              <div class="overflow-x-auto">
+                <table class="w-full text-sm">
+                  <thead>
+                    <tr class="border-b">
+                      <th class="text-left py-2 px-3">排名</th>
+                      <th class="text-left py-2 px-3">目标地址</th>
+                      <th class="text-center py-2 px-3">失败次数</th>
+                      <th class="text-right py-2 px-3">最后失败时间</th>
+                    </tr>
+                  </thead>
+                  <tbody id="failed-targets-list">
+                    <!-- 动态填充 -->
+                  </tbody>
+                </table>
+                <div id="no-failed-targets" class="text-center py-8 text-gray-500 hidden">
+                  <i class="fas fa-check-circle text-3xl mb-2"></i>
+                  <p>暂无失败请求</p>
+                </div>
+              </div>
+            </div>
+          </div>
+        </main>
+      </div>
+    </div>
+
+    <!-- 添加/编辑代理模态框 -->
+    <div id="proxy-modal" class="fixed inset-0 bg-black bg-opacity-50 hidden flex items-center justify-center z-50">
+      <div class="bg-white rounded-lg shadow-xl w-full max-w-lg mx-4">
+        <div class="px-6 py-4 border-b">
+          <h3 class="text-lg font-semibold" id="modal-title">新增代理配置</h3>
+        </div>
+        <div class="p-6 space-y-4">
+          <input type="hidden" id="proxy-id" />
+
+          <div>
+            <label class="block text-sm font-medium text-gray-700 mb-1">名称</label>
+            <input type="text" id="proxy-name" class="input-field w-full" placeholder="例如: 办公室代理" />
+          </div>
+
+          <div class="flex items-center justify-between p-3 bg-gray-50 rounded-lg">
+            <div>
+              <label class="block text-sm font-medium text-gray-700">启用状态</label>
+              <p class="text-xs text-gray-500 mt-1">禁用后代理将不会被使用</p>
+            </div>
+            <label class="relative inline-flex items-center cursor-pointer">
+              <input type="checkbox" id="proxy-enabled" class="sr-only peer" checked />
+              <div
+                class="w-11 h-6 bg-gray-200 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-blue-300 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-600"
+              ></div>
+            </label>
+          </div>
+
+          <div>
+            <label class="block text-sm font-medium text-gray-700 mb-1">类型</label>
+            <select id="proxy-type" class="input-field w-full" onchange="toggleAuthFields()">
+              <option value="http">HTTP</option>
+              <option value="https">HTTPS</option>
+              <option value="socks4">SOCKS4</option>
+              <option value="socks5">SOCKS5</option>
+            </select>
+          </div>
+
+          <div class="grid grid-cols-2 gap-4">
+            <div>
+              <label class="block text-sm font-medium text-gray-700 mb-1">主机</label>
+              <input type="text" id="proxy-host" class="input-field w-full" placeholder="127.0.0.1" />
+            </div>
+            <div>
+              <label class="block text-sm font-medium text-gray-700 mb-1">端口</label>
+              <input type="number" id="host-port" class="input-field w-full" placeholder="1080" />
+            </div>
+          </div>
+
+          <div id="auth-fields" class="grid grid-cols-2 gap-4">
+            <div>
+              <label class="block text-sm font-medium text-gray-700 mb-1">用户名（可选）</label>
+              <input type="text" id="proxy-username" class="input-field w-full" />
+            </div>
+            <div>
+              <label class="block text-sm font-medium text-gray-700 mb-1">密码（可选）</label>
+              <input type="password" id="proxy-password" class="input-field w-full" />
+            </div>
+          </div>
+
+          <div>
+            <label class="block text-sm font-medium text-gray-700 mb-1">测试地址（可选）</label>
+            <input type="text" id="proxy-test-url" class="input-field w-full" list="test-url-options" placeholder="留空使用全局默认" />
+            <datalist id="test-url-options">
+              <!-- 动态填充历史测试地址 -->
+            </datalist>
+            <p class="text-xs text-gray-500 mt-1">可选择历史地址或输入新地址，留空则使用全局默认测试地址</p>
+          </div>
+
+          <div>
+            <label class="block text-sm font-medium text-gray-700 mb-1">超时时间（可选，秒）</label>
+            <input type="number" id="proxy-test-timeout" class="input-field w-32" placeholder="留空使用全局默认" min="1" max="60" />
+            <p class="text-xs text-gray-500 mt-1">留空则使用全局默认超时时间</p>
+          </div>
+        </div>
+        <div class="px-6 py-4 border-t flex justify-end space-x-3">
+          <button onclick="closeProxyModal()" class="px-4 py-2 text-gray-600 hover:text-gray-800">取消</button>
+          <button onclick="saveProxy()" class="btn-primary">保存</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 添加/编辑DNS映射模态框 -->
+    <div id="dns-modal" class="fixed inset-0 bg-black bg-opacity-50 hidden flex items-center justify-center z-50">
+      <div class="bg-white rounded-lg shadow-xl w-full max-w-lg mx-4">
+        <div class="px-6 py-4 border-b">
+          <h3 class="text-lg font-semibold" id="dns-modal-title">新增DNS映射</h3>
+        </div>
+        <div class="p-6 space-y-4">
+          <input type="hidden" id="dns-id" />
+
+          <div>
+            <label class="block text-sm font-medium text-gray-700 mb-1">域名</label>
+            <input type="text" id="dns-domain" class="input-field w-full" placeholder="例如: cms.zjzwfw.gov.cn" />
+            <p class="text-xs text-gray-500 mt-1">请输入完整的域名</p>
+          </div>
+
+          <div>
+            <label class="block text-sm font-medium text-gray-700 mb-1">IP地址</label>
+            <input type="text" id="dns-ip" class="input-field w-full" placeholder="例如: 123.123.123.123" />
+            <p class="text-xs text-gray-500 mt-1">域名将被解析到此IP地址</p>
+          </div>
+
+          <div>
+            <label class="block text-sm font-medium text-gray-700 mb-1">说明（可选）</label>
+            <input type="text" id="dns-description" class="input-field w-full" placeholder="例如: 测试环境" />
+          </div>
+
+          <div class="flex items-center justify-between p-3 bg-gray-50 rounded-lg">
+            <div>
+              <label class="block text-sm font-medium text-gray-700">启用状态</label>
+              <p class="text-xs text-gray-500 mt-1">禁用后DNS映射将不会生效</p>
+            </div>
+            <label class="relative inline-flex items-center cursor-pointer">
+              <input type="checkbox" id="dns-enabled" class="sr-only peer" checked />
+              <div
+                class="w-11 h-6 bg-gray-200 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-blue-300 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-600"
+              ></div>
+            </label>
+          </div>
+        </div>
+        <div class="px-6 py-4 border-t flex justify-end space-x-3">
+          <button onclick="closeDNSModal()" class="px-4 py-2 text-gray-600 hover:text-gray-800">取消</button>
+          <button onclick="saveDNS()" class="btn-primary">保存</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 代理分组模态框 -->
+    <div id="group-modal" class="fixed inset-0 bg-black bg-opacity-50 hidden flex items-center justify-center z-50">
+      <div class="bg-white rounded-lg shadow-xl w-full max-w-lg mx-4">
+        <div class="px-6 py-4 border-b">
+          <h3 class="text-lg font-semibold" id="group-modal-title">新增代理分组</h3>
+        </div>
+        <div class="p-6 space-y-4 max-h-[70vh] overflow-y-auto">
+          <input type="hidden" id="group-id" />
+
+          <div>
+            <label class="block text-sm font-medium text-gray-700 mb-1">分组名称</label>
+            <input type="text" id="group-name" class="input-field w-full" placeholder="例如: 政务网专用" />
+          </div>
+
+          <div class="flex items-center justify-between p-3 bg-gray-50 rounded-lg">
+            <div>
+              <label class="block text-sm font-medium text-gray-700">设为默认分组</label>
+              <p class="text-xs text-gray-500 mt-1">未命中任何分组的请求将使用默认分组</p>
+            </div>
+            <label class="relative inline-flex items-center cursor-pointer">
+              <input type="checkbox" id="group-is-default" class="sr-only peer" />
+              <div
+                class="w-11 h-6 bg-gray-200 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-blue-300 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-600"
+              ></div>
+            </label>
+          </div>
+
+          <div>
+            <label class="block text-sm font-medium text-gray-700 mb-1">域名列表</label>
+            <div class="flex gap-2 mb-2">
+              <input type="text" id="group-domain-input" class="input-field flex-1" placeholder="输入域名，如 cms.zjzwfw.gov.cn" onkeydown="if(event.key==='Enter'){event.preventDefault();addGroupDomain()}" />
+              <button type="button" onclick="addGroupDomain()" class="btn-primary text-sm px-3"><i class="fas fa-plus"></i></button>
+            </div>
+            <div id="group-domains-tags" class="flex flex-wrap gap-2">
+              <!-- 动态填充域名标签 -->
+            </div>
+          </div>
+
+          <div>
+            <label class="block text-sm font-medium text-gray-700 mb-2">选择代理</label>
+            <div id="group-proxy-checkboxes" class="space-y-2 max-h-48 overflow-y-auto border rounded-lg p-3">
+              <!-- 动态填充代理checkbox -->
+            </div>
+          </div>
+        </div>
+        <div class="px-6 py-4 border-t flex justify-end space-x-3">
+          <button onclick="closeGroupModal()" class="px-4 py-2 text-gray-600 hover:text-gray-800">取消</button>
+          <button onclick="saveGroup()" class="btn-primary">保存</button>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      document.addEventListener("DOMContentLoaded", function () {
+        // 立即显示默认页面，避免白屏
+        document.getElementById("proxy-list").classList.remove("hidden");
+      });
+    </script>
+    <script src="js/index.js" defer></script>
+  </body>
+</html>

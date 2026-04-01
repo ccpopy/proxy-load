@@ -147,3 +147,13 @@ docs/_book
 # TODO: where does this rule come from?
 test/
 
+# Claude config and artifacts
+.claude
+.claude/
+CLAUDE.md
+
+# SQLite
+*.db
+*.db-shm
+*.db-wal
+
