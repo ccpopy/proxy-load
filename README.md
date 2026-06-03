@@ -134,6 +134,14 @@ src-tauri/target/release/bundle/
 release/
 ```
 
+Windows 本地构建还会额外复制一个可直接运行的便携 exe：
+
+```text
+release/zwfw-load_1.2.2_x64-portable.exe
+```
+
+这个文件主要用于本机验证，可以直接双击运行；正式更新安装仍建议使用 setup 或 msi 安装包。
+
 ## 检查更新
 
 应用内“检查更新”遵循本地目录策略：

@@ -575,6 +575,17 @@ pub fn install_update(artifact_path: Option<String>) -> CommandResult<Value> {
         .and_then(|value| value.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
+    let file_name = selected_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    if extension == "exe" && file_name.contains("portable") {
+        return Err(CommandError::new(
+            "便携 exe 只用于本机验证，不能在应用运行中直接覆盖当前程序。请使用 setup/msi 更新包，或关闭应用后手动替换 exe。",
+        ));
+    }
 
     match extension.as_str() {
         "exe" => {
@@ -694,6 +705,7 @@ fn artifact_kind(path: &Path) -> Option<&'static str> {
     let extension = path.extension()?.to_string_lossy().to_ascii_lowercase();
 
     match extension.as_str() {
+        "exe" if file_name.contains("portable") => Some("windows-portable"),
         "exe" if file_name.contains("setup") => Some("windows-nsis"),
         "exe" => Some("windows-exe"),
         "msi" => Some("windows-msi"),
@@ -719,6 +731,7 @@ fn artifact_priority(artifact: &UpdateArtifact) -> i32 {
         "windows-nsis" => 40,
         "windows-msi" => 30,
         "windows-exe" => 20,
+        "windows-portable" => 15,
         _ => 10,
     }
 }
