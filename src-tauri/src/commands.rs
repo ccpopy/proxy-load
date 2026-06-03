@@ -605,11 +605,7 @@ pub async fn install_update(artifact_path: Option<String>) -> CommandResult<Valu
     }
 
     fs::create_dir_all(&download_dir)?;
-    let selected_path = if selected.kind == "windows-portable" {
-        portable_update_staging_path()?
-    } else {
-        download_dir.join(&selected.file_name)
-    };
+    let selected_path = download_dir.join(&selected.file_name);
     if selected_path == std::env::current_exe()? {
         return Err(CommandError::new(
             "更新包文件名与当前运行程序相同，无法在运行中覆盖自身",
@@ -619,7 +615,7 @@ pub async fn install_update(artifact_path: Option<String>) -> CommandResult<Valu
     launch_update_installer(&selected_path, &app_dir, &selected.kind)?;
 
     let message = if selected.kind == "windows-portable" {
-        "已下载便携更新包到当前应用目录，应用即将替换并重启"
+        "已下载便携更新包到当前应用目录，应用即将启动新版本"
     } else {
         "已下载 GitHub Release 更新包，并启动安装程序，安装目录已指向当前应用所在目录"
     };
@@ -671,17 +667,12 @@ fn launch_update_installer(selected_path: &Path, app_dir: &Path, kind: &str) -> 
 
 #[cfg(target_os = "windows")]
 fn launch_portable_update(selected_path: &Path, app_dir: &Path) -> CommandResult<()> {
-    let current_exe = std::env::current_exe()?;
     let restart_command = format!(
-        "ping 127.0.0.1 -n 3 > nul && del /f /q \"{}\" && move /y \"{}\" \"{}\" && start \"\" /D \"{}\" \"{}\"",
-        current_exe.display(),
-        selected_path.display(),
-        current_exe.display(),
+        "ping 127.0.0.1 -n 3 > nul && start \"\" /D \"{}\" \"{}\"",
         app_dir.display(),
-        current_exe.display()
+        selected_path.display()
     );
 
-    // The running exe is locked on Windows; the helper replaces it after this process exits.
     Command::new("cmd")
         .arg("/C")
         .arg(restart_command)
@@ -703,17 +694,6 @@ fn launch_portable_update(selected_path: &Path, _app_dir: &Path) -> CommandResul
         "当前平台暂不支持直接安装便携更新包: {}",
         selected_path.display()
     )))
-}
-
-#[cfg(target_os = "windows")]
-fn portable_update_staging_path() -> CommandResult<PathBuf> {
-    let current_exe = std::env::current_exe()?;
-    Ok(current_exe.with_extension("update.exe"))
-}
-
-#[cfg(not(target_os = "windows"))]
-fn portable_update_staging_path() -> CommandResult<PathBuf> {
-    Err(CommandError::new("当前平台不支持便携更新包暂存路径"))
 }
 
 fn ensure_positive(value: i64, field: &str) -> CommandResult<i64> {

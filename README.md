@@ -227,13 +227,13 @@ cp data/proxy.db "$HOME/Library/Application Support/zwfw-load/proxy.db"
 - 开发环境：直接返回错误，避免把本地调试产物误当成线上更新。
 - 生产环境：请求 GitHub Releases 最新版本，选择当前平台可用的安装包。
 - 安装包运行：Windows 下会启动下载的 setup 或 msi，并把安装目录指向当前应用所在目录，例如 `F:\zwfw-load`。
-- 便携版运行：Windows 下会下载 portable exe 到当前应用目录，退出当前应用后替换原 exe，并重新启动。
+- 便携版运行：Windows 下会下载 portable exe 到当前应用目录，退出当前应用后启动新版本文件。
 
 更新检查不会默认安装到系统盘其他位置；应用放在 `F:\zwfw-load` 时，更新也会以该目录作为安装位置。
 
 应用内显示的“更新目标目录”和“下载保存目录”都会指向当前应用所在目录。比如便携 exe 放在 `F:\project\zwfw-load\release` 中运行时，更新也会下载到 `F:\project\zwfw-load\release`，不会再放到 `F:\project\zwfw-load\release\release`。
 
-便携 exe 在运行时不能直接覆盖自身，所以更新时会先在同目录写入临时更新文件，应用退出后再替换原 exe 并重启。
+便携 exe 在运行时不能直接覆盖自身，所以更新时会直接下载 GitHub Release 中的新版本文件名，例如 `zwfw-load_2026.6.3+4_x64-portable.exe`，然后退出当前应用并启动这个新版本文件。
 
 如果发布仓库是私有仓库，GitHub 未认证访问会返回 `404`。生产环境需要在启动应用前设置环境变量：
 
