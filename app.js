@@ -6,9 +6,9 @@ const ProxyLoadBalancer = require('./proxyServer');
 const { printVersion } = require('./version');
 
 // 模块引入
-const { DEFAULT_ADVANCED_CONFIG, VALID_ALGORITHMS } = require('./src/constants');
+const { DEFAULT_ADVANCED_CONFIG, VALID_ALGORITHMS, TRAFFIC_LOG_DEFAULT_PAGE_SIZE } = require('./src/constants');
 const { initDatabase } = require('./src/database');
-const { testProxy, measureBandwidth } = require('./src/proxyTester');
+const { testProxy } = require('./src/proxyTester');
 const { createLogger } = require('./src/logger');
 const { createConfigManager } = require('./src/configManager');
 const { createScheduler } = require('./src/scheduler');
@@ -60,6 +60,21 @@ function broadcast (type, data) {
   });
 }
 
+function parsePositiveIntegerQuery (value, defaultValue, fieldName) {
+  if (value === undefined || value === null || value === '') {
+    return defaultValue;
+  }
+
+  const number = Number(value);
+  if (!Number.isInteger(number) || number < 1) {
+    const error = new Error(`${fieldName}必须是正整数`);
+    error.statusCode = 400;
+    throw error;
+  }
+
+  return number;
+}
+
 // 启动服务器
 async function startServer () {
   db = await initDatabase();
@@ -100,7 +115,6 @@ async function startServer () {
     getProxyServer,
     stats,
     testProxy,
-    measureBandwidth,
     logRequest,
     applyRuntimeConfig: configManager.applyRuntimeConfig
   };
@@ -129,17 +143,41 @@ async function startServer () {
   });
 
   // traffic-logs 挂载在原路径（前端直接调用 /api/traffic-logs）
-  const { TRAFFIC_LOG_LIMIT } = require('./src/constants');
   app.get('/api/traffic-logs', async (req, res) => {
     try {
+      const page = parsePositiveIntegerQuery(req.query.page, 1, 'page');
+      const pageSize = parsePositiveIntegerQuery(req.query.page_size, TRAFFIC_LOG_DEFAULT_PAGE_SIZE, 'page_size');
+      const totalRow = await db.get('SELECT COUNT(*) AS total FROM request_logs');
+      const total = Number(totalRow?.total || 0);
+      const totalPages = Math.max(1, Math.ceil(total / pageSize));
+      const offset = (page - 1) * pageSize;
+
       const logs = await db.all(`
         SELECT rl.id, rl.proxy_id, p.name AS proxy_name, p.type AS proxy_type,
           p.host AS proxy_host, p.port AS proxy_port, rl.target_host, rl.target_port,
           rl.success, rl.response_time, rl.error_message, rl.result_type, rl.created_at
         FROM request_logs rl LEFT JOIN proxies p ON p.id = rl.proxy_id
-        ORDER BY rl.id DESC LIMIT ?
-      `, [TRAFFIC_LOG_LIMIT]);
-      res.json(logs);
+        ORDER BY rl.id DESC LIMIT ? OFFSET ?
+      `, [pageSize, offset]);
+
+      res.json({
+        items: logs,
+        page,
+        pageSize,
+        total,
+        totalPages
+      });
+    } catch (error) {
+      res.status(error.statusCode || 500).json({ error: error.message });
+    }
+  });
+
+  app.delete('/api/traffic-logs', async (req, res) => {
+    try {
+      const result = await db.run('DELETE FROM request_logs');
+      const deleted = result?.changes || 0;
+      broadcast('traffic_logs_cleared', { deleted });
+      res.json({ deleted });
     } catch (error) {
       res.status(500).json({ error: error.message });
     }

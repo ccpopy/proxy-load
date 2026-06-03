@@ -1,5 +1,15 @@
 const { DEFAULT_ADVANCED_CONFIG } = require('./constants');
 
+function restartHealthCheckTimer (proxyServer) {
+  if (!proxyServer.healthCheckTimer) return;
+
+  clearInterval(proxyServer.healthCheckTimer);
+  proxyServer.healthCheckTimer = setInterval(
+    () => proxyServer.performHealthCheck(),
+    proxyServer.healthCheck.interval
+  );
+}
+
 function createConfigManager ({ db, getProxyServer, getSchedulerTimers, getPeriodicProxyTest }) {
   async function loadAdvancedConfig () {
     const configKeys = Object.keys(DEFAULT_ADVANCED_CONFIG);
@@ -41,6 +51,9 @@ function createConfigManager ({ db, getProxyServer, getSchedulerTimers, getPerio
         if (config.pool_idle_timeout !== undefined) {
           proxyServer.connectionPool.maxIdleTime = config.pool_idle_timeout;
         }
+        if (config.pool_wait_timeout !== undefined) {
+          proxyServer.connectionPool.maxWaitTime = config.pool_wait_timeout;
+        }
       }
 
       // 更新熔断器默认配置
@@ -73,8 +86,6 @@ function createConfigManager ({ db, getProxyServer, getSchedulerTimers, getPerio
         if (!proxyServer.healthCheck) {
           proxyServer.healthCheck = {
             interval: 30000,
-            timeout: 5000,
-            retries: 3,
             degradeThreshold: 0.5,
             recoverThreshold: 0.8
           };
@@ -91,13 +102,7 @@ function createConfigManager ({ db, getProxyServer, getSchedulerTimers, getPerio
         }
 
         // 重启健康检查定时器
-        if (proxyServer.healthCheckTimer) {
-          clearInterval(proxyServer.healthCheckTimer);
-          proxyServer.healthCheckTimer = setInterval(
-            () => proxyServer.performHealthCheck(),
-            proxyServer.healthCheck.interval
-          );
-        }
+        restartHealthCheckTimer(proxyServer);
       }
 
       // 更新快速失败配置
@@ -135,18 +140,7 @@ function createConfigManager ({ db, getProxyServer, getSchedulerTimers, getPerio
         if (typeof proxyServer.setAlgorithmWeights === 'function') {
           proxyServer.setAlgorithmWeights(config.algorithm_weights);
         } else {
-          const weights = { ...config.algorithm_weights };
-          const sum = Object.values(weights).reduce((a, b) => a + b, 0);
-
-          if (Math.abs(sum - 1.0) > 0.01) {
-            for (let key in weights) {
-              weights[key] = weights[key] / sum;
-            }
-          }
-
-          proxyServer.algorithmWeights = weights;
-          // 保存原始权重用于动态调整
-          proxyServer.originalWeights = { ...weights };
+          throw new Error('代理服务器缺少算法权重配置方法');
         }
       }
     }
@@ -157,6 +151,7 @@ function createConfigManager ({ db, getProxyServer, getSchedulerTimers, getPerio
     // 设置连接池配置
     proxyServerInstance.connectionPool.maxSize = config.pool_max_size;
     proxyServerInstance.connectionPool.maxIdleTime = config.pool_idle_timeout;
+    proxyServerInstance.connectionPool.maxWaitTime = config.pool_wait_timeout;
 
     // 设置熔断器默认配置
     proxyServerInstance.circuitBreakerConfig = {
@@ -169,6 +164,7 @@ function createConfigManager ({ db, getProxyServer, getSchedulerTimers, getPerio
     proxyServerInstance.healthCheck.interval = config.health_check_interval;
     proxyServerInstance.healthCheck.degradeThreshold = config.health_degrade_threshold;
     proxyServerInstance.healthCheck.recoverThreshold = config.health_recover_threshold;
+    restartHealthCheckTimer(proxyServerInstance);
 
     // 设置快速失败配置
     proxyServerInstance.failFast = {
@@ -184,17 +180,7 @@ function createConfigManager ({ db, getProxyServer, getSchedulerTimers, getPerio
       if (typeof proxyServerInstance.setAlgorithmWeights === 'function') {
         proxyServerInstance.setAlgorithmWeights(config.algorithm_weights);
       } else {
-        const weights = { ...config.algorithm_weights };
-        const sum = Object.values(weights).reduce((a, b) => a + b, 0);
-
-        if (Math.abs(sum - 1.0) > 0.01) {
-          for (let key in weights) {
-            weights[key] = weights[key] / sum;
-          }
-        }
-
-        proxyServerInstance.algorithmWeights = weights;
-        proxyServerInstance.originalWeights = { ...weights };
+        throw new Error('代理服务器缺少算法权重配置方法');
       }
     }
   }

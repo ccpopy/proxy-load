@@ -1,5 +1,6 @@
 const express = require('express');
 const { DEFAULT_ADVANCED_CONFIG } = require('../constants');
+const { getVersion } = require('../../version');
 
 module.exports = function ({ db, applyRuntimeConfig }) {
   const router = express.Router();
@@ -37,8 +38,11 @@ module.exports = function ({ db, applyRuntimeConfig }) {
       let requiresRestart = false;
 
       // 检查是否修改了需要重启的配置
-      const currentProxyPort = await db.get("SELECT value FROM settings WHERE key = 'proxy_port'");
-      if (currentProxyPort && Number(currentProxyPort.value) !== config.proxy_port) {
+      const currentProxyPortSetting = await db.get("SELECT value FROM settings WHERE key = 'proxy_port'");
+      const currentProxyPort = currentProxyPortSetting
+        ? Number(currentProxyPortSetting.value)
+        : DEFAULT_ADVANCED_CONFIG.proxy_port;
+      if (Number(currentProxyPort) !== Number(config.proxy_port)) {
         requiresRestart = true;
       }
 
@@ -106,7 +110,7 @@ module.exports = function ({ db, applyRuntimeConfig }) {
       config.proxies = proxies;
 
       res.json({
-        version: '1.0.0',
+        version: getVersion().version,
         exportTime: new Date().toISOString(),
         config
       });

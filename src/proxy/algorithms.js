@@ -10,7 +10,6 @@ module.exports = {
 
     const rtScore = this.calculateResponseTimeScore(metrics);
     const srScore = this.calculateSuccessRateScore(metrics);
-    const bwScore = this.calculateBandwidthScore(metrics);
     const connScore = this.calculateConnectionScore(proxyId);
     const stabScore = this.calculateStabilityScore(metrics);
     const trendScore = this.calculateTrendScore(metrics);
@@ -18,7 +17,6 @@ module.exports = {
     let score =
       rtScore * this.algorithmWeights.responseTime +
       srScore * this.algorithmWeights.successRate +
-      bwScore * this.algorithmWeights.bandwidth +
       connScore * this.algorithmWeights.connections +
       stabScore * this.algorithmWeights.stability +
       trendScore * this.algorithmWeights.recentPerf;
@@ -46,17 +44,6 @@ module.exports = {
     if (rate < 0.8) return 20 + (rate - 0.5) * 100;
     if (rate < 0.95) return 50 + (rate - 0.8) * 200;
     return 80 + (rate - 0.95) * 400;
-  },
-
-  calculateBandwidthScore (metrics) {
-    const bw = metrics.bandwidth || 0;
-    if (bw === 0) return 50;
-
-    if (bw >= 100) return 100;
-    if (bw >= 50) return 85 + (bw - 50) * 0.3;
-    if (bw >= 10) return 60 + (bw - 10) * 0.625;
-    if (bw >= 1) return 30 + (bw - 1) * 3.33;
-    return bw * 30;
   },
 
   calculateConnectionScore (proxyId) {
@@ -260,81 +247,6 @@ module.exports = {
 
   async getGroupProxyIds (targetHost) {
     const domain = await this.resolveTargetDomain(targetHost);
-
-    const matchedGroup = await this.db.get(`
-      SELECT pg.id FROM proxy_groups pg
-      JOIN proxy_group_domains pgd ON pgd.group_id = pg.id
-      WHERE pgd.domain = ? AND pg.enabled = 1
-    `, [domain.toLowerCase()]);
-
-    if (matchedGroup) {
-      const members = await this.db.all(
-        'SELECT proxy_id FROM proxy_group_members WHERE group_id = ?',
-        [matchedGroup.id]
-      );
-      if (members.length > 0) {
-        return new Set(members.map(m => m.proxy_id));
-      }
-    }
-
-    const defaultGroup = await this.db.get(
-      'SELECT id FROM proxy_groups WHERE is_default = 1 AND enabled = 1'
-    );
-    if (defaultGroup) {
-      const members = await this.db.all(
-        'SELECT proxy_id FROM proxy_group_members WHERE group_id = ?',
-        [defaultGroup.id]
-      );
-      if (members.length > 0) {
-        return new Set(members.map(m => m.proxy_id));
-      }
-    }
-
-    return null;
-  },
-
-  async selectProxy (targetHost) {
-    const modeSetting = await this.db.get("SELECT value FROM settings WHERE key = 'load_mode'");
-    this.loadMode = modeSetting?.value || 'auto';
-
-    const proxies = await this.getEnabledProxies();
-
-    const groupProxyIds = await this.getGroupProxyIds(targetHost);
-
-    const activeProxies = proxies.filter(p => {
-      if (groupProxyIds && !groupProxyIds.has(p.id)) {
-        return false;
-      }
-
-      const circuitBreaker = this.getCircuitBreaker(p.id);
-      if (!circuitBreaker.canAttempt()) {
-        return false;
-      }
-
-      const poolInfo = this.proxyPool.get(p.id);
-      if (poolInfo?.degraded) {
-        const degradeDuration = Date.now() - (poolInfo.degradedAt || 0);
-        if (degradeDuration < 60000) {
-          return false;
-        } else {
-          this.recoverProxy(p.id);
-        }
-      }
-
-      return p.status === 'active' || p.status === 'testing' || !p.status;
-    });
-
-    if (activeProxies.length === 0) {
-      return null;
-    }
-
-    if (this.loadMode === 'manual') {
-      return activeProxies;
-    } else {
-      const algorithmKey = this.allowedAlgorithms.has(this.currentAlgorithm) ? this.currentAlgorithm : 'adaptive';
-      const algorithm = this.algorithms[algorithmKey] || this.algorithms.adaptive;
-      const ordered = await algorithm(activeProxies, targetHost);
-      return Array.isArray(ordered) && ordered.length > 0 ? ordered : activeProxies;
-    }
+    return this.domainMatcher.match(domain);
   }
 };

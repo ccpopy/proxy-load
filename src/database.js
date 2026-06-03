@@ -31,6 +31,7 @@ async function initDatabase () {
       fail_count INTEGER DEFAULT 0,
       priority INTEGER DEFAULT 999,
       enabled INTEGER DEFAULT 1,
+      skip_cert_verify INTEGER DEFAULT 0,
       bandwidth_bps INTEGER DEFAULT NULL,
       bandwidth_test_time DATETIME DEFAULT NULL,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
@@ -143,6 +144,11 @@ async function initDatabase () {
   if (!hasTestUrl) {
     await db.exec(`ALTER TABLE proxies ADD COLUMN test_url TEXT DEFAULT NULL`);
     await db.exec(`ALTER TABLE proxies ADD COLUMN test_timeout INTEGER DEFAULT NULL`);
+  }
+
+  const hasSkipCertVerify = columns.some(col => col.name === 'skip_cert_verify');
+  if (!hasSkipCertVerify) {
+    await db.exec(`ALTER TABLE proxies ADD COLUMN skip_cert_verify INTEGER DEFAULT 0`);
   }
 
   const logColumns = await db.all("PRAGMA table_info(request_logs)");

@@ -243,10 +243,9 @@ const DEFAULT_ADVANCED_CONFIG = {
 
   // 算法权重配置
   algorithm_weights: {
-    responseTime: 0.25,
-    successRate: 0.2,
-    bandwidth: 0.15,
-    connections: 0.15,
+    responseTime: 0.3,
+    successRate: 0.25,
+    connections: 0.2,
     stability: 0.15,
     recentPerf: 0.1,
   },

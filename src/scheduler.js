@@ -1,7 +1,7 @@
 const { DEFAULT_ADVANCED_CONFIG } = require('./constants');
 
 function createScheduler ({ db, broadcast, getProxyServer, testProxy, loadAdvancedConfig }) {
-  const timers = { periodicTest: null, cleanLogs: null, statsUpdate: null };
+  const timers = { periodicTest: null, cleanLogs: null };
   const taskRunning = { periodicTest: false, cleanLogs: false };
 
   // 定期测试代理

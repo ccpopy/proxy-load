@@ -1,6 +1,7 @@
 const net = require('net');
 const CircuitBreaker = require('./CircuitBreaker');
 const ConnectionPool = require('./ConnectionPool');
+const DomainMatcher = require('./DomainMatcher');
 const { getArithmeticName, methods: utilMethods } = require('./utils');
 const algorithmMethods = require('./algorithms');
 const protocolMethods = require('./protocols');
@@ -17,6 +18,7 @@ class ProxyLoadBalancer {
     this.loadMode = 'auto';
     this.circuitBreakers = new Map();
     this.dnsCache = new Map();
+    this.domainMatcher = new DomainMatcher();
 
     this.circuitBreakerConfig = {
       threshold: 5,
@@ -24,7 +26,7 @@ class ProxyLoadBalancer {
       halfOpenAttempts: 2
     };
 
-    this.connectionPool = new ConnectionPool(50, 30000);
+    this.connectionPool = new ConnectionPool(50, 30000, 10000);
 
     this.healthCheckTimer = null;
     this.performanceTimer = null;
@@ -39,10 +41,9 @@ class ProxyLoadBalancer {
     };
 
     this.algorithmWeights = {
-      responseTime: 0.25,
-      successRate: 0.20,
-      bandwidth: 0.15,
-      connections: 0.15,
+      responseTime: 0.30,
+      successRate: 0.25,
+      connections: 0.20,
       stability: 0.15,
       recentPerf: 0.10
     };
@@ -70,43 +71,11 @@ class ProxyLoadBalancer {
 
     this.healthCheck = {
       interval: 30000,
-      timeout: 5000,
-      retries: 3,
       degradeThreshold: 0.5,
       recoverThreshold: 0.8
     };
 
     this.startMonitoring();
-  }
-
-  // ── 配置管理 ──
-
-  updateConfig (config) {
-    if (config.circuitBreakerConfig) {
-      this.circuitBreakerConfig = { ...this.circuitBreakerConfig, ...config.circuitBreakerConfig };
-      this.circuitBreakers.clear();
-    }
-
-    if (config.failFast) {
-      this.failFast = { ...this.failFast, ...config.failFast };
-    }
-
-    if (config.algorithmWeights) {
-      this.algorithmWeights = { ...this.algorithmWeights, ...config.algorithmWeights };
-    }
-
-    if (config.healthCheck) {
-      this.healthCheck = { ...this.healthCheck, ...config.healthCheck };
-      if (this.healthCheckTimer) {
-        clearInterval(this.healthCheckTimer);
-        this.healthCheckTimer = setInterval(() => this.performHealthCheck(), this.healthCheck.interval);
-      }
-    }
-
-    if (config.connectionPool) {
-      this.connectionPool.maxSize = config.connectionPool.maxSize || this.connectionPool.maxSize;
-      this.connectionPool.maxIdleTime = config.connectionPool.maxIdleTime || this.connectionPool.maxIdleTime;
-    }
   }
 
   getCircuitBreaker (proxyId) {
@@ -126,14 +95,19 @@ class ProxyLoadBalancer {
     return this.circuitBreakers.get(proxyId);
   }
 
+  async reloadDomainMatcher () {
+    await this.domainMatcher.loadFromDb(this.db);
+  }
+
   // ── TCP 服务器 ──
 
   async start (port = 5678) {
+    await this.domainMatcher.loadFromDb(this.db);
     this.server = net.createServer((client) => this.handleConnection(client));
 
     return new Promise((resolve, reject) => {
       this.server.listen(port, '0.0.0.0', () => {
-        console.log(`代理负载均衡服务器运行在 0.0.0.0:${port}`);
+        console.log(`混合代理负载均衡服务器运行在 0.0.0.0:${port}（SOCKS5/HTTP）`);
         console.log(`当前模式: ${this.loadMode === 'manual' ? '手动模式' : '自动负载均衡'}`);
         console.log(`当前算法: ${getArithmeticName(this.currentAlgorithm)}(${this.currentAlgorithm})`);
         resolve();
@@ -168,19 +142,35 @@ class ProxyLoadBalancer {
       }
     });
 
-    this.handleSocks5(client, startTime).catch(err => {
+    this.handleClientProtocol(client, startTime).catch(err => {
       client.destroy();
     });
   }
 
-  async handleSocks5 (client, startTime) {
+  async handleClientProtocol (client, startTime) {
+    const initialData = await this.readFirstDataWithTimeout(client, 1000);
+
+    if (initialData[0] === 0x05) {
+      await this.handleSocks5(client, startTime, initialData);
+      return;
+    }
+
+    if (this.isHttpProxyRequest(initialData)) {
+      await this.handleHttpProxy(client, startTime, initialData);
+      return;
+    }
+
+    throw new Error('不支持的入站代理协议');
+  }
+
+  async handleSocks5 (client, startTime, initialHandshake = null) {
     let targetHost = null;
     let targetPort = null;
 
     try {
       client.setTimeout(this.failFast.totalTimeout);
 
-      const handshake = await this.readDataWithTimeout(client, 1000);
+      const handshake = initialHandshake || await this.readDataWithTimeout(client, 1000);
       if (!handshake || handshake[0] !== 0x05) {
         this.sendSocks5Error(client, 0x01);
         return;
@@ -236,6 +226,57 @@ class ProxyLoadBalancer {
     }
   }
 
+  async handleHttpProxy (client, startTime, initialData) {
+    let targetHost = null;
+    let targetPort = null;
+
+    try {
+      client.setTimeout(this.failFast.totalTimeout);
+
+      const { header, rest } = await this.readHttpHeaderWithInitial(client, initialData, 5000);
+      const request = this.parseHttpProxyRequest(header);
+      targetHost = request.host;
+      targetPort = request.port;
+
+      if (request.inboundProtocol === 'http-forward') {
+        request.initialPayload = this.buildHttpForwardPayload(header, request, rest);
+      } else if (rest.length > 0) {
+        request.initialPayload = rest;
+      }
+
+      const resolvedRequest = await this.resolveTarget(request);
+
+      if (request.addressType === 0x03 && request.host) {
+        this.clientTargets.set(client, {
+          originalHost: request.host,
+          port: request.port,
+          resolvedHost: resolvedRequest.host,
+          dnsRewritten: !!resolvedRequest.dnsRewritten
+        });
+      }
+
+      const result = await this.connectWithFailFast(client, resolvedRequest, startTime);
+
+      if (!result.connected) {
+        this.sendHttpProxyError(client, 502, result.error || '所有代理连接失败');
+        if (this.logRequest) {
+          this.logRequest(null, targetHost, targetPort, false,
+            Date.now() - startTime, result.error || '所有代理连接失败', {
+              resultType: 'proxy_exhausted'
+            });
+        }
+      }
+    } catch (error) {
+      this.sendHttpProxyError(client, targetHost ? 502 : 400, error.message);
+      if (targetHost && this.logRequest) {
+        this.logRequest(null, targetHost, targetPort, false,
+          Date.now() - startTime, error.message, {
+            resultType: 'proxy_error'
+          });
+      }
+    }
+  }
+
   async connectWithFailFast (client, request, startTime) {
     const totalStartTime = Date.now();
 
@@ -250,14 +291,35 @@ class ProxyLoadBalancer {
       return { connected: false, error: '没有可用的代理' };
     }
 
-    const activeProxies = allProxies.filter(p => {
+    const lbHost = (request.originalHost || request.host || '').toLowerCase();
+    const groupProxyIds = await this.getGroupProxyIds(lbHost);
+    const scopedProxies = groupProxyIds
+      ? allProxies.filter(p => groupProxyIds.has(p.id))
+      : allProxies;
+
+    if (scopedProxies.length === 0) {
+      return { connected: false, error: `目标 ${lbHost || request.host} 匹配的代理分组没有可用代理` };
+    }
+
+    const activeProxies = scopedProxies.filter(p => {
       const circuitBreaker = this.getCircuitBreaker(p.id);
-      return circuitBreaker.canAttempt() && (p.status === 'active' || !p.status);
+      if (!circuitBreaker.canAttempt() || !(p.status === 'active' || !p.status)) {
+        return false;
+      }
+
+      const poolInfo = this.proxyPool.get(p.id);
+      if (poolInfo?.degraded) {
+        const degradeDuration = Date.now() - (poolInfo.degradedAt || 0);
+        if (degradeDuration < this.healthCheck.interval) {
+          return false;
+        }
+        this.recoverProxy(p.id);
+      }
+
+      return true;
     });
 
-    let proxiesToTry = activeProxies.length > 0 ? activeProxies : allProxies;
-
-    const lbHost = (request.originalHost || request.host || '').toLowerCase();
+    let proxiesToTry = activeProxies.length > 0 ? activeProxies : scopedProxies;
 
     const algorithm = this.algorithms[currentAlgorithm] || this.algorithms.adaptive;
     const ordered = await algorithm(proxiesToTry, lbHost);
@@ -266,6 +328,14 @@ class ProxyLoadBalancer {
       const rest = proxiesToTry.filter(p => !selectedIds.has(p.id));
       proxiesToTry = [...ordered, ...rest];
     }
+
+    const maxAttempts = Number.isInteger(Number(this.failFast.maxAttempts))
+      ? Math.max(1, Number(this.failFast.maxAttempts))
+      : proxiesToTry.length;
+    const attemptLimit = this.failFast.enabled === false
+      ? 1
+      : Math.min(maxAttempts, proxiesToTry.length);
+    proxiesToTry = proxiesToTry.slice(0, attemptLimit);
 
     const errors = [];
 

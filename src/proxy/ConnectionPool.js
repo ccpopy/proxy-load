@@ -1,8 +1,9 @@
 class ConnectionPool {
-  constructor (maxSize = 50, maxIdleTime = 30000) {
+  constructor (maxSize = 50, maxIdleTime = 30000, maxWaitTime = 10000) {
     this.pools = new Map();
     this.maxSize = maxSize;
     this.maxIdleTime = maxIdleTime;
+    this.maxWaitTime = maxWaitTime;
     this.waitQueues = new Map();
     this.stats = new Map();
   }
@@ -108,7 +109,7 @@ class ConnectionPool {
           if (stat) stat.waiting--;
         }
         reject(new Error('Connection wait timeout'));
-      }, 10000);
+      }, this.maxWaitTime);
 
       const callback = (conn) => {
         clearTimeout(timer);

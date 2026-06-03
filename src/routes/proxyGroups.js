@@ -1,7 +1,14 @@
 const express = require('express');
 
-module.exports = function ({ db, broadcast }) {
+module.exports = function ({ db, broadcast, getProxyServer }) {
   const router = express.Router();
+
+  async function reloadDomainMatcher () {
+    const proxyServer = getProxyServer?.();
+    if (proxyServer?.reloadDomainMatcher) {
+      await proxyServer.reloadDomainMatcher();
+    }
+  }
 
   // 获取所有分组
   router.get('/', async (req, res) => {
@@ -57,6 +64,7 @@ module.exports = function ({ db, broadcast }) {
       `, groupId);
 
       broadcast('proxy_group_created', group);
+      await reloadDomainMatcher();
       res.json(group);
     } catch (error) {
       res.status(500).json({ error: error.message });
@@ -107,6 +115,7 @@ module.exports = function ({ db, broadcast }) {
       `, groupId);
 
       broadcast('proxy_group_updated', group);
+      await reloadDomainMatcher();
       res.json(group);
     } catch (error) {
       res.status(500).json({ error: error.message });
@@ -118,6 +127,7 @@ module.exports = function ({ db, broadcast }) {
     try {
       await db.run('DELETE FROM proxy_groups WHERE id = ?', req.params.id);
       broadcast('proxy_group_deleted', { id: req.params.id });
+      await reloadDomainMatcher();
       res.json({ message: '分组已删除' });
     } catch (error) {
       res.status(500).json({ error: error.message });

@@ -69,7 +69,7 @@ module.exports = function ({ db, broadcast, getProxyServer, testProxy, logReques
   // 创建代理
   router.post('/', async (req, res) => {
     try {
-      const { name, type, host, port, username, password, enabled = 1, test_url, test_timeout } = req.body;
+      const { name, type, host, port, username, password, enabled = 1, test_url, test_timeout, skip_cert_verify } = req.body;
 
       // 验证必填字段
       if (!name || !type || !host || !port) {
@@ -86,8 +86,8 @@ module.exports = function ({ db, broadcast, getProxyServer, testProxy, logReques
       }
 
       const result = await db.run(
-        'INSERT INTO proxies (name, type, host, port, username, password, enabled, test_url, test_timeout) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-        [name, type, host, port, username, password, enabled, test_url || null, test_timeout || null]
+        'INSERT INTO proxies (name, type, host, port, username, password, enabled, test_url, test_timeout, skip_cert_verify) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        [name, type, host, port, username, password, enabled, test_url || null, test_timeout || null, skip_cert_verify ? 1 : 0]
       );
 
       const newProxy = await db.get('SELECT * FROM proxies WHERE id = ?', result.lastID);
@@ -101,11 +101,11 @@ module.exports = function ({ db, broadcast, getProxyServer, testProxy, logReques
   // 更新代理
   router.put('/:id', async (req, res) => {
     try {
-      const { name, type, host, port, username, password, enabled, test_url, test_timeout } = req.body;
+      const { name, type, host, port, username, password, enabled, test_url, test_timeout, skip_cert_verify } = req.body;
 
       await db.run(
-        'UPDATE proxies SET name = ?, type = ?, host = ?, port = ?, username = ?, password = ?, enabled = ?, test_url = ?, test_timeout = ? WHERE id = ?',
-        [name, type, host, port, username, password, enabled, test_url || null, test_timeout || null, req.params.id]
+        'UPDATE proxies SET name = ?, type = ?, host = ?, port = ?, username = ?, password = ?, enabled = ?, test_url = ?, test_timeout = ?, skip_cert_verify = ? WHERE id = ?',
+        [name, type, host, port, username, password, enabled, test_url || null, test_timeout || null, skip_cert_verify ? 1 : 0, req.params.id]
       );
 
       const updatedProxy = await db.get('SELECT * FROM proxies WHERE id = ?', req.params.id);
@@ -174,8 +174,11 @@ module.exports = function ({ db, broadcast, getProxyServer, testProxy, logReques
       await db.run('UPDATE proxies SET status = ? WHERE id = ?', ['testing', proxy.id]);
       broadcast('proxy_testing', { id: proxy.id });
 
-      // 只进行连通性测试，不测带宽
-      const result = await testProxy(proxy, testUrl, timeout, false);
+      const result = await testProxy(proxy, testUrl, timeout);
+      const testTarget = new URL(testUrl);
+      const testTargetPort = testTarget.port
+        ? Number(testTarget.port)
+        : (testTarget.protocol === 'https:' ? 443 : 80);
 
       if (result.success) {
         await db.run(
@@ -183,7 +186,7 @@ module.exports = function ({ db, broadcast, getProxyServer, testProxy, logReques
           ['active', result.responseTime, proxy.id]
         );
 
-        await logRequest(proxy.id, new URL(testUrl).hostname, 80, true, result.responseTime, null, {
+        await logRequest(proxy.id, testTarget.hostname, testTargetPort, true, result.responseTime, null, {
           resultType: 'health_success',
           proxyName: proxy.name,
           proxyType: proxy.type,
@@ -196,7 +199,7 @@ module.exports = function ({ db, broadcast, getProxyServer, testProxy, logReques
           ['inactive', proxy.id]
         );
 
-        await logRequest(proxy.id, new URL(testUrl).hostname, 80, false, null, result.error, {
+        await logRequest(proxy.id, testTarget.hostname, testTargetPort, false, null, result.error, {
           resultType: 'health_failure',
           proxyName: proxy.name,
           proxyType: proxy.type,

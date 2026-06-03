@@ -157,3 +157,15 @@ CLAUDE.md
 *.db-shm
 *.db-wal
 
+# Rust / Tauri
+target/
+src-tauri/target/
+src-tauri/gen/
+
+# Frontend build artifacts
+web/dist/
+
+# Local automation artifacts
+.playwright-cli/
+.codesign-mcp/
+

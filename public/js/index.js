@@ -275,6 +275,11 @@ const messageHandler = {
       }
     },
 
+    traffic_logs_cleared: (data) => {
+      trafficLogManager.handleCleared(data);
+      refreshSystemStatsAfterTrafficLogChange();
+    },
+
     batch_test_completed: (data) => {
       // 只在非积压处理模式下显示进度
       if (!wsManager.isProcessingBacklog && data?.batch && data?.totalBatches) {
@@ -318,12 +323,6 @@ const messageHandler = {
     periodic_test_error: (data) => {
       // 错误始终显示
       uiUtils.showToast("定期测试失败: " + (data?.error || ""), "error");
-    },
-
-    stats_update: (data) => {
-      if (window.__systemStatusInited) {
-        chartManager.updateChartsPartial(data);
-      }
     }
   },
 
@@ -343,6 +342,10 @@ const messageHandler = {
           chartManager.updateStatisticsPartial(data);
           trafficLogManager.pushRealtime(data);
         }
+      },
+      traffic_logs_cleared: (data) => {
+        trafficLogManager.handleCleared(data);
+        refreshSystemStatsAfterTrafficLogChange();
       },
       periodic_test_completed: (data) => {
         if (data.overview) chartManager.updateOverviewKPIs(data.overview);
@@ -483,6 +486,156 @@ const uiUtils = {
   }
 };
 
+const customSelectManager = {
+  instances: new Map(),
+  listenersReady: false,
+
+  initAll (root = document) {
+    this.ensureGlobalListeners();
+    root.querySelectorAll("select").forEach(select => this.init(select));
+    this.syncAll();
+  },
+
+  init (select) {
+    if (!select || this.instances.has(select)) return;
+
+    const wrapper = document.createElement("div");
+    wrapper.className = "custom-select";
+    if (select.classList.contains("w-full")) wrapper.classList.add("w-full");
+    if (select.id === "traffic-log-page-size") wrapper.classList.add("is-compact");
+
+    select.parentNode.insertBefore(wrapper, select);
+    wrapper.appendChild(select);
+    select.classList.add("native-select-hidden");
+    select.tabIndex = -1;
+    select.setAttribute("aria-hidden", "true");
+
+    const trigger = document.createElement("button");
+    trigger.type = "button";
+    trigger.className = "custom-select-trigger";
+    trigger.setAttribute("aria-haspopup", "listbox");
+    trigger.setAttribute("aria-expanded", "false");
+    trigger.innerHTML = `
+      <span class="custom-select-value"></span>
+      <i class="fas fa-chevron-down custom-select-chevron"></i>
+    `;
+
+    const menu = document.createElement("div");
+    menu.className = "custom-select-menu";
+    menu.setAttribute("role", "listbox");
+
+    wrapper.appendChild(trigger);
+    wrapper.appendChild(menu);
+
+    const instance = { select, wrapper, trigger, menu };
+    this.instances.set(select, instance);
+    this.rebuildOptions(select);
+
+    trigger.addEventListener("click", event => {
+      event.stopPropagation();
+      this.toggle(select);
+    });
+
+    trigger.addEventListener("keydown", event => {
+      if (["Enter", " ", "ArrowDown"].includes(event.key)) {
+        event.preventDefault();
+        this.open(select);
+      }
+      if (event.key === "Escape") {
+        this.close(select);
+      }
+    });
+
+    select.addEventListener("change", () => this.sync(select));
+  },
+
+  rebuildOptions (select) {
+    const instance = this.instances.get(select);
+    if (!instance) return;
+
+    instance.menu.innerHTML = Array.from(select.options).map(option => `
+      <button type="button" class="custom-select-option" role="option" data-value="${escapeHtml(option.value)}">
+        <span>${escapeHtml(option.textContent)}</span>
+        <i class="fas fa-check custom-select-check"></i>
+      </button>
+    `).join("");
+
+    instance.menu.querySelectorAll(".custom-select-option").forEach(button => {
+      button.addEventListener("click", event => {
+        event.stopPropagation();
+        select.value = button.dataset.value;
+        select.dispatchEvent(new Event("change", { bubbles: true }));
+        this.close(select);
+      });
+    });
+
+    this.sync(select);
+  },
+
+  toggle (select) {
+    const instance = this.instances.get(select);
+    if (!instance) return;
+
+    if (instance.wrapper.classList.contains("open")) {
+      this.close(select);
+    } else {
+      this.open(select);
+    }
+  },
+
+  open (select) {
+    const instance = this.instances.get(select);
+    if (!instance) return;
+
+    this.closeAll(select);
+    instance.wrapper.classList.add("open");
+    instance.trigger.setAttribute("aria-expanded", "true");
+  },
+
+  close (select) {
+    const instance = this.instances.get(select);
+    if (!instance) return;
+
+    instance.wrapper.classList.remove("open");
+    instance.trigger.setAttribute("aria-expanded", "false");
+  },
+
+  closeAll (exceptSelect = null) {
+    this.instances.forEach((_, select) => {
+      if (select !== exceptSelect) this.close(select);
+    });
+  },
+
+  sync (select) {
+    const instance = this.instances.get(select);
+    if (!instance) return;
+
+    const selected = select.selectedOptions[0] || select.options[0];
+    const valueText = selected ? selected.textContent : "";
+    instance.trigger.querySelector(".custom-select-value").textContent = valueText;
+
+    instance.menu.querySelectorAll(".custom-select-option").forEach(button => {
+      const isSelected = button.dataset.value === select.value;
+      button.classList.toggle("is-selected", isSelected);
+      button.setAttribute("aria-selected", isSelected ? "true" : "false");
+    });
+  },
+
+  syncAll () {
+    this.instances.forEach((_, select) => this.sync(select));
+  },
+
+  ensureGlobalListeners () {
+    if (this.listenersReady) return;
+    this.listenersReady = true;
+
+    document.addEventListener("click", () => this.closeAll());
+    document.addEventListener("keydown", event => {
+      if (event.key === "Escape") this.closeAll();
+    });
+  }
+};
+
 // 代理管理器
 const proxyManager = {
   allProxies: [],
@@ -508,7 +661,7 @@ const proxyManager = {
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const proxies = await response.json();
       this.allProxies = proxies;
-      const filtered = this.applyFilter(proxies);
+      const filtered = this.sortProxiesForDisplay(this.applyFilter(proxies));
       this.filteredProxies = filtered;
       updateProxyFilterCounts(proxies);
       statusManager.setStatus("online");
@@ -557,6 +710,25 @@ const proxyManager = {
       return proxies.filter(proxy => isProxyEnabled(proxy) && proxy.status === "testing");
     }
     return proxies;
+  },
+
+  sortProxiesForDisplay (proxies) {
+    const statusRank = (proxy) => {
+      if (!isProxyEnabled(proxy)) return 4;
+      if (proxy.status === "active") return 0;
+      if (proxy.status === "testing") return 1;
+      if (proxy.status === "inactive") return 3;
+      return 2;
+    };
+
+    return (Array.isArray(proxies) ? proxies : [])
+      .map((proxy, index) => ({ proxy, index }))
+      .sort((a, b) => {
+        const rankDiff = statusRank(a.proxy) - statusRank(b.proxy);
+        if (rankDiff !== 0) return rankDiff;
+        return a.index - b.index;
+      })
+      .map(item => item.proxy);
   },
 
   createCard (proxy, index) {
@@ -650,7 +822,7 @@ const proxyManager = {
     const testButtonHtml = isTesting ? TEST_BUTTON_HTML.loading : TEST_BUTTON_HTML.idle;
     const testButtonDisabled = !proxy.enabled || proxy.enabled === 0 || isTesting;
     const buttons = [
-      `<button data-test-proxy-id="${proxy.id}" data-proxy-enabled="${proxy.enabled ? 1 : 0}" onclick="testProxy(event, ${proxy.id}, { bandwidth:false })" class="btn-success" ${testButtonDisabled ? 'disabled' : ''}>
+      `<button data-test-proxy-id="${proxy.id}" data-proxy-enabled="${proxy.enabled ? 1 : 0}" onclick="testProxy(${proxy.id})" class="btn-success" ${testButtonDisabled ? 'disabled' : ''}>
         ${testButtonHtml}
       </button>`,
       `<div class="flex justify-end">
@@ -739,7 +911,7 @@ function applyProxyFilter (filterValue) {
       btn.classList.toggle("active", btn.dataset.filter === nextFilter);
     });
   }
-  const filtered = proxyManager.applyFilter(proxyManager.allProxies || []);
+  const filtered = proxyManager.sortProxiesForDisplay(proxyManager.applyFilter(proxyManager.allProxies || []));
   proxyManager.filteredProxies = filtered;
   proxyManager.renderCards(filtered);
 }
@@ -1003,25 +1175,6 @@ const chartManager = {
     this.applyHourlyToCharts(hourlyData);
   },
 
-  updateChartsPartial (payload) {
-    if (!payload) return;
-
-    if (Array.isArray(payload)) {
-      this.applyHourlyToCharts(payload);
-      return;
-    }
-    if (payload.type === "hourly" || Array.isArray(payload.hourly)) {
-      const data = payload.type === "hourly" ? payload.data : payload.hourly;
-      this.applyHourlyToCharts(Array.isArray(data) ? data : []);
-      return;
-    }
-    if (payload.type === "proxy_usage") {
-      this.updateProxyUsageChart(Array.isArray(payload.data) ? payload.data : []);
-    } else if (payload.type === "overview") {
-      this.updateOverviewKPIs(payload.data || {});
-    }
-  },
-
   async loadAndUpdateProxyUsage () {
     try {
       const res = await fetch(`${API_BASE}/api/stats/proxy-usage`);
@@ -1116,6 +1269,16 @@ const chartManager = {
   }
 };
 
+function refreshSystemStatsAfterTrafficLogChange () {
+  if (!window.__systemStatusInited) return;
+
+  chartManager.loadAndUpdateOverview();
+  chartManager.loadAndUpdateHourly();
+  chartManager.loadAndUpdateProxyUsage();
+  chartManager.loadAndUpdateTargets();
+  chartManager.loadFailedTargets();
+}
+
 const TRAFFIC_STATUS_META = Object.freeze({
   direct_success: { text: "成功", className: "bg-green-100 text-green-700" },
   health_success: { text: "健康检查成功", className: "bg-emerald-100 text-emerald-700" },
@@ -1127,27 +1290,58 @@ const TRAFFIC_STATUS_META = Object.freeze({
 });
 
 const trafficLogManager = {
-  maxRows: 100,
+  page: 1,
+  pageSize: 50,
+  total: 0,
+  totalPages: 1,
   logs: [],
 
-  async load () {
+  async load (page = this.page) {
     try {
-      const response = await fetch(`${API_BASE}/api/traffic-logs`);
+      const nextPage = Number(page);
+      if (!Number.isInteger(nextPage) || nextPage < 1) {
+        throw new Error(`无效页码: ${page}`);
+      }
+
+      const params = new URLSearchParams({
+        page: String(nextPage),
+        page_size: String(this.pageSize)
+      });
+
+      const response = await fetch(`${API_BASE}/api/traffic-logs?${params.toString()}`);
       if (!response.ok) {
         throw new Error(`HTTP ${response.status}`);
       }
       const data = await response.json();
-      this.logs = Array.isArray(data) ? data.slice(0, this.maxRows) : [];
+      if (!data || !Array.isArray(data.items)) {
+        throw new Error("流量日志接口返回格式不正确");
+      }
+
+      this.logs = data.items;
+      this.page = Number(data.page);
+      this.pageSize = Number(data.pageSize);
+      this.total = Number(data.total);
+      this.totalPages = Number(data.totalPages);
       this.render();
     } catch (error) {
       console.error("流量日志获取失败", error);
+      uiUtils.showToast(`流量日志获取失败: ${error.message}`, "error");
     }
   },
 
   pushRealtime (log) {
     if (!log) return;
     const normalized = this.normalizeRealtimeLog(log);
-    this.logs = [normalized, ...this.logs].slice(0, this.maxRows);
+
+    this.total += 1;
+    this.totalPages = Math.max(1, Math.ceil(this.total / this.pageSize));
+
+    if (this.page !== 1) {
+      this.renderPagination();
+      return;
+    }
+
+    this.logs = [normalized, ...this.logs].slice(0, this.pageSize);
     this.render();
   },
 
@@ -1169,6 +1363,68 @@ const trafficLogManager = {
     };
   },
 
+  prevPage () {
+    if (this.page <= 1) return;
+    this.load(this.page - 1);
+  },
+
+  nextPage () {
+    if (this.page >= this.totalPages) return;
+    this.load(this.page + 1);
+  },
+
+  changePageSize (value) {
+    const nextPageSize = Number(value);
+    if (!Number.isInteger(nextPageSize) || nextPageSize < 1) {
+      uiUtils.showToast(`无效每页条数: ${value}`, "error");
+      this.renderPagination();
+      return;
+    }
+
+    this.pageSize = nextPageSize;
+    this.load(1);
+  },
+
+  async clear () {
+    const result = await Swal.fire({
+      title: "确定要清除全部流量日志吗？",
+      text: "此操作会删除当前保存的所有请求日志。",
+      icon: "warning",
+      showCancelButton: true,
+      confirmButtonText: "清除",
+      cancelButtonText: "取消"
+    });
+
+    if (!result.isConfirmed) return;
+
+    const button = document.querySelector("#clear-traffic-logs-btn");
+    if (button) button.disabled = true;
+
+    try {
+      const response = await fetch(`${API_BASE}/api/traffic-logs`, { method: "DELETE" });
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+
+      const data = await response.json();
+      this.handleCleared(data);
+      refreshSystemStatsAfterTrafficLogChange();
+      uiUtils.showToast(`已清除 ${data.deleted || 0} 条流量日志`, "success");
+    } catch (error) {
+      uiUtils.showToast(`清除流量日志失败: ${error.message}`, "error");
+    } finally {
+      if (button) button.disabled = this.total === 0;
+    }
+  },
+
+  handleCleared () {
+    this.page = 1;
+    this.total = 0;
+    this.totalPages = 1;
+    this.logs = [];
+    this.render();
+  },
+
   render () {
     const tbody = document.querySelector("#traffic-log-list");
     const noDataDiv = document.querySelector("#no-traffic-logs");
@@ -1177,11 +1433,30 @@ const trafficLogManager = {
     if (!Array.isArray(this.logs) || this.logs.length === 0) {
       tbody.innerHTML = "";
       noDataDiv.classList.remove("hidden");
+      this.renderPagination();
       return;
     }
 
     noDataDiv.classList.add("hidden");
     tbody.innerHTML = this.logs.map(log => this.renderRow(log)).join("");
+    this.renderPagination();
+  },
+
+  renderPagination () {
+    const totalEl = document.querySelector("#traffic-log-total");
+    const pageInfoEl = document.querySelector("#traffic-log-page-info");
+    const prevBtn = document.querySelector("#traffic-log-prev");
+    const nextBtn = document.querySelector("#traffic-log-next");
+    const pageSizeSelect = document.querySelector("#traffic-log-page-size");
+    const clearBtn = document.querySelector("#clear-traffic-logs-btn");
+
+    if (totalEl) totalEl.textContent = `共 ${this.total.toLocaleString()} 条`;
+    if (pageInfoEl) pageInfoEl.textContent = `第 ${this.page} / ${this.totalPages} 页`;
+    if (prevBtn) prevBtn.disabled = this.page <= 1;
+    if (nextBtn) nextBtn.disabled = this.page >= this.totalPages;
+    if (pageSizeSelect) pageSizeSelect.value = String(this.pageSize);
+    if (clearBtn) clearBtn.disabled = this.total === 0;
+    customSelectManager.syncAll();
   },
 
   renderRow (log) {
@@ -1267,6 +1542,22 @@ const trafficLogManager = {
   }
 };
 
+function prevTrafficLogPage () {
+  trafficLogManager.prevPage();
+}
+
+function nextTrafficLogPage () {
+  trafficLogManager.nextPage();
+}
+
+function changeTrafficLogPageSize (value) {
+  trafficLogManager.changePageSize(value);
+}
+
+function clearTrafficLogs () {
+  trafficLogManager.clear();
+}
+
 // 页面可见性监听
 document.addEventListener('visibilitychange', () => {
   wsManager.setPageActive(!document.hidden);
@@ -1296,6 +1587,7 @@ function showSection (sectionId, el) {
     "proxy-list": "代理配置管理",
     "dns-mappings": "DNS映射管理",
     "test-settings": "负载设置",
+    "proxy-groups": "代理分组",
     "advanced-config": "高级配置",
     "system-status": "系统状态"
   };
@@ -1313,6 +1605,8 @@ function showSection (sectionId, el) {
   } else if (sectionId === "advanced-config") {
     loadAdvancedConfig();
   } else if (sectionId === "test-settings") {
+    customSelectManager.syncAll();
+  } else if (sectionId === "proxy-groups") {
     loadProxyGroups();
   }
 }
@@ -1520,6 +1814,18 @@ function refreshProxyList () {
   if (uiUtils.isSystemStatusVisible()) {
     uiUtils.showToast("正在刷新统计数据...", "info");
     chartManager.refresh();
+  } else if (!document.querySelector("#proxy-groups")?.classList.contains("hidden")) {
+    uiUtils.showToast("正在刷新代理分组...", "info");
+    loadProxyGroups();
+  } else if (!document.querySelector("#dns-mappings")?.classList.contains("hidden")) {
+    uiUtils.showToast("正在刷新DNS映射...", "info");
+    loadDNSMappings();
+  } else if (!document.querySelector("#advanced-config")?.classList.contains("hidden")) {
+    uiUtils.showToast("正在刷新高级配置...", "info");
+    loadAdvancedConfig();
+  } else if (!document.querySelector("#test-settings")?.classList.contains("hidden")) {
+    uiUtils.showToast("正在刷新负载设置...", "info");
+    loadSettings();
   } else {
     proxyManager.loadList();
   }
@@ -1546,6 +1852,7 @@ async function loadSettings () {
     const exists = Array.from(algorithmSelect.options).some(opt => opt.value === settings.algorithm);
     algorithmSelect.value = exists ? settings.algorithm : "adaptive";
   }
+  customSelectManager.syncAll();
 
   // 加载高级配置
   await loadAdvancedConfig();
@@ -1584,7 +1891,9 @@ async function showAddProxyModal () {
   document.querySelector("#proxy-enabled").checked = true;
   document.querySelector("#proxy-test-url").value = "";
   document.querySelector("#proxy-test-timeout").value = "";
+  document.querySelector("#proxy-skip-cert-verify").checked = false;
   await loadTestUrlOptions();
+  customSelectManager.syncAll();
   document.querySelector("#proxy-modal").classList.remove("hidden");
 }
 
@@ -1615,7 +1924,8 @@ async function saveProxy () {
     password: document.querySelector("#proxy-password").value,
     enabled: document.querySelector("#proxy-enabled").checked ? 1 : 0,
     test_url: document.querySelector("#proxy-test-url").value || null,
-    test_timeout: testTimeoutVal ? parseInt(testTimeoutVal) : null
+    test_timeout: testTimeoutVal ? parseInt(testTimeoutVal) : null,
+    skip_cert_verify: document.querySelector("#proxy-skip-cert-verify").checked ? 1 : 0
   };
 
   if (!data.name || !data.host || !data.port) {
@@ -1659,9 +1969,11 @@ async function editProxy (id) {
     document.querySelector("#proxy-enabled").checked = proxy.enabled === 1 || proxy.enabled === true;
     document.querySelector("#proxy-test-url").value = proxy.test_url || "";
     document.querySelector("#proxy-test-timeout").value = proxy.test_timeout || "";
+    document.querySelector("#proxy-skip-cert-verify").checked = proxy.skip_cert_verify === 1 || proxy.skip_cert_verify === true;
 
     await loadTestUrlOptions();
     toggleAuthFields();
+    customSelectManager.syncAll();
     document.querySelector("#proxy-modal").classList.remove("hidden");
   } catch (error) {
     console.log(error.message);
@@ -1767,8 +2079,7 @@ async function testAllProxies () {
         try {
           const response = await fetch(`${API_BASE}/api/proxies/${proxy.id}/test`, {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ measureBandwidth: false })
+            headers: { "Content-Type": "application/json" }
           });
           if (!response.ok) throw new Error(`HTTP ${response.status}`);
           const result = await response.json();
@@ -1808,7 +2119,7 @@ async function testAllProxies () {
   proxyManager.loadList();
 }
 
-async function testProxy (event, id, opts = {}) {
+async function testProxy (id) {
   const proxyKey = String(id);
   if (testingButtons.has(proxyKey)) return;
 
@@ -1832,8 +2143,7 @@ async function testProxy (event, id, opts = {}) {
 
     const response = await fetch(`${API_BASE}/api/proxies/${id}/test`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ measureBandwidth: false })
+      headers: { "Content-Type": "application/json" }
     });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const result = await response.json();
@@ -1912,10 +2222,6 @@ async function loadAdvancedConfig () {
         document.querySelector("#weight-success").value = weights.successRate * 100;
         document.querySelector("#weight-success-value").textContent = weights.successRate.toFixed(2);
       }
-      if (weights.bandwidth !== undefined) {
-        document.querySelector("#weight-bandwidth").value = weights.bandwidth * 100;
-        document.querySelector("#weight-bandwidth-value").textContent = weights.bandwidth.toFixed(2);
-      }
       if (weights.connections !== undefined) {
         document.querySelector("#weight-connections").value = weights.connections * 100;
         document.querySelector("#weight-connections-value").textContent = weights.connections.toFixed(2);
@@ -1974,7 +2280,6 @@ async function saveAdvancedConfig () {
     algorithm_weights: {
       responseTime: parseFloat(document.querySelector("#weight-response").value) / 100,
       successRate: parseFloat(document.querySelector("#weight-success").value) / 100,
-      bandwidth: parseFloat(document.querySelector("#weight-bandwidth").value) / 100,
       connections: parseFloat(document.querySelector("#weight-connections").value) / 100,
       stability: parseFloat(document.querySelector("#weight-stability").value) / 100,
       recentPerf: parseFloat(document.querySelector("#weight-recent").value) / 100
@@ -2078,8 +2383,7 @@ function updateWeightDisplay (name) {
 // 更新权重总和
 function updateWeightTotal () {
   const weights = [
-    'response', 'success', 'bandwidth',
-    'connections', 'stability', 'recent'
+    'response', 'success', 'connections', 'stability', 'recent'
   ];
 
   let total = 0;
@@ -2375,7 +2679,10 @@ function renderProxyGroups (groups) {
       <div class="mb-2">
         <span class="text-xs text-gray-500 mr-1">域名:</span>
         ${group.domains.length > 0
-          ? group.domains.map(d => `<span class="inline-block text-xs bg-gray-100 text-gray-700 px-2 py-0.5 rounded mr-1 mb-1">${escapeHtml(d.domain)}</span>`).join("")
+          ? group.domains.map(d => {
+            const isWild = d.domain.startsWith('*');
+            return `<span class="inline-block text-xs ${isWild ? 'bg-purple-100 text-purple-700' : 'bg-gray-100 text-gray-700'} px-2 py-0.5 rounded mr-1 mb-1">${escapeHtml(d.domain)}</span>`;
+          }).join("")
           : '<span class="text-xs text-gray-400">无</span>'}
       </div>
       <div>
@@ -2444,6 +2751,12 @@ function addGroupDomain () {
   const input = document.querySelector("#group-domain-input");
   const domain = input.value.trim().toLowerCase();
   if (!domain) return;
+  // 验证域名格式: 精确域名、泛域名(*.xxx.com)、全局通配(*)
+  const domainPattern = /^(\*|\*\.[a-z0-9]([a-z0-9\-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9\-]*[a-z0-9])?)*|[a-z0-9]([a-z0-9\-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9\-]*[a-z0-9])?)*)$/;
+  if (!domainPattern.test(domain)) {
+    Swal.fire({ icon: "warning", title: "域名格式不正确", text: "支持格式: example.com、*.example.com、*" });
+    return;
+  }
   if (groupDomains.includes(domain)) {
     input.value = "";
     return;
@@ -2460,12 +2773,16 @@ function removeGroupDomain (domain) {
 
 function renderGroupDomainTags () {
   const container = document.querySelector("#group-domains-tags");
-  container.innerHTML = groupDomains.map(d => `
-    <span class="inline-flex items-center gap-1 bg-blue-100 text-blue-700 text-sm px-2 py-1 rounded">
+  container.innerHTML = groupDomains.map(d => {
+    const isWildcard = d.startsWith('*');
+    const bgClass = isWildcard ? 'bg-purple-100 text-purple-700' : 'bg-blue-100 text-blue-700';
+    const btnClass = isWildcard ? 'text-purple-500 hover:text-purple-700' : 'text-blue-500 hover:text-blue-700';
+    return `
+    <span class="inline-flex items-center gap-1 ${bgClass} text-sm px-2 py-1 rounded">
       ${escapeHtml(d)}
-      <button type="button" onclick="removeGroupDomain('${d}')" class="text-blue-500 hover:text-blue-700">&times;</button>
-    </span>
-  `).join("");
+      <button type="button" onclick="removeGroupDomain('${d}')" class="${btnClass}">&times;</button>
+    </span>`;
+  }).join("");
 }
 
 async function saveGroup () {
@@ -2554,11 +2871,11 @@ async function deleteGroup (id) {
 
 // 初始化
 document.addEventListener("DOMContentLoaded", () => {
+  customSelectManager.initAll();
   // 渲染页面框架
   proxyManager.renderSkeleton();
   loadSettings();
   loadVersionInfo();
-  loadProxyGroups();
 
   // 使用 requestIdleCallback 延迟非关键操作
   if ('requestIdleCallback' in window) {

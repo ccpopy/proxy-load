@@ -4,11 +4,12 @@ const dns = require('dns').promises;
 // 协议处理方法 - ProxyLoadBalancer.prototype mixin
 
 module.exports = {
-  async getConnectionFromPool (proxyId, createFn, timeout = 5000) {
+  async getConnectionFromPool (proxyId, createFn, timeout) {
+    const waitTimeout = timeout ?? this.connectionPool?.maxWaitTime ?? 5000;
     return Promise.race([
       this.connectionPool.getConnection(proxyId, createFn),
       new Promise((_, reject) =>
-        setTimeout(() => reject(new Error('获取连接超时')), timeout)
+        setTimeout(() => reject(new Error('获取连接超时')), waitTimeout)
       )
     ]);
   },
@@ -114,7 +115,7 @@ module.exports = {
         return false;
       }
 
-      client.write(connectResponse);
+      this.completeClientProxyHandshake(client, proxySocket, request, connectResponse);
 
       client.pipe(proxySocket);
       proxySocket.pipe(client);
@@ -216,11 +217,9 @@ module.exports = {
           if (addresses.length > 0) {
             targetIP = addresses[0];
           } else {
-            this.sendSocks5Error(client, 0x04);
             return false;
           }
         } catch (error) {
-          this.sendSocks5Error(client, 0x04);
           return false;
         }
       } else {
@@ -229,7 +228,7 @@ module.exports = {
 
       const conn = await this.getConnectionFromPool(proxy.id, async () => {
         return await this.createSocks4Connection(proxy);
-      }, 3000);
+      });
 
       if (!conn || !conn.socket || conn.socket.destroyed) {
         if (conn) this.connectionPool.releaseConnection(conn);
@@ -255,12 +254,7 @@ module.exports = {
         return false;
       }
 
-      const successResponse = Buffer.from([
-        0x05, 0x00, 0x00, 0x01,
-        0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00
-      ]);
-      client.write(successResponse);
+      this.completeClientProxyHandshake(client, proxySocket, request);
 
       this.setupBidirectionalPipe(client, proxySocket, conn);
 
@@ -300,7 +294,7 @@ module.exports = {
     try {
       const conn = await this.getConnectionFromPool(proxy.id, async () => {
         return await this.createHttpConnection(proxy);
-      }, 3000);
+      });
 
       if (!conn || !conn.socket || conn.socket.destroyed) {
         if (conn) this.connectionPool.releaseConnection(conn);
@@ -332,12 +326,7 @@ module.exports = {
         return false;
       }
 
-      const successResponse = Buffer.from([
-        0x05, 0x00, 0x00, 0x01,
-        0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00
-      ]);
-      client.write(successResponse);
+      this.completeClientProxyHandshake(client, proxySocket, request);
 
       this.setupBidirectionalPipe(client, proxySocket, conn);
 

@@ -1,6 +1,8 @@
 // 健康检查、性能评估、指标管理
 // 所有方法作为 ProxyLoadBalancer.prototype mixin
 
+const ALGORITHM_WEIGHT_KEYS = ['responseTime', 'successRate', 'connections', 'stability', 'recentPerf'];
+
 module.exports = {
   // ── 监控 ──
 
@@ -59,7 +61,7 @@ module.exports = {
       weights.successRate = Math.min(0.40, weights.successRate + adjustment);
 
       const toReduce = adjustment;
-      const otherWeights = ['responseTime', 'bandwidth', 'connections', 'stability', 'recentPerf'];
+      const otherWeights = ['responseTime', 'connections', 'stability', 'recentPerf'];
       const reductionEach = toReduce / otherWeights.length;
 
       otherWeights.forEach(key => {
@@ -76,7 +78,7 @@ module.exports = {
       const adjustment = 0.10;
       weights.connections = Math.min(0.35, weights.connections + adjustment);
 
-      const otherWeights = ['responseTime', 'bandwidth', 'stability', 'recentPerf'];
+      const otherWeights = ['responseTime', 'stability', 'recentPerf'];
       const reductionEach = adjustment / otherWeights.length;
 
       otherWeights.forEach(key => {
@@ -94,22 +96,27 @@ module.exports = {
     this.algorithmWeights = weights;
   },
 
-  resetAlgorithmWeights () {
-    if (this.originalWeights) {
-      this.algorithmWeights = { ...this.originalWeights };
-    }
-  },
-
   setAlgorithmWeights (weights) {
-    const sum = Object.values(weights).reduce((a, b) => a + b, 0);
+    const nextWeights = {};
+    for (const key of ALGORITHM_WEIGHT_KEYS) {
+      const value = Number(weights?.[key]);
+      nextWeights[key] = Number.isFinite(value) && value >= 0
+        ? value
+        : this.algorithmWeights[key];
+    }
+
+    const sum = Object.values(nextWeights).reduce((a, b) => a + b, 0);
+    if (sum <= 0) {
+      throw new Error('算法权重总和必须大于 0');
+    }
     if (Math.abs(sum - 1.0) > 0.01) {
-      for (let key in weights) {
-        weights[key] = weights[key] / sum;
+      for (const key of ALGORITHM_WEIGHT_KEYS) {
+        nextWeights[key] = nextWeights[key] / sum;
       }
     }
 
-    this.algorithmWeights = { ...weights };
-    this.originalWeights = { ...weights };
+    this.algorithmWeights = { ...nextWeights };
+    this.originalWeights = { ...nextWeights };
   },
 
   getTotalRequests () {

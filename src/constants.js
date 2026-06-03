@@ -29,10 +29,9 @@ const DEFAULT_ADVANCED_CONFIG = {
 
   // 算法权重配置
   algorithm_weights: {
-    responseTime: 0.25,
-    successRate: 0.20,
-    bandwidth: 0.15,
-    connections: 0.15,
+    responseTime: 0.30,
+    successRate: 0.25,
+    connections: 0.20,
     stability: 0.15,
     recentPerf: 0.10
   }
@@ -45,6 +44,6 @@ const VALID_ALGORITHMS = new Set([
   'sticky_host'
 ]);
 
-const TRAFFIC_LOG_LIMIT = 100;
+const TRAFFIC_LOG_DEFAULT_PAGE_SIZE = 50;
 
-module.exports = { DEFAULT_ADVANCED_CONFIG, VALID_ALGORITHMS, TRAFFIC_LOG_LIMIT };
+module.exports = { DEFAULT_ADVANCED_CONFIG, VALID_ALGORITHMS, TRAFFIC_LOG_DEFAULT_PAGE_SIZE };
