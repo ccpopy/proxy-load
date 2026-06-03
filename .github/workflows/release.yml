@@ -83,7 +83,7 @@ jobs:
           releaseBody: |
             ## Changes
 
-            - 版本升级为 2026.6.3+1，用同日期小版本区分首个发布版后的更新。
+            - 版本升级为 2026.6.3+2，用同日期小版本区分首个发布版后的更新。
             - README 增加 Tauri、Rust、React、TypeScript、Vite、shadcn/ui 和 Recharts 技术徽标。
             - 公开文档移除历史入口说明，本地历史实现文件从仓库跟踪中移除。
             - 修复系统状态页排行图 X 轴标签重叠问题。
@@ -91,9 +91,7 @@ jobs:
             - 优化 GitHub Releases 检查更新错误提示，明确公开仓库、私有仓库和 Token 权限问题。
           releaseDraft: false
           prerelease: ${{ contains(github.ref_name, '-') }}
-          releaseAssetNamePattern: zwfw-load_${{ steps.package-version.outputs.version }}_[platform]_[arch][setup][ext]
-          uploadWorkflowArtifacts: true
-          workflowArtifactNamePattern: zwfw-load-[platform]-[arch]-[bundle]
+          assetNamePattern: zwfw-load_${{ steps.package-version.outputs.version }}_[platform]_[arch][setup][ext]
 
       - name: Upload Windows portable executable
         if: runner.os == 'Windows'

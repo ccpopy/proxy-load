@@ -1,6 +1,6 @@
 {
   "name": "zwfw-load",
-  "version": "2026.6.3+1",
+  "version": "2026.6.3+2",
   "description": "代理负载均衡管理系统",
   "scripts": {
     "start": "npm run tauri:dev",

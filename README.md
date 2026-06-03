@@ -142,7 +142,7 @@ release/
 Windows 本地构建还会额外复制一个可直接运行的便携 exe：
 
 ```text
-release/zwfw-load_2026.6.3+1_x64-portable.exe
+release/zwfw-load_2026.6.3+2_x64-portable.exe
 ```
 
 这个文件主要用于本机验证，可以直接双击运行；正式更新安装仍建议使用 setup 或 msi 安装包。
@@ -153,8 +153,8 @@ release/zwfw-load_2026.6.3+1_x64-portable.exe
 
 Windows：
 
-- 便携运行：下载 `zwfw-load_2026.6.3+1_x64-portable.exe`，放到目标目录后直接双击运行。
-- 安装运行：下载 Windows x64 的 `setup.exe` 或 `.msi` 安装包，按安装向导完成安装。GitHub Release 文件名会使用 `zwfw-load_2026.6.3+1_windows_*` 前缀。
+- 便携运行：下载 `zwfw-load_2026.6.3+2_x64-portable.exe`，放到目标目录后直接双击运行。
+- 安装运行：下载 Windows x64 的 `setup.exe` 或 `.msi` 安装包，按安装向导完成安装。GitHub Release 文件名会使用 `zwfw-load_2026.6.3+2_windows_*` 前缀。
 - 启动后应用会监听默认代理端口 `5678`，浏览器或系统代理可配置为 `SOCKS5 127.0.0.1:5678` 或 `HTTP 127.0.0.1:5678`。
 
 macOS：
