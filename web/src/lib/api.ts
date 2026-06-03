@@ -45,7 +45,7 @@ export function onServerEvent(handler: (message: ServerEvent) => void) {
 }
 
 export async function api<T>(path: string, init?: RequestInit): Promise<T> {
-  const route = new URL(path, "tauri://local")
+  const route = new URL(path, "http://tauri.local")
   const method = (init?.method ?? "GET").toUpperCase()
   const body = parseJsonBody(init?.body)
   const parts = route.pathname.split("/").filter(Boolean)

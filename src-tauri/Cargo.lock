@@ -5541,7 +5541,7 @@ dependencies = [
 
 [[package]]
 name = "zwfw-load-tauri"
-version = "2026.6.3+3"
+version = "2026.6.3+4"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

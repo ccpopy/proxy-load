@@ -142,7 +142,7 @@ release/
 Windows 本地构建还会额外复制一个可直接运行的便携 exe：
 
 ```text
-release/zwfw-load_2026.6.3+3_x64-portable.exe
+release/zwfw-load_2026.6.3+4_x64-portable.exe
 ```
 
 这个文件主要用于本机验证，可以直接双击运行；正式更新安装仍建议使用 setup 或 msi 安装包。
@@ -153,14 +153,14 @@ release/zwfw-load_2026.6.3+3_x64-portable.exe
 
 Windows：
 
-- 便携运行：下载 `zwfw-load_2026.6.3+3_x64-portable.exe`，放到目标目录后直接双击运行。
-- 安装运行：下载 Windows x64 的 `setup.exe` 或 `.msi` 安装包，按安装向导完成安装。GitHub Release 文件名会使用 `zwfw-load_2026.6.3+3_windows_*` 前缀。
+- 便携运行：下载 `zwfw-load_2026.6.3+4_x64-portable.exe`，放到目标目录后直接双击运行。
+- 安装运行：下载 Windows x64 的 `setup.exe` 或 `.msi` 安装包，按安装向导完成安装。GitHub Release 文件名会使用 `zwfw-load_2026.6.3+4_windows_*` 前缀。
 - 启动后应用会监听默认代理端口 `5678`，浏览器或系统代理可配置为 `SOCKS5 127.0.0.1:5678` 或 `HTTP 127.0.0.1:5678`。
 
 macOS：
 
-- Intel 芯片下载 `zwfw-load_2026.6.3+3_darwin_x64.dmg`。
-- Apple Silicon 芯片下载 `zwfw-load_2026.6.3+3_darwin_aarch64.dmg`。
+- Intel 芯片下载 `zwfw-load_2026.6.3+4_darwin_x64.dmg`。
+- Apple Silicon 芯片下载 `zwfw-load_2026.6.3+4_darwin_aarch64.dmg`。
 - `.app.tar.gz` 是同架构的应用包压缩产物，通常优先使用 `.dmg` 安装。
 - 打开 `.dmg` 后把应用拖入 `Applications`。未签名构建首次打开时可能需要在系统设置的“隐私与安全性”中允许打开。
 - 启动后代理端口同样默认为 `5678`，可在系统网络代理或浏览器代理中配置 `127.0.0.1:5678`。
