@@ -111,6 +111,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
+import { ScrollArea } from "@/components/ui/scroll-area"
 import { Separator } from "@/components/ui/separator"
 import {
   Sidebar,
@@ -510,62 +511,64 @@ export function App() {
           </div>
         </header>
 
-        <div className="min-h-0 flex-1 overflow-auto p-6">
-          <div className="mx-auto flex max-w-7xl flex-col gap-6">
-            <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-              <MetricCard title="在线代理" value={activeCount} icon={CheckCircle2} />
-              <MetricCard title="离线代理" value={failedCount} icon={XCircle} />
-              <MetricCard title="24小时请求" value={overview.totalRequests} icon={Cable} />
-              <MetricCard title="平均响应" value={`${overview.avgResponseTime} ms`} icon={Gauge} />
-            </div>
+        <ScrollArea className="min-h-0 flex-1">
+          <div className="p-6">
+            <div className="mx-auto flex max-w-7xl flex-col gap-6">
+              <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+                <MetricCard title="在线代理" value={activeCount} icon={CheckCircle2} />
+                <MetricCard title="离线代理" value={failedCount} icon={XCircle} />
+                <MetricCard title="24小时请求" value={overview.totalRequests} icon={Cable} />
+                <MetricCard title="平均响应" value={`${overview.avgResponseTime} ms`} icon={Gauge} />
+              </div>
 
-            {section === "proxies" && (
-              <ProxySection
-                proxies={proxies}
-                onCreate={() => setProxyDialog("new")}
-                onEdit={setProxyDialog}
-                onChanged={refresh}
-              />
-            )}
-            {section === "dns" && (
-              <DnsSection
-                mappings={dnsMappings}
-                onCreate={() => setDnsDialog("new")}
-                onEdit={setDnsDialog}
-                onChanged={refresh}
-              />
-            )}
-            {section === "settings" && (
-              <LoadSettingsSection
-                settings={settings}
-                proxies={proxies}
-                onChanged={refresh}
-              />
-            )}
-            {section === "groups" && (
-              <GroupSection
-                groups={groups}
-                onCreate={() => setGroupDialog("new")}
-                onEdit={setGroupDialog}
-                onChanged={refresh}
-              />
-            )}
-            {section === "status" && (
-              <StatusSection
-                overview={overview}
-                hourlyStats={hourlyStats}
-                proxyUsage={proxyUsage}
-                targetStats={targetStats}
-                logs={trafficLogs}
-                onPageChange={(page) => loadTrafficLogs(page, trafficLogs.pageSize)}
-                onPageSizeChange={(pageSize) => loadTrafficLogs(1, pageSize)}
-                onChanged={async () => {
-                  await Promise.all([refresh(), loadTrafficLogs(1, trafficLogs.pageSize)])
-                }}
-              />
-            )}
+              {section === "proxies" && (
+                <ProxySection
+                  proxies={proxies}
+                  onCreate={() => setProxyDialog("new")}
+                  onEdit={setProxyDialog}
+                  onChanged={refresh}
+                />
+              )}
+              {section === "dns" && (
+                <DnsSection
+                  mappings={dnsMappings}
+                  onCreate={() => setDnsDialog("new")}
+                  onEdit={setDnsDialog}
+                  onChanged={refresh}
+                />
+              )}
+              {section === "settings" && (
+                <LoadSettingsSection
+                  settings={settings}
+                  proxies={proxies}
+                  onChanged={refresh}
+                />
+              )}
+              {section === "groups" && (
+                <GroupSection
+                  groups={groups}
+                  onCreate={() => setGroupDialog("new")}
+                  onEdit={setGroupDialog}
+                  onChanged={refresh}
+                />
+              )}
+              {section === "status" && (
+                <StatusSection
+                  overview={overview}
+                  hourlyStats={hourlyStats}
+                  proxyUsage={proxyUsage}
+                  targetStats={targetStats}
+                  logs={trafficLogs}
+                  onPageChange={(page) => loadTrafficLogs(page, trafficLogs.pageSize)}
+                  onPageSizeChange={(pageSize) => loadTrafficLogs(1, pageSize)}
+                  onChanged={async () => {
+                    await Promise.all([refresh(), loadTrafficLogs(1, trafficLogs.pageSize)])
+                  }}
+                />
+              )}
+            </div>
           </div>
-        </div>
+        </ScrollArea>
       </SidebarInset>
 
       <ProxyDialog
@@ -1424,41 +1427,43 @@ function AdvancedDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-h-[calc(100vh-4rem)] max-w-5xl overflow-auto">
+      <DialogContent className="max-h-[calc(100vh-4rem)] max-w-5xl overflow-hidden">
         <DialogHeader>
           <DialogTitle>高级配置</DialogTitle>
           <DialogDescription>连接池、熔断器、健康检查和快速失败参数</DialogDescription>
         </DialogHeader>
-        <div className="grid gap-6 lg:grid-cols-2">
-          <ConfigGroup title="基础配置" icon={Settings}>
-            <NumberField label="代理服务端口" value={config.proxy_port} onChange={(value) => update("proxy_port", value)} />
-            <NumberField label="定期测试间隔（分钟）" value={Math.round(config.periodic_test_interval / 60000)} onChange={(value) => update("periodic_test_interval", value * 60000)} />
-            <NumberField label="请求日志保留天数" value={config.log_retention_days} onChange={(value) => update("log_retention_days", value)} />
-            <NumberField label="统计保留天数" value={config.stats_retention_days} onChange={(value) => update("stats_retention_days", value)} />
-          </ConfigGroup>
-          <ConfigGroup title="连接池" icon={Database}>
-            <NumberField label="最大连接数" value={config.pool_max_size} onChange={(value) => update("pool_max_size", value)} />
-            <NumberField label="空闲超时（秒）" value={Math.round(config.pool_idle_timeout / 1000)} onChange={(value) => update("pool_idle_timeout", value * 1000)} />
-            <NumberField label="等待超时（秒）" value={Math.round(config.pool_wait_timeout / 1000)} onChange={(value) => update("pool_wait_timeout", value * 1000)} />
-          </ConfigGroup>
-          <ConfigGroup title="熔断器" icon={Shield}>
-            <NumberField label="失败阈值" value={config.circuit_failure_threshold} onChange={(value) => update("circuit_failure_threshold", value)} />
-            <NumberField label="熔断时长（秒）" value={Math.round(config.circuit_timeout / 1000)} onChange={(value) => update("circuit_timeout", value * 1000)} />
-            <NumberField label="半开尝试次数" value={config.circuit_half_open_attempts} onChange={(value) => update("circuit_half_open_attempts", value)} />
-          </ConfigGroup>
-          <ConfigGroup title="快速失败" icon={Zap}>
-            <Field orientation="horizontal">
-              <FieldContent>
-                <FieldTitle>启用快速失败</FieldTitle>
-                <FieldDescription>失败后按策略尝试下一个代理</FieldDescription>
-              </FieldContent>
-              <Switch checked={config.failfast_enabled} onCheckedChange={(value) => update("failfast_enabled", value)} />
-            </Field>
-            <NumberField label="最大尝试次数" value={config.failfast_max_attempts} onChange={(value) => update("failfast_max_attempts", value)} />
-            <NumberField label="单次超时（秒）" value={Math.round(config.failfast_attempt_timeout / 1000)} onChange={(value) => update("failfast_attempt_timeout", value * 1000)} />
-            <NumberField label="总超时（秒）" value={Math.round(config.failfast_total_timeout / 1000)} onChange={(value) => update("failfast_total_timeout", value * 1000)} />
-          </ConfigGroup>
-        </div>
+        <ScrollArea className="h-[calc(100vh-14rem)] max-h-[620px] pr-4">
+          <div className="grid gap-6 pb-1 lg:grid-cols-2">
+            <ConfigGroup title="基础配置" icon={Settings}>
+              <NumberField label="代理服务端口" value={config.proxy_port} onChange={(value) => update("proxy_port", value)} />
+              <NumberField label="定期测试间隔（分钟）" value={Math.round(config.periodic_test_interval / 60000)} onChange={(value) => update("periodic_test_interval", value * 60000)} />
+              <NumberField label="请求日志保留天数" value={config.log_retention_days} onChange={(value) => update("log_retention_days", value)} />
+              <NumberField label="统计保留天数" value={config.stats_retention_days} onChange={(value) => update("stats_retention_days", value)} />
+            </ConfigGroup>
+            <ConfigGroup title="连接池" icon={Database}>
+              <NumberField label="最大连接数" value={config.pool_max_size} onChange={(value) => update("pool_max_size", value)} />
+              <NumberField label="空闲超时（秒）" value={Math.round(config.pool_idle_timeout / 1000)} onChange={(value) => update("pool_idle_timeout", value * 1000)} />
+              <NumberField label="等待超时（秒）" value={Math.round(config.pool_wait_timeout / 1000)} onChange={(value) => update("pool_wait_timeout", value * 1000)} />
+            </ConfigGroup>
+            <ConfigGroup title="熔断器" icon={Shield}>
+              <NumberField label="失败阈值" value={config.circuit_failure_threshold} onChange={(value) => update("circuit_failure_threshold", value)} />
+              <NumberField label="熔断时长（秒）" value={Math.round(config.circuit_timeout / 1000)} onChange={(value) => update("circuit_timeout", value * 1000)} />
+              <NumberField label="半开尝试次数" value={config.circuit_half_open_attempts} onChange={(value) => update("circuit_half_open_attempts", value)} />
+            </ConfigGroup>
+            <ConfigGroup title="快速失败" icon={Zap}>
+              <Field orientation="horizontal">
+                <FieldContent>
+                  <FieldTitle>启用快速失败</FieldTitle>
+                  <FieldDescription>失败后按策略尝试下一个代理</FieldDescription>
+                </FieldContent>
+                <Switch checked={config.failfast_enabled} onCheckedChange={(value) => update("failfast_enabled", value)} />
+              </Field>
+              <NumberField label="最大尝试次数" value={config.failfast_max_attempts} onChange={(value) => update("failfast_max_attempts", value)} />
+              <NumberField label="单次超时（秒）" value={Math.round(config.failfast_attempt_timeout / 1000)} onChange={(value) => update("failfast_attempt_timeout", value * 1000)} />
+              <NumberField label="总超时（秒）" value={Math.round(config.failfast_total_timeout / 1000)} onChange={(value) => update("failfast_total_timeout", value * 1000)} />
+            </ConfigGroup>
+          </div>
+        </ScrollArea>
         <DialogFooter>
           <Button variant="outline" onClick={exportConfig}>
             <Download data-icon="inline-start" />
@@ -1580,75 +1585,77 @@ function ProxyDialog({
 
   return (
     <Dialog open={value !== null} onOpenChange={onOpenChange}>
-      <DialogContent className="max-h-[calc(100vh-4rem)] overflow-auto">
+      <DialogContent className="max-h-[calc(100vh-4rem)] overflow-hidden">
         <DialogHeader>
           <DialogTitle>{proxy ? "编辑代理" : "新增代理"}</DialogTitle>
           <DialogDescription>配置上游代理连接参数</DialogDescription>
         </DialogHeader>
-        <FieldGroup>
-          <Field>
-            <FieldLabel>名称</FieldLabel>
-            <Input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} />
-          </Field>
-          <Field orientation="horizontal">
-            <FieldContent>
-              <FieldTitle>启用</FieldTitle>
-              <FieldDescription>启用后参与负载均衡</FieldDescription>
-            </FieldContent>
-            <Switch checked={form.enabled} onCheckedChange={(enabled) => setForm({ ...form, enabled })} />
-          </Field>
-          <Field>
-            <FieldLabel>类型</FieldLabel>
-            <Select value={form.type} onValueChange={(type) => setForm({ ...form, type })}>
-              <SelectTrigger className="w-full">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectGroup>
-                  <SelectItem value="http">HTTP</SelectItem>
-                  <SelectItem value="https">HTTPS</SelectItem>
-                  <SelectItem value="socks4">SOCKS4</SelectItem>
-                  <SelectItem value="socks5">SOCKS5</SelectItem>
-                </SelectGroup>
-              </SelectContent>
-            </Select>
-          </Field>
-          <div className="grid gap-4 sm:grid-cols-2">
+        <ScrollArea className="h-[calc(100vh-14rem)] max-h-[560px] pr-4">
+          <FieldGroup className="pb-1">
             <Field>
-              <FieldLabel>主机</FieldLabel>
-              <Input value={form.host} onChange={(event) => setForm({ ...form, host: event.target.value })} />
+              <FieldLabel>名称</FieldLabel>
+              <Input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} />
+            </Field>
+            <Field orientation="horizontal">
+              <FieldContent>
+                <FieldTitle>启用</FieldTitle>
+                <FieldDescription>启用后参与负载均衡</FieldDescription>
+              </FieldContent>
+              <Switch checked={form.enabled} onCheckedChange={(enabled) => setForm({ ...form, enabled })} />
             </Field>
             <Field>
-              <FieldLabel>端口</FieldLabel>
-              <Input type="number" value={form.port} onChange={(event) => setForm({ ...form, port: Number(event.target.value) })} />
+              <FieldLabel>类型</FieldLabel>
+              <Select value={form.type} onValueChange={(type) => setForm({ ...form, type })}>
+                <SelectTrigger className="w-full">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectGroup>
+                    <SelectItem value="http">HTTP</SelectItem>
+                    <SelectItem value="https">HTTPS</SelectItem>
+                    <SelectItem value="socks4">SOCKS4</SelectItem>
+                    <SelectItem value="socks5">SOCKS5</SelectItem>
+                  </SelectGroup>
+                </SelectContent>
+              </Select>
             </Field>
-          </div>
-          <div className="grid gap-4 sm:grid-cols-2">
+            <div className="grid gap-4 sm:grid-cols-2">
+              <Field>
+                <FieldLabel>主机</FieldLabel>
+                <Input value={form.host} onChange={(event) => setForm({ ...form, host: event.target.value })} />
+              </Field>
+              <Field>
+                <FieldLabel>端口</FieldLabel>
+                <Input type="number" value={form.port} onChange={(event) => setForm({ ...form, port: Number(event.target.value) })} />
+              </Field>
+            </div>
+            <div className="grid gap-4 sm:grid-cols-2">
+              <Field>
+                <FieldLabel>用户名</FieldLabel>
+                <Input value={form.username} onChange={(event) => setForm({ ...form, username: event.target.value })} />
+              </Field>
+              <Field>
+                <FieldLabel>密码</FieldLabel>
+                <Input type="password" value={form.password} onChange={(event) => setForm({ ...form, password: event.target.value })} />
+              </Field>
+            </div>
             <Field>
-              <FieldLabel>用户名</FieldLabel>
-              <Input value={form.username} onChange={(event) => setForm({ ...form, username: event.target.value })} />
+              <FieldLabel>测试地址</FieldLabel>
+              <Input value={form.test_url} onChange={(event) => setForm({ ...form, test_url: event.target.value })} />
             </Field>
             <Field>
-              <FieldLabel>密码</FieldLabel>
-              <Input type="password" value={form.password} onChange={(event) => setForm({ ...form, password: event.target.value })} />
+              <FieldLabel>超时时间（秒）</FieldLabel>
+              <Input value={form.test_timeout} onChange={(event) => setForm({ ...form, test_timeout: event.target.value })} />
             </Field>
-          </div>
-          <Field>
-            <FieldLabel>测试地址</FieldLabel>
-            <Input value={form.test_url} onChange={(event) => setForm({ ...form, test_url: event.target.value })} />
-          </Field>
-          <Field>
-            <FieldLabel>超时时间（秒）</FieldLabel>
-            <Input value={form.test_timeout} onChange={(event) => setForm({ ...form, test_timeout: event.target.value })} />
-          </Field>
-          <Field orientation="horizontal">
-            <FieldContent>
-              <FieldTitle>跳过证书验证</FieldTitle>
-              <FieldDescription>仅影响连通性测试</FieldDescription>
-            </FieldContent>
-            <Switch checked={form.skip_cert_verify} onCheckedChange={(skip_cert_verify) => setForm({ ...form, skip_cert_verify })} />
-          </Field>
-        </FieldGroup>
+            <Field orientation="horizontal">
+              <FieldContent>
+                <FieldTitle>跳过证书验证</FieldTitle>
+                <FieldDescription>仅影响连通性测试</FieldDescription>
+              </FieldContent>
+              <Switch checked={form.skip_cert_verify} onCheckedChange={(skip_cert_verify) => setForm({ ...form, skip_cert_verify })} />
+            </Field>
+          </FieldGroup>
+        </ScrollArea>
         <DialogFooter>
           <Button variant="outline" onClick={() => onOpenChange(false)}>取消</Button>
           <Button onClick={save}>
@@ -1788,46 +1795,48 @@ function GroupDialog({
 
   return (
     <Dialog open={value !== null} onOpenChange={onOpenChange}>
-      <DialogContent className="max-h-[calc(100vh-4rem)] overflow-auto">
+      <DialogContent className="max-h-[calc(100vh-4rem)] overflow-hidden">
         <DialogHeader>
           <DialogTitle>{group ? "编辑代理分组" : "新增代理分组"}</DialogTitle>
           <DialogDescription>设置域名规则和代理成员</DialogDescription>
         </DialogHeader>
-        <FieldGroup>
-          <Field>
-            <FieldLabel>分组名称</FieldLabel>
-            <Input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} />
-          </Field>
-          <Field>
-            <FieldLabel>域名列表</FieldLabel>
-            <Textarea value={form.domains} rows={4} onChange={(event) => setForm({ ...form, domains: event.target.value })} />
-          </Field>
-          <Field orientation="horizontal">
-            <FieldTitle>默认分组</FieldTitle>
-            <Switch checked={form.is_default} onCheckedChange={(is_default) => setForm({ ...form, is_default })} />
-          </Field>
-          <Field orientation="horizontal">
-            <FieldTitle>启用</FieldTitle>
-            <Switch checked={form.enabled} onCheckedChange={(enabled) => setForm({ ...form, enabled })} />
-          </Field>
-          <Separator />
-          <div className="grid gap-2">
-            {proxies.map((proxy) => (
-              <label key={proxy.id} className="flex items-center gap-3 rounded-md border p-3">
-                <Checkbox
-                  checked={form.proxy_ids.includes(proxy.id)}
-                  onCheckedChange={(checked) => toggleProxy(proxy.id, checked === true)}
-                />
-                <span className="min-w-0 flex-1">
-                  <span className="block truncate text-sm font-medium">{proxy.name}</span>
-                  <span className="block truncate text-xs text-muted-foreground">
-                    {proxy.type}://{proxy.host}:{proxy.port}
+        <ScrollArea className="h-[calc(100vh-14rem)] max-h-[560px] pr-4">
+          <FieldGroup className="pb-1">
+            <Field>
+              <FieldLabel>分组名称</FieldLabel>
+              <Input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} />
+            </Field>
+            <Field>
+              <FieldLabel>域名列表</FieldLabel>
+              <Textarea value={form.domains} rows={4} onChange={(event) => setForm({ ...form, domains: event.target.value })} />
+            </Field>
+            <Field orientation="horizontal">
+              <FieldTitle>默认分组</FieldTitle>
+              <Switch checked={form.is_default} onCheckedChange={(is_default) => setForm({ ...form, is_default })} />
+            </Field>
+            <Field orientation="horizontal">
+              <FieldTitle>启用</FieldTitle>
+              <Switch checked={form.enabled} onCheckedChange={(enabled) => setForm({ ...form, enabled })} />
+            </Field>
+            <Separator />
+            <div className="grid gap-2">
+              {proxies.map((proxy) => (
+                <label key={proxy.id} className="flex items-center gap-3 rounded-md border p-3">
+                  <Checkbox
+                    checked={form.proxy_ids.includes(proxy.id)}
+                    onCheckedChange={(checked) => toggleProxy(proxy.id, checked === true)}
+                  />
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate text-sm font-medium">{proxy.name}</span>
+                    <span className="block truncate text-xs text-muted-foreground">
+                      {proxy.type}://{proxy.host}:{proxy.port}
+                    </span>
                   </span>
-                </span>
-              </label>
-            ))}
-          </div>
-        </FieldGroup>
+                </label>
+              ))}
+            </div>
+          </FieldGroup>
+        </ScrollArea>
         <DialogFooter>
           <Button variant="outline" onClick={() => onOpenChange(false)}>取消</Button>
           <Button onClick={save}>
