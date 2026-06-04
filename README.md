@@ -211,12 +211,19 @@ sudo dnf install ./zwfw-load_*_x86_64.rpm
 3. 应用会在用户数据目录还没有 `proxy.db` 时，自动导入同级 `data/proxy.db`。
 4. 确认配置列表显示正常后，再把 `zwfw-load.app` 拖入 `Applications`。
 
-如果已经只把 `.app` 拖入 `Applications`，可以手动复制数据库：
+如果已经只把 `.app` 拖入 `Applications`，可以手动复制数据库。复制前先退出 `zwfw-load`，否则 SQLite 的 WAL 文件可能还在写入。
+
+大多数用户会把 zip 解压到“下载”目录。假设解压后的目录是 `~/Downloads/zwfw-load`，可以执行：
 
 ```bash
-mkdir -p "$HOME/Library/Application Support/zwfw-load"
-cp data/proxy.db "$HOME/Library/Application Support/zwfw-load/proxy.db"
+SOURCE_DATA="$HOME/Downloads/zwfw-load/data"
+TARGET_DATA="$HOME/Library/Application Support/zwfw-load"
+
+mkdir -p "$TARGET_DATA"
+cp "$SOURCE_DATA"/proxy.db* "$TARGET_DATA"/
 ```
+
+如果解压目录不是 `~/Downloads/zwfw-load`，把 `SOURCE_DATA` 改成实际的 `data` 目录路径。需要复制的是同一批 SQLite 数据文件，包括 `proxy.db`、`proxy.db-shm` 和 `proxy.db-wal`。
 
 自动导入只会在目标目录还没有 `proxy.db` 时执行，避免覆盖用户已有配置。
 

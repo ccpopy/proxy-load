@@ -87,6 +87,10 @@ jobs:
             - 将关于弹窗中的运行信息标签改为中文展示，提升界面一致性。
             - 修复 Windows 便携版更新文件名，直接使用 GitHub Release 原始 portable exe 文件名，不再生成 .update.exe。
             - 修复 Windows 便携版更新后无法直接启动新版本的问题。
+            - 新增已启用代理的启动探测和定期健康检查，代理恢复可用后会自动刷新在线状态。
+            - 统一手动测试和自动健康检查的后端逻辑，测试结果会同步更新代理状态、响应时间和健康日志。
+            - 保存高级设置时校验定期测试间隔，避免无效周期进入运行配置。
+            - 完善 macOS 随包数据迁移说明，明确从下载目录复制 proxy.db、proxy.db-shm 和 proxy.db-wal。
           releaseDraft: false
           prerelease: ${{ contains(github.ref_name, '-') }}
           assetNamePattern: zwfw-load_${{ steps.package-version.outputs.version }}_[platform]_[arch][setup][ext]

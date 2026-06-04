@@ -10,14 +10,12 @@ use std::{
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 
-use anyhow::anyhow;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
 use crate::{
     models::{DnsInput, ProxyGroupInput, ProxyInput},
     proxy::ProxyServiceStatus,
-    proxy_tester,
     state::AppState,
     version,
 };
@@ -175,74 +173,7 @@ pub fn update_proxy_priorities(
 
 #[tauri::command]
 pub async fn test_proxy(state: tauri::State<'_, Arc<AppState>>, id: i64) -> CommandResult<Value> {
-    let state = state.inner().clone();
-    let proxy = state
-        .db
-        .get_proxy(id)?
-        .ok_or_else(|| CommandError::new("代理不存在"))?;
-    let settings = state.db.settings_map()?;
-    let global_url = settings
-        .get("test_url")
-        .cloned()
-        .unwrap_or_else(|| "https://cms.zjzwfw.gov.cn/favicon.ico".to_string());
-    let global_timeout = settings
-        .get("timeout")
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(10)
-        * 1000;
-    let test_url = proxy.test_url.clone().unwrap_or(global_url);
-    let timeout = proxy
-        .test_timeout
-        .and_then(|value| u64::try_from(value).ok())
-        .map(|value| value * 1000)
-        .unwrap_or(global_timeout);
-
-    state
-        .db
-        .update_proxy_status(proxy.id, "testing", None, 0, 0)?;
-    state.emit("proxy_testing", json!({ "id": proxy.id }));
-
-    let result = proxy_tester::test_proxy(&proxy, &test_url, timeout).await;
-    let target = url::Url::parse(&test_url).map_err(|error| anyhow!("测试地址无效: {error}"))?;
-    let target_host = target.host_str().unwrap_or_default().to_string();
-    let target_port = target.port_or_known_default().unwrap_or(80);
-
-    if result.success {
-        state
-            .db
-            .update_proxy_status(proxy.id, "active", Some(result.response_time), 1, 0)?;
-        state.db.log_request(
-            Some(proxy.id),
-            &target_host,
-            i64::from(target_port),
-            true,
-            Some(result.response_time),
-            None,
-            "health_success",
-        )?;
-    } else {
-        state
-            .db
-            .update_proxy_status(proxy.id, "inactive", None, 0, 1)?;
-        state.db.log_request(
-            Some(proxy.id),
-            &target_host,
-            i64::from(target_port),
-            false,
-            None,
-            result.error.as_deref(),
-            "health_failure",
-        )?;
-    }
-
-    let updated = state.db.get_proxy(proxy.id)?;
-    state.emit(
-        "proxy_tested",
-        json!({
-            "proxy": updated,
-            "result": result
-        }),
-    );
+    let result = state.inner().test_proxy_by_id(id).await?;
     Ok(serde_json::to_value(result)?)
 }
 
@@ -324,6 +255,15 @@ pub fn save_advanced_config(
     state: tauri::State<'_, Arc<AppState>>,
     config: Map<String, Value>,
 ) -> CommandResult<Value> {
+    if let Some(value) = config.get("periodic_test_interval") {
+        let interval = value
+            .as_i64()
+            .ok_or_else(|| CommandError::new("定期测试间隔必须是数字"))?;
+        if interval <= 0 {
+            return Err(CommandError::new("定期测试间隔必须大于 0"));
+        }
+    }
+
     let current = state.db.load_advanced_config()?;
     let current_port = current
         .get("proxy_port")
