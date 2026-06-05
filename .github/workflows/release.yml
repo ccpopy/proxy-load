@@ -29,30 +29,47 @@ env:
   RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
 
 jobs:
+  prepare:
+    name: Prepare build matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: Resolve build target
+        id: matrix
+        shell: bash
+        env:
+          TARGET: ${{ github.event_name == 'workflow_dispatch' && inputs.target || 'all' }}
+        run: |
+          case "$TARGET" in
+            all)
+              echo 'matrix={"include":[{"label":"linux-x64","os":"ubuntu-22.04","args":"","rust-target":""},{"label":"windows-x64","os":"windows-latest","args":"","rust-target":""},{"label":"macos-aarch64","os":"macos-latest","args":"--target aarch64-apple-darwin","rust-target":"aarch64-apple-darwin"},{"label":"macos-x64","os":"macos-latest","args":"--target x86_64-apple-darwin","rust-target":"x86_64-apple-darwin"}]}' >> "$GITHUB_OUTPUT"
+              ;;
+            linux-x64)
+              echo 'matrix={"include":[{"label":"linux-x64","os":"ubuntu-22.04","args":"","rust-target":""}]}' >> "$GITHUB_OUTPUT"
+              ;;
+            windows-x64)
+              echo 'matrix={"include":[{"label":"windows-x64","os":"windows-latest","args":"","rust-target":""}]}' >> "$GITHUB_OUTPUT"
+              ;;
+            macos-aarch64)
+              echo 'matrix={"include":[{"label":"macos-aarch64","os":"macos-latest","args":"--target aarch64-apple-darwin","rust-target":"aarch64-apple-darwin"}]}' >> "$GITHUB_OUTPUT"
+              ;;
+            macos-x64)
+              echo 'matrix={"include":[{"label":"macos-x64","os":"macos-latest","args":"--target x86_64-apple-darwin","rust-target":"x86_64-apple-darwin"}]}' >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "Unsupported build target: $TARGET" >&2
+              exit 1
+              ;;
+          esac
+
   build:
     name: Build ${{ matrix.label }}
-    if: ${{ github.event_name == 'push' || inputs.target == 'all' || inputs.target == matrix.label }}
+    needs: prepare
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - label: linux-x64
-            os: ubuntu-22.04
-            args: ""
-            rust-target: ""
-          - label: windows-x64
-            os: windows-latest
-            args: ""
-            rust-target: ""
-          - label: macos-aarch64
-            os: macos-latest
-            args: "--target aarch64-apple-darwin"
-            rust-target: aarch64-apple-darwin
-          - label: macos-x64
-            os: macos-latest
-            args: "--target x86_64-apple-darwin"
-            rust-target: x86_64-apple-darwin
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
 
     steps:
       - name: Checkout
