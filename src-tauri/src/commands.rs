@@ -21,8 +21,8 @@ use crate::{
 };
 
 const GITHUB_LATEST_RELEASE_URL: &str =
-    "https://api.github.com/repos/ccpopy/zwfw-load/releases/latest";
-const GITHUB_TOKEN_ENV: &str = "ZWFW_LOAD_GITHUB_TOKEN";
+    "https://api.github.com/repos/ccpopy/proxy-load/releases/latest";
+const GITHUB_TOKEN_ENV: &str = "PROXY_LOAD_GITHUB_TOKEN";
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 #[cfg(target_os = "windows")]
@@ -745,7 +745,7 @@ async fn download_release_asset(download_url: &str, target_path: &Path) -> Comma
 fn github_client(timeout: Duration) -> CommandResult<reqwest::Client> {
     Ok(reqwest::Client::builder()
         .timeout(timeout)
-        .user_agent(format!("zwfw-load/{}", version::VERSION))
+        .user_agent(format!("proxy-load/{}", version::VERSION))
         .build()?)
 }
 

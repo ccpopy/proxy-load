@@ -3,7 +3,7 @@ import { basename, extname, join, resolve } from "node:path"
 
 const root = resolve(process.cwd())
 const bundleDir = join(root, "src-tauri", "target", "release", "bundle")
-const portableExe = join(root, "src-tauri", "target", "release", "zwfw-load-tauri.exe")
+const portableExe = join(root, "src-tauri", "target", "release", "proxy-load-tauri.exe")
 const outputDir = join(root, "release")
 const allowedExtensions = new Set([".exe", ".msi", ".dmg", ".deb", ".rpm", ".appimage"])
 const { version } = JSON.parse(await readFile(join(root, "package.json"), "utf8"))
@@ -23,7 +23,7 @@ for (const artifact of artifacts) {
 if (await exists(portableExe)) {
   const arch = process.arch === "x64" ? "x64" : process.arch
   artifacts.push(portableExe)
-  await copyFile(portableExe, join(outputDir, `zwfw-load_${version}_${arch}-portable.exe`))
+  await copyFile(portableExe, join(outputDir, `proxy-load_${version}_${arch}-portable.exe`))
 }
 
 console.log(`Copied ${artifacts.length} release artifact(s) to ${outputDir}`)
@@ -57,7 +57,7 @@ async function removeExistingReleaseArtifacts(dir) {
     if (!metadata.isFile()) {
       continue
     }
-    if (entry.startsWith("zwfw-load_") && allowedExtensions.has(extname(entry).toLowerCase())) {
+    if (entry.startsWith("proxy-load_") && allowedExtensions.has(extname(entry).toLowerCase())) {
       await rm(path)
     }
   }

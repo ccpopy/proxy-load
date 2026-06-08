@@ -117,7 +117,7 @@ jobs:
           tauriScript: npm run tauri
           args: ${{ matrix.args }}
           tagName: ${{ env.RELEASE_TAG }}
-          releaseName: zwfw-load ${{ env.RELEASE_TAG }}
+          releaseName: proxy-load ${{ env.RELEASE_TAG }}
           releaseBody: |
             ## Changes
 
@@ -141,7 +141,7 @@ jobs:
             - 更新 README 中 Windows portable、Windows 安装包和 macOS dmg 的示例文件名。
           releaseDraft: false
           prerelease: ${{ contains(env.RELEASE_TAG, '-') }}
-          assetNamePattern: zwfw-load_${{ steps.package-version.outputs.version }}_[platform]_[arch][setup][ext]
+          assetNamePattern: proxy-load_${{ steps.package-version.outputs.version }}_[platform]_[arch][setup][ext]
 
       - name: Upload Windows portable executable
         if: runner.os == 'Windows'
@@ -151,10 +151,10 @@ jobs:
           RELEASE_TAG: ${{ env.RELEASE_TAG }}
           PACKAGE_VERSION: ${{ steps.package-version.outputs.version }}
         run: |
-          $portable = "src-tauri/target/release/zwfw-load-tauri.exe"
+          $portable = "src-tauri/target/release/proxy-load-tauri.exe"
           if (-not (Test-Path $portable)) {
             throw "Windows portable executable not found: $portable"
           }
-          $asset = "zwfw-load_${env:PACKAGE_VERSION}_x64-portable.exe"
+          $asset = "proxy-load_${env:PACKAGE_VERSION}_x64-portable.exe"
           Copy-Item -Path $portable -Destination $asset -Force
           gh release upload $env:RELEASE_TAG $asset --clobber

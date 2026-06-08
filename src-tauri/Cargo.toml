@@ -1,5 +1,5 @@
 [package]
-name = "zwfw-load-tauri"
+name = "proxy-load-tauri"
 version = "26.6.8"
 description = "代理负载均衡管理系统"
 authors = ["linmew"]

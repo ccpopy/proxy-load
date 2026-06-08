@@ -858,21 +858,21 @@ fn platform_data_dir() -> Result<PathBuf> {
                 PathBuf::from(value)
                     .join("Library")
                     .join("Application Support")
-                    .join("zwfw-load")
+                    .join("proxy-load")
             })
             .with_context(|| "无法确定 macOS 用户数据目录，缺少 HOME 环境变量");
     }
 
     if cfg!(target_os = "linux") {
         if let Ok(value) = env::var("XDG_DATA_HOME") {
-            return Ok(PathBuf::from(value).join("zwfw-load"));
+            return Ok(PathBuf::from(value).join("proxy-load"));
         }
         return env::var("HOME")
             .map(|value| {
                 PathBuf::from(value)
                     .join(".local")
                     .join("share")
-                    .join("zwfw-load")
+                    .join("proxy-load")
             })
             .with_context(|| "无法确定 Linux 用户数据目录，缺少 XDG_DATA_HOME 和 HOME 环境变量");
     }

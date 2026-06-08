@@ -1,4 +1,4 @@
-# zwfw-load
+# proxy-load
 
 ![Tauri](https://img.shields.io/badge/Tauri-v2-24C8DB?logo=tauri&logoColor=white)
 ![Rust](https://img.shields.io/badge/Rust-backend-000000?logo=rust&logoColor=white)
@@ -37,7 +37,7 @@
 ## 目录结构
 
 ```text
-zwfw-load/
+proxy-load/
 ├── release/                   # 本地打包产物收集目录，仓库仅保留 .gitkeep
 ├── scripts/
 │   └── collect-release-artifacts.mjs
@@ -142,7 +142,7 @@ release/
 Windows 本地构建还会额外复制一个可直接运行的便携 exe：
 
 ```text
-release/zwfw-load_26.6.8_x64-portable.exe
+release/proxy-load_26.6.8_x64-portable.exe
 ```
 
 这个文件主要用于本机验证，可以直接双击运行；正式更新安装仍建议使用 setup 或 msi 安装包。
@@ -153,14 +153,14 @@ release/zwfw-load_26.6.8_x64-portable.exe
 
 Windows：
 
-- 便携运行：下载 `zwfw-load_26.6.8_x64-portable.exe`，放到目标目录后直接双击运行。
-- 安装运行：下载 Windows x64 的 `setup.exe` 或 `.msi` 安装包，按安装向导完成安装。GitHub Release 文件名会使用 `zwfw-load_26.6.8_windows_*` 前缀。
+- 便携运行：下载 `proxy-load_26.6.8_x64-portable.exe`，放到目标目录后直接双击运行。
+- 安装运行：下载 Windows x64 的 `setup.exe` 或 `.msi` 安装包，按安装向导完成安装。GitHub Release 文件名会使用 `proxy-load_26.6.8_windows_*` 前缀。
 - 启动后应用会监听默认代理端口 `5678`，浏览器或系统代理可配置为 `SOCKS5 127.0.0.1:5678` 或 `HTTP 127.0.0.1:5678`。
 
 macOS：
 
-- Intel 芯片下载 `zwfw-load_26.6.8_darwin_x64.dmg`。
-- Apple Silicon 芯片下载 `zwfw-load_26.6.8_darwin_aarch64.dmg`。
+- Intel 芯片下载 `proxy-load_26.6.8_darwin_x64.dmg`。
+- Apple Silicon 芯片下载 `proxy-load_26.6.8_darwin_aarch64.dmg`。
 - `.app.tar.gz` 是同架构的应用包压缩产物，通常优先使用 `.dmg` 安装。
 - 打开 `.dmg` 后把应用拖入 `Applications`。未签名构建首次打开时可能需要在系统设置的“隐私与安全性”中允许打开。
 - 启动后代理端口同样默认为 `5678`，可在系统网络代理或浏览器代理中配置 `127.0.0.1:5678`。
@@ -170,20 +170,20 @@ Linux：
 - 优先下载 Linux x64 的 `.AppImage`，赋予执行权限后运行：
 
 ```bash
-chmod +x zwfw-load_*_*.AppImage
-./zwfw-load_*_*.AppImage
+chmod +x proxy-load_*_*.AppImage
+./proxy-load_*_*.AppImage
 ```
 
 - Debian/Ubuntu 可下载 `.deb` 后安装：
 
 ```bash
-sudo apt install ./zwfw-load_*_amd64.deb
+sudo apt install ./proxy-load_*_amd64.deb
 ```
 
 - Fedora/RHEL 系发行版可下载 `.rpm` 后安装：
 
 ```bash
-sudo dnf install ./zwfw-load_*_x86_64.rpm
+sudo dnf install ./proxy-load_*_x86_64.rpm
 ```
 
 - 启动后代理端口默认为 `5678`，可将应用或系统代理指向 `127.0.0.1:5678`。
@@ -198,31 +198,31 @@ sudo dnf install ./zwfw-load_*_x86_64.rpm
 | --- | --- |
 | 开发环境 | 项目根目录 `data` |
 | Windows 发布版（安装版和便携版） | exe 所在目录的 `data` |
-| macOS | `~/Library/Application Support/zwfw-load` |
-| Linux | `$XDG_DATA_HOME/zwfw-load`，未设置时使用 `~/.local/share/zwfw-load` |
+| macOS | `~/Library/Application Support/proxy-load` |
+| Linux | `$XDG_DATA_HOME/proxy-load`，未设置时使用 `~/.local/share/proxy-load` |
 
-如果给 macOS 用户的 zip 里同时包含 `zwfw-load.app` 和 `data/`，不要只把 `zwfw-load.app` 拖入 `Applications` 后再启动。应用只能看到被复制后的 `.app`，看不到 zip 解压目录里的同级 `data`。
+如果给 macOS 用户的 zip 里同时包含 `proxy-load.app` 和 `data/`，不要只把 `proxy-load.app` 拖入 `Applications` 后再启动。应用只能看到被复制后的 `.app`，看不到 zip 解压目录里的同级 `data`。
 
 带随包配置的 macOS zip 推荐流程：
 
-1. 解压后保持 `zwfw-load.app` 和 `data/` 在同一个目录。
-2. 先从这个解压目录启动一次 `zwfw-load.app`。
+1. 解压后保持 `proxy-load.app` 和 `data/` 在同一个目录。
+2. 先从这个解压目录启动一次 `proxy-load.app`。
 3. 应用会在用户数据目录还没有 `proxy.db` 时，自动导入同级 `data/proxy.db`。
-4. 确认配置列表显示正常后，再把 `zwfw-load.app` 拖入 `Applications`。
+4. 确认配置列表显示正常后，再把 `proxy-load.app` 拖入 `Applications`。
 
-如果已经只把 `.app` 拖入 `Applications`，可以手动复制数据库。复制前先退出 `zwfw-load`，否则 SQLite 的 WAL 文件可能还在写入。
+如果已经只把 `.app` 拖入 `Applications`，可以手动复制数据库。复制前先退出 `proxy-load`，否则 SQLite 的 WAL 文件可能还在写入。
 
-大多数用户会把 zip 解压到“下载”目录。假设解压后的目录是 `~/Downloads/zwfw-load`，可以执行：
+大多数用户会把 zip 解压到“下载”目录。假设解压后的目录是 `~/Downloads/proxy-load`，可以执行：
 
 ```bash
-SOURCE_DATA="$HOME/Downloads/zwfw-load/data"
-TARGET_DATA="$HOME/Library/Application Support/zwfw-load"
+SOURCE_DATA="$HOME/Downloads/proxy-load/data"
+TARGET_DATA="$HOME/Library/Application Support/proxy-load"
 
 mkdir -p "$TARGET_DATA"
 cp "$SOURCE_DATA"/proxy.db* "$TARGET_DATA"/
 ```
 
-如果解压目录不是 `~/Downloads/zwfw-load`，把 `SOURCE_DATA` 改成实际的 `data` 目录路径。需要复制的是同一批 SQLite 数据文件，包括 `proxy.db`、`proxy.db-shm` 和 `proxy.db-wal`。
+如果解压目录不是 `~/Downloads/proxy-load`，把 `SOURCE_DATA` 改成实际的 `data` 目录路径。需要复制的是同一批 SQLite 数据文件，包括 `proxy.db`、`proxy.db-shm` 和 `proxy.db-wal`。
 
 自动导入只会在目标目录还没有 `proxy.db` 时执行，避免覆盖用户已有配置。
 
@@ -232,19 +232,19 @@ cp "$SOURCE_DATA"/proxy.db* "$TARGET_DATA"/
 
 - 开发环境：直接返回错误，避免把本地调试产物误当成线上更新。
 - 生产环境：请求 GitHub Releases 最新版本，选择当前平台可用的安装包。
-- 安装包运行：Windows 下会启动下载的 setup 或 msi，并把安装目录指向当前应用所在目录，例如 `F:\zwfw-load`。
+- 安装包运行：Windows 下会启动下载的 setup 或 msi，并把安装目录指向当前应用所在目录，例如 `F:\proxy-load`。
 - 便携版运行：Windows 下会下载 portable exe 到当前应用目录，退出当前应用后启动新版本文件。
 
-更新检查不会默认安装到系统盘其他位置；应用放在 `F:\zwfw-load` 时，更新也会以该目录作为安装位置。
+更新检查不会默认安装到系统盘其他位置；应用放在 `F:\proxy-load` 时，更新也会以该目录作为安装位置。
 
-应用内显示的“更新目标目录”和“下载保存目录”都会指向当前应用所在目录。比如便携 exe 放在 `F:\project\zwfw-load\release` 中运行时，更新也会下载到 `F:\project\zwfw-load\release`，不会再放到 `F:\project\zwfw-load\release\release`。
+应用内显示的“更新目标目录”和“下载保存目录”都会指向当前应用所在目录。比如便携 exe 放在 `F:\project\proxy-load\release` 中运行时，更新也会下载到 `F:\project\proxy-load\release`，不会再放到 `F:\project\proxy-load\release\release`。
 
-便携 exe 在运行时不能直接覆盖自身，所以更新时会直接下载 GitHub Release 中的新版本文件名，例如 `zwfw-load_26.6.8_x64-portable.exe`，然后退出当前应用并启动这个新版本文件。
+便携 exe 在运行时不能直接覆盖自身，所以更新时会直接下载 GitHub Release 中的新版本文件名，例如 `proxy-load_26.6.8_x64-portable.exe`，然后退出当前应用并启动这个新版本文件。
 
 如果发布仓库是私有仓库，GitHub 未认证访问会返回 `404`。生产环境需要在启动应用前设置环境变量：
 
 ```powershell
-$env:ZWFW_LOAD_GITHUB_TOKEN = "github_pat_xxx"
+$env:PROXY_LOAD_GITHUB_TOKEN = "github_pat_xxx"
 ```
 
 Token 需要具备读取私有仓库 Release 的权限。不要把 Token 打包进应用或提交到仓库。
