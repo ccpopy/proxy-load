@@ -159,6 +159,33 @@ export interface UpdateInfo {
   artifacts: UpdateArtifact[]
 }
 
+export interface TransferCounts {
+  added: number
+  skipped: number
+}
+
+export interface ImportSummary {
+  proxies: TransferCounts
+  dnsMappings: TransferCounts
+  proxyGroups: TransferCounts
+  unresolvedMembers: number
+}
+
+export interface ImportResult {
+  canceled: boolean
+  summary?: ImportSummary
+}
+
+export interface ExportResult {
+  canceled: boolean
+  path?: string
+  counts?: {
+    proxies: number
+    dnsMappings: number
+    proxyGroups: number
+  }
+}
+
 export interface AdvancedConfig {
   proxy_port: number
   periodic_test_interval: number

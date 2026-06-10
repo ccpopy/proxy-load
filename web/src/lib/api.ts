@@ -140,9 +140,6 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   if (method === "POST" && route.pathname === "/api/advanced-config/reset") {
     return command<T>("reset_advanced_config")
   }
-  if (method === "GET" && route.pathname === "/api/advanced-config/export") {
-    return command<T>("export_config")
-  }
   if (method === "GET" && route.pathname === "/api/test-urls") {
     return command<T>("test_urls")
   }

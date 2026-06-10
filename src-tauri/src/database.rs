@@ -10,8 +10,9 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde_json::{json, Map, Value};
 
 use crate::models::{
-    DnsInput, DnsMapping, ProxyGroup, ProxyGroupDomain, ProxyGroupInput, ProxyGroupMember,
-    ProxyInput, ProxyRecord, TrafficLog,
+    BundleDns, BundleGroup, BundleGroupMember, BundleProxy, ConfigBundle, DnsInput, DnsMapping,
+    ImportSummary, ProxyGroup, ProxyGroupDomain, ProxyGroupInput, ProxyGroupMember, ProxyInput,
+    ProxyRecord, TrafficLog, CONFIG_BUNDLE_KIND,
 };
 
 #[derive(Clone)]
@@ -408,21 +409,214 @@ impl Database {
         Ok(())
     }
 
-    pub fn exported_config(&self) -> Result<Value> {
-        let settings = self.settings_map()?;
-        let mut config = Map::new();
-        for (key, raw) in settings {
-            config.insert(key, parse_setting_value(&raw));
+    pub fn export_bundle(
+        &self,
+        proxy_ids: &[i64],
+        dns_ids: &[i64],
+        group_ids: &[i64],
+    ) -> Result<ConfigBundle> {
+        let proxy_ids = proxy_ids.iter().copied().collect::<HashSet<_>>();
+        let dns_ids = dns_ids.iter().copied().collect::<HashSet<_>>();
+        let group_ids = group_ids.iter().copied().collect::<HashSet<_>>();
+
+        let proxies = self
+            .list_proxies()?
+            .into_iter()
+            .filter(|proxy| proxy_ids.contains(&proxy.id))
+            .map(|proxy| BundleProxy {
+                name: proxy.name,
+                proxy_type: proxy.proxy_type,
+                host: proxy.host,
+                port: proxy.port,
+                username: proxy.username,
+                password: proxy.password,
+                enabled: proxy.enabled,
+                priority: proxy.priority,
+                test_url: proxy.test_url,
+                test_timeout: proxy.test_timeout,
+                skip_cert_verify: proxy.skip_cert_verify,
+            })
+            .collect();
+
+        let dns_mappings = self
+            .list_dns_mappings()?
+            .into_iter()
+            .filter(|mapping| dns_ids.contains(&mapping.id))
+            .map(|mapping| BundleDns {
+                domain: mapping.domain,
+                ip: mapping.ip,
+                description: mapping.description,
+                enabled: mapping.enabled,
+            })
+            .collect();
+
+        let proxy_groups = self
+            .list_proxy_groups()?
+            .into_iter()
+            .filter(|group| group_ids.contains(&group.id))
+            .map(|group| BundleGroup {
+                name: group.name,
+                is_default: group.is_default,
+                enabled: group.enabled,
+                domains: group
+                    .domains
+                    .into_iter()
+                    .map(|domain| domain.domain)
+                    .collect(),
+                members: group
+                    .members
+                    .into_iter()
+                    .map(|member| BundleGroupMember {
+                        name: member.name,
+                        proxy_type: member.proxy_type,
+                        host: member.host,
+                        port: member.port,
+                    })
+                    .collect(),
+            })
+            .collect();
+
+        Ok(ConfigBundle {
+            kind: CONFIG_BUNDLE_KIND.to_string(),
+            version: crate::version::VERSION.to_string(),
+            exported_at: chrono::Utc::now().to_rfc3339(),
+            proxies,
+            dns_mappings,
+            proxy_groups,
+        })
+    }
+
+    pub fn import_bundle(&self, bundle: &ConfigBundle) -> Result<ImportSummary> {
+        let mut conn = self.connection()?;
+        let tx = conn.transaction()?;
+        let mut summary = ImportSummary::default();
+
+        for proxy in &bundle.proxies {
+            if proxy.name.trim().is_empty()
+                || proxy.proxy_type.trim().is_empty()
+                || proxy.host.trim().is_empty()
+                || proxy.port <= 0
+                || proxy.port > 65535
+            {
+                summary.proxies.skipped += 1;
+                continue;
+            }
+            let exists: Option<i64> = tx
+                .query_row(
+                    "SELECT id FROM proxies WHERE host = ? AND port = ? AND type = ?",
+                    params![proxy.host.trim(), proxy.port, proxy.proxy_type.trim()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if exists.is_some() {
+                summary.proxies.skipped += 1;
+                continue;
+            }
+            tx.execute(
+                r#"
+                INSERT INTO proxies
+                  (name, type, host, port, username, password, enabled, priority, test_url, test_timeout, skip_cert_verify)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                "#,
+                params![
+                    proxy.name.trim(),
+                    proxy.proxy_type.trim(),
+                    proxy.host.trim(),
+                    proxy.port,
+                    proxy.username,
+                    proxy.password,
+                    i64::from(proxy.enabled != 0),
+                    proxy.priority,
+                    empty_to_none(proxy.test_url.clone()),
+                    proxy.test_timeout,
+                    i64::from(proxy.skip_cert_verify != 0)
+                ],
+            )?;
+            summary.proxies.added += 1;
         }
-        config.insert(
-            "proxies".to_string(),
-            serde_json::to_value(self.list_proxies()?)?,
-        );
-        Ok(json!({
-            "version": crate::version::VERSION,
-            "exportTime": chrono::Utc::now().to_rfc3339(),
-            "config": Value::Object(config)
-        }))
+
+        for mapping in &bundle.dns_mappings {
+            let domain = mapping.domain.trim().to_lowercase();
+            if domain.is_empty() || validate_ipv4(mapping.ip.trim()).is_err() {
+                summary.dns_mappings.skipped += 1;
+                continue;
+            }
+            let exists: Option<i64> = tx
+                .query_row(
+                    "SELECT id FROM dns_mappings WHERE domain = ?",
+                    params![domain],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if exists.is_some() {
+                summary.dns_mappings.skipped += 1;
+                continue;
+            }
+            tx.execute(
+                "INSERT INTO dns_mappings (domain, ip, description, enabled) VALUES (?, ?, ?, ?)",
+                params![
+                    domain,
+                    mapping.ip.trim(),
+                    mapping.description,
+                    i64::from(mapping.enabled != 0)
+                ],
+            )?;
+            summary.dns_mappings.added += 1;
+        }
+
+        for group in &bundle.proxy_groups {
+            let name = group.name.trim();
+            if name.is_empty() {
+                summary.proxy_groups.skipped += 1;
+                continue;
+            }
+            let exists: Option<i64> = tx
+                .query_row(
+                    "SELECT id FROM proxy_groups WHERE name = ?",
+                    params![name],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if exists.is_some() {
+                summary.proxy_groups.skipped += 1;
+                continue;
+            }
+            // 仅当本地尚无默认分组时才保留导入分组的默认标记，避免悄悄改变现有默认分组
+            let has_default: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM proxy_groups WHERE is_default = 1",
+                [],
+                |row| row.get(0),
+            )?;
+            let is_default = i64::from(group.is_default == 1 && has_default == 0);
+            tx.execute(
+                "INSERT INTO proxy_groups (name, is_default, enabled) VALUES (?, ?, ?)",
+                params![name, is_default, i64::from(group.enabled != 0)],
+            )?;
+            let group_id = tx.last_insert_rowid();
+            save_group_domains(&tx, group_id, group.domains.clone())?;
+            for member in &group.members {
+                let proxy_id: Option<i64> = tx
+                    .query_row(
+                        "SELECT id FROM proxies WHERE host = ? AND port = ? AND type = ?",
+                        params![member.host.trim(), member.port, member.proxy_type.trim()],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                match proxy_id {
+                    Some(proxy_id) => {
+                        tx.execute(
+                            "INSERT OR IGNORE INTO proxy_group_members (group_id, proxy_id) VALUES (?, ?)",
+                            params![group_id, proxy_id],
+                        )?;
+                    }
+                    None => summary.unresolved_members += 1,
+                }
+            }
+            summary.proxy_groups.added += 1;
+        }
+
+        tx.commit()?;
+        Ok(summary)
     }
 
     pub fn list_dns_mappings(&self) -> Result<Vec<DnsMapping>> {

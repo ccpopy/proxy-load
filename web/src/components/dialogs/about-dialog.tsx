@@ -13,6 +13,15 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
+import {
+  Field,
+  FieldContent,
+  FieldDescription,
+  FieldTitle,
+} from "@/components/ui/field"
+import { Switch } from "@/components/ui/switch"
+
+const MIRROR_STORAGE_KEY = "proxy-load-update-mirror"
 
 export function AboutDialog({
   open,
@@ -28,11 +37,20 @@ export function AboutDialog({
   const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null)
   const [checking, setChecking] = useState(false)
   const [installing, setInstalling] = useState(false)
+  const [useMirror, setUseMirror] = useState(
+    () => localStorage.getItem(MIRROR_STORAGE_KEY) === "1"
+  )
+
+  function toggleMirror(value: boolean) {
+    setUseMirror(value)
+    localStorage.setItem(MIRROR_STORAGE_KEY, value ? "1" : "0")
+    setUpdateInfo(null)
+  }
 
   async function handleCheck() {
     setChecking(true)
     try {
-      const info = await command<UpdateInfo>("check_for_updates")
+      const info = await command<UpdateInfo>("check_for_updates", { useMirror })
       setUpdateInfo(info)
       if (info.hasUpdate) {
         toast.success(`发现新版本 ${info.latest?.version}`)
@@ -53,6 +71,7 @@ export function AboutDialog({
     try {
       const result = await command<{ message?: string }>("install_update", {
         artifactPath: updateInfo.latest.path,
+        useMirror,
       })
       toast.success(result.message ?? "已启动更新安装程序")
       onOpenChange(false)
@@ -102,6 +121,16 @@ export function AboutDialog({
               <Meta label="代理端口" value={serviceInfo.proxy_port} />
             )}
           </div>
+
+          <Field orientation="horizontal" className="rounded-md border bg-card/40 p-4">
+            <FieldContent>
+              <FieldTitle>国内加速</FieldTitle>
+              <FieldDescription>
+                通过 gh.lessdo.top 镜像检查更新与下载，适用于无法直连 GitHub 的网络
+              </FieldDescription>
+            </FieldContent>
+            <Switch checked={useMirror} onCheckedChange={toggleMirror} />
+          </Field>
         </div>
 
         <DialogFooter>

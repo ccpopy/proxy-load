@@ -1,9 +1,22 @@
-import { Activity, Globe2, Layers3, Server, SlidersHorizontal } from "lucide-react"
+import {
+  Activity,
+  ArrowLeftRight,
+  Globe2,
+  Layers3,
+  Server,
+  SlidersHorizontal,
+} from "lucide-react"
 
 import type { ChartConfig } from "@/components/ui/chart"
 import type { AdvancedConfig, Overview } from "@/types"
 
-export type SectionKey = "proxies" | "dns" | "settings" | "groups" | "status"
+export type SectionKey =
+  | "proxies"
+  | "dns"
+  | "settings"
+  | "groups"
+  | "transfer"
+  | "status"
 export type ThemeMode = "light" | "dark"
 
 export const navItems = [
@@ -11,6 +24,7 @@ export const navItems = [
   { key: "dns", label: "DNS映射", icon: Globe2 },
   { key: "settings", label: "负载设置", icon: SlidersHorizontal },
   { key: "groups", label: "代理分组", icon: Layers3 },
+  { key: "transfer", label: "导入导出", icon: ArrowLeftRight },
   { key: "status", label: "系统状态", icon: Activity },
 ] satisfies Array<{ key: SectionKey; label: string; icon: typeof Server }>
 

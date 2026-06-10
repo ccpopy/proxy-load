@@ -40,6 +40,7 @@ import { DnsSection } from "@/components/sections/dns-section"
 import { LoadSettingsSection } from "@/components/sections/load-settings-section"
 import { GroupSection } from "@/components/sections/groups-section"
 import { StatusSection } from "@/components/sections/status-section"
+import { TransferSection } from "@/components/sections/transfer-section"
 import { ProxyDialog } from "@/components/dialogs/proxy-dialog"
 import { DnsDialog } from "@/components/dialogs/dns-dialog"
 import { GroupDialog } from "@/components/dialogs/group-dialog"
@@ -178,6 +179,7 @@ export function App() {
           "proxy_group_created",
           "proxy_group_updated",
           "proxy_group_deleted",
+          "config_imported",
           "traffic_logs_cleared",
           "request_logged",
           "proxy_service_status_changed",
@@ -289,6 +291,14 @@ export function App() {
                   groups={groups}
                   onCreate={() => setGroupDialog("new")}
                   onEdit={setGroupDialog}
+                  onChanged={refresh}
+                />
+              )}
+              {section === "transfer" && (
+                <TransferSection
+                  proxies={proxies}
+                  dnsMappings={dnsMappings}
+                  groups={groups}
                   onChanged={refresh}
                 />
               )}

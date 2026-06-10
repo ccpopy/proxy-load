@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
 use crate::{
-    models::{DnsInput, ProxyGroupInput, ProxyInput},
+    models::{ConfigBundle, DnsInput, ProxyGroupInput, ProxyInput, CONFIG_BUNDLE_KIND},
     proxy::ProxyServiceStatus,
     state::AppState,
     version,
@@ -22,6 +22,9 @@ use crate::{
 
 const GITHUB_LATEST_RELEASE_URL: &str =
     "https://api.github.com/repos/ccpopy/proxy-load/releases/latest";
+const GITHUB_RELEASES_URL: &str = "https://github.com/ccpopy/proxy-load/releases";
+// gh-proxy（hunshcn/gh-proxy）镜像，仅支持 github.com 页面与资产下载，不支持 api.github.com
+const GH_PROXY_BASE: &str = "https://gh.lessdo.top/";
 const GITHUB_TOKEN_ENV: &str = "PROXY_LOAD_GITHUB_TOKEN";
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -288,9 +291,94 @@ pub fn reset_advanced_config(state: tauri::State<'_, Arc<AppState>>) -> CommandR
     Ok(json!({ "success": true, "message": "已恢复默认配置" }))
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportSelection {
+    #[serde(default)]
+    pub proxy_ids: Vec<i64>,
+    #[serde(default)]
+    pub dns_ids: Vec<i64>,
+    #[serde(default)]
+    pub group_ids: Vec<i64>,
+}
+
 #[tauri::command]
-pub fn export_config(state: tauri::State<'_, Arc<AppState>>) -> CommandResult<Value> {
-    Ok(state.db.exported_config()?)
+pub async fn export_selected_config(
+    state: tauri::State<'_, Arc<AppState>>,
+    selection: ExportSelection,
+) -> CommandResult<Value> {
+    if selection.proxy_ids.is_empty()
+        && selection.dns_ids.is_empty()
+        && selection.group_ids.is_empty()
+    {
+        return Err(CommandError::new("请先选择要导出的代理、DNS 映射或分组"));
+    }
+
+    let bundle = state.db.export_bundle(
+        &selection.proxy_ids,
+        &selection.dns_ids,
+        &selection.group_ids,
+    )?;
+    let counts = json!({
+        "proxies": bundle.proxies.len(),
+        "dnsMappings": bundle.dns_mappings.len(),
+        "proxyGroups": bundle.proxy_groups.len()
+    });
+    let content = serde_json::to_vec_pretty(&bundle)?;
+
+    let default_name = format!(
+        "proxy-load-config-{}.json",
+        chrono::Local::now().format("%Y%m%d-%H%M%S")
+    );
+    let target = tauri::async_runtime::spawn_blocking(move || {
+        rfd::FileDialog::new()
+            .set_title("导出配置")
+            .set_file_name(&default_name)
+            .add_filter("JSON 配置文件", &["json"])
+            .save_file()
+    })
+    .await
+    .map_err(|error| CommandError::new(format!("打开保存对话框失败: {error}")))?;
+
+    let Some(path) = target else {
+        return Ok(json!({ "canceled": true }));
+    };
+    fs::write(&path, content)?;
+    Ok(json!({
+        "canceled": false,
+        "path": path.display().to_string(),
+        "counts": counts
+    }))
+}
+
+#[tauri::command]
+pub async fn import_config_file(state: tauri::State<'_, Arc<AppState>>) -> CommandResult<Value> {
+    let state = state.inner().clone();
+    let target = tauri::async_runtime::spawn_blocking(|| {
+        rfd::FileDialog::new()
+            .set_title("导入配置")
+            .add_filter("JSON 配置文件", &["json"])
+            .pick_file()
+    })
+    .await
+    .map_err(|error| CommandError::new(format!("打开文件对话框失败: {error}")))?;
+
+    let Some(path) = target else {
+        return Ok(json!({ "canceled": true }));
+    };
+    let raw = fs::read_to_string(&path)?;
+    let bundle: ConfigBundle = serde_json::from_str(&raw)
+        .map_err(|error| CommandError::new(format!("配置文件格式无效: {error}")))?;
+    if bundle.kind != CONFIG_BUNDLE_KIND {
+        return Err(CommandError::new(
+            "选中的文件不是本系统导出的配置文件，无法导入",
+        ));
+    }
+
+    let summary = state.db.import_bundle(&bundle)?;
+    state.proxy_runtime.refresh_dns_cache().await?;
+    state.emit("config_imported", serde_json::to_value(&summary)?);
+    Ok(json!({ "canceled": false, "summary": summary }))
 }
 
 #[tauri::command]
@@ -521,13 +609,17 @@ pub struct UpdateInfo {
 }
 
 #[tauri::command]
-pub async fn check_for_updates() -> CommandResult<UpdateInfo> {
-    build_update_info().await
+pub async fn check_for_updates(use_mirror: Option<bool>) -> CommandResult<UpdateInfo> {
+    build_update_info(use_mirror.unwrap_or(false)).await
 }
 
 #[tauri::command]
-pub async fn install_update(artifact_path: Option<String>) -> CommandResult<Value> {
-    let info = build_update_info().await?;
+pub async fn install_update(
+    artifact_path: Option<String>,
+    use_mirror: Option<bool>,
+) -> CommandResult<Value> {
+    let use_mirror = use_mirror.unwrap_or(false);
+    let info = build_update_info(use_mirror).await?;
     let app_dir = PathBuf::from(&info.app_dir);
     let download_dir = PathBuf::from(&info.download_dir);
     let selected = artifact_path
@@ -551,7 +643,7 @@ pub async fn install_update(artifact_path: Option<String>) -> CommandResult<Valu
             "更新包文件名与当前运行程序相同，无法在运行中覆盖自身",
         ));
     }
-    download_release_asset(&selected.download_url, &selected_path).await?;
+    download_release_asset(&selected.download_url, &selected_path, !use_mirror).await?;
     launch_update_installer(&selected_path, &app_dir, &selected.kind)?;
 
     let message = if selected.kind == "windows-portable" {
@@ -644,7 +736,7 @@ fn ensure_positive(value: i64, field: &str) -> CommandResult<i64> {
     }
 }
 
-async fn build_update_info() -> CommandResult<UpdateInfo> {
+async fn build_update_info(use_mirror: bool) -> CommandResult<UpdateInfo> {
     if cfg!(debug_assertions) {
         return Err(CommandError::new(
             "开发环境不允许检查更新；生产环境将从 GitHub Releases 获取更新包",
@@ -658,17 +750,17 @@ async fn build_update_info() -> CommandResult<UpdateInfo> {
     let current_version = version::VERSION.to_string();
     let current = VersionParts::parse(version::VERSION)
         .ok_or_else(|| CommandError::new("当前版本号格式无效"))?;
-    let release = fetch_latest_release().await?;
-    let release_version_text = release.tag_name.trim_start_matches('v').to_string();
+    let (release_tag, assets) = if use_mirror {
+        fetch_latest_release_via_mirror().await?
+    } else {
+        fetch_latest_release_via_api().await?
+    };
+    let release_version_text = release_tag.trim_start_matches('v').to_string();
     let release_version = VersionParts::parse(&release_version_text).ok_or_else(|| {
-        CommandError::new(format!(
-            "GitHub Release 标签不是有效版本号: {}",
-            release.tag_name
-        ))
+        CommandError::new(format!("GitHub Release 标签不是有效版本号: {release_tag}"))
     })?;
 
-    let mut artifacts = release
-        .assets
+    let mut artifacts = assets
         .into_iter()
         .filter_map(|asset| {
             let kind = artifact_kind_from_name(&asset.name)?;
@@ -677,12 +769,12 @@ async fn build_update_info() -> CommandResult<UpdateInfo> {
             }
             Some(UpdateArtifact {
                 file_name: asset.name,
-                path: asset.browser_download_url.clone(),
-                download_url: asset.browser_download_url,
+                path: asset.download_url.clone(),
+                download_url: asset.download_url,
                 version: release_version_text.clone(),
                 kind: kind.to_string(),
                 is_newer: release_version > current,
-                size: Some(asset.size),
+                size: asset.size,
             })
         })
         .collect::<Vec<_>>();
@@ -694,7 +786,11 @@ async fn build_update_info() -> CommandResult<UpdateInfo> {
         app_dir: app_dir.display().to_string(),
         download_dir: app_dir.display().to_string(),
         install_mode: install_mode.to_string(),
-        source: "github-releases".to_string(),
+        source: if use_mirror {
+            "gh-proxy-mirror".to_string()
+        } else {
+            "github-releases".to_string()
+        },
         has_update: latest.is_some(),
         latest,
         artifacts,
@@ -723,19 +819,132 @@ fn current_install_mode(executable: &Path) -> &'static str {
     }
 }
 
-async fn fetch_latest_release() -> CommandResult<GithubRelease> {
+struct ReleaseAssetRef {
+    name: String,
+    download_url: String,
+    size: Option<u64>,
+}
+
+async fn fetch_latest_release_via_api() -> CommandResult<(String, Vec<ReleaseAssetRef>)> {
     let client = github_client(Duration::from_secs(20))?;
-    let response = github_get(&client, GITHUB_LATEST_RELEASE_URL)
+    let response = github_get(&client, GITHUB_LATEST_RELEASE_URL, true)
         .send()
         .await?;
     let response = ensure_github_success(response, "查询").await?;
-
-    Ok(response.json().await?)
+    let release: GithubRelease = response.json().await?;
+    let assets = release
+        .assets
+        .into_iter()
+        .map(|asset| ReleaseAssetRef {
+            name: asset.name,
+            download_url: asset.browser_download_url,
+            size: Some(asset.size),
+        })
+        .collect();
+    Ok((release.tag_name, assets))
 }
 
-async fn download_release_asset(download_url: &str, target_path: &Path) -> CommandResult<()> {
+/// gh-proxy 镜像不代理 api.github.com，改用 releases/latest 的 302 重定向获取最新
+/// 标签，再从 expanded_assets 页面提取资产文件名。
+async fn fetch_latest_release_via_mirror() -> CommandResult<(String, Vec<ReleaseAssetRef>)> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .user_agent(format!("proxy-load/{}", version::VERSION))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+    let response = client
+        .get(format!("{GH_PROXY_BASE}{GITHUB_RELEASES_URL}/latest"))
+        .send()
+        .await?;
+    let status = response.status();
+    let tag = if status.is_redirection() {
+        response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(extract_release_tag)
+    } else if status.is_success() {
+        extract_release_tag(&response.text().await?)
+    } else {
+        return Err(CommandError::new(format!(
+            "国内加速查询最新版本失败: HTTP {status}（镜像 {GH_PROXY_BASE}）"
+        )));
+    };
+    let tag = tag
+        .ok_or_else(|| CommandError::new("国内加速未能解析最新版本号，请稍后重试或关闭国内加速"))?;
+
+    let client = github_client(Duration::from_secs(20))?;
+    let response = client
+        .get(format!(
+            "{GH_PROXY_BASE}{GITHUB_RELEASES_URL}/expanded_assets/{tag}"
+        ))
+        .send()
+        .await?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(CommandError::new(format!(
+            "国内加速获取更新包列表失败: HTTP {status}（镜像 {GH_PROXY_BASE}）"
+        )));
+    }
+    let html = response.text().await?;
+    let names = extract_release_asset_names(&html, &tag);
+    if names.is_empty() {
+        return Err(CommandError::new(
+            "国内加速未返回任何更新包，可能镜像暂不可用，请稍后重试或关闭国内加速",
+        ));
+    }
+
+    let assets = names
+        .into_iter()
+        .map(|name| ReleaseAssetRef {
+            download_url: format!("{GH_PROXY_BASE}{GITHUB_RELEASES_URL}/download/{tag}/{name}"),
+            name,
+            size: None,
+        })
+        .collect();
+    Ok((tag, assets))
+}
+
+fn extract_release_tag(text: &str) -> Option<String> {
+    let marker = "/releases/tag/";
+    let start = text.find(marker)? + marker.len();
+    let rest = &text[start..];
+    let end = rest
+        .find(|c: char| c == '"' || c == '\'' || c == '?' || c == '#' || c.is_whitespace())
+        .unwrap_or(rest.len());
+    let tag = rest[..end].trim_end_matches('/');
+    if tag.is_empty() {
+        None
+    } else {
+        Some(tag.to_string())
+    }
+}
+
+fn extract_release_asset_names(html: &str, tag: &str) -> Vec<String> {
+    let marker = format!("/releases/download/{tag}/");
+    let mut seen = HashSet::new();
+    let mut names = Vec::new();
+    let mut rest = html;
+    while let Some(position) = rest.find(&marker) {
+        let after = &rest[position + marker.len()..];
+        if let Some(end) = after.find('"') {
+            let name = &after[..end];
+            if !name.is_empty() && !name.contains('/') && seen.insert(name.to_string()) {
+                names.push(name.to_string());
+            }
+        }
+        rest = &rest[position + marker.len()..];
+    }
+    names
+}
+
+async fn download_release_asset(
+    download_url: &str,
+    target_path: &Path,
+    with_token: bool,
+) -> CommandResult<()> {
     let client = github_client(Duration::from_secs(120))?;
-    let response = github_get(&client, download_url).send().await?;
+    let response = github_get(&client, download_url, with_token).send().await?;
     let response = ensure_github_success(response, "下载").await?;
 
     fs::write(target_path, response.bytes().await?)?;
@@ -749,8 +958,12 @@ fn github_client(timeout: Duration) -> CommandResult<reqwest::Client> {
         .build()?)
 }
 
-fn github_get(client: &reqwest::Client, url: &str) -> reqwest::RequestBuilder {
+/// 直连 GitHub 时附加可选 Token；镜像请求不携带，避免凭据泄露给第三方。
+fn github_get(client: &reqwest::Client, url: &str, with_token: bool) -> reqwest::RequestBuilder {
     let request = client.get(url);
+    if !with_token {
+        return request;
+    }
     match std::env::var(GITHUB_TOKEN_ENV) {
         Ok(token) if !token.trim().is_empty() => request.bearer_auth(token.trim().to_string()),
         _ => request,
@@ -900,14 +1113,26 @@ impl VersionParts {
 
 #[cfg(test)]
 mod tests {
-    use super::VersionParts;
+    use super::{extract_release_asset_names, extract_release_tag, VersionParts};
 
     #[test]
     fn compares_legacy_date_versions_with_windows_safe_versions() {
-        let legacy = VersionParts::parse("2026.6.8").unwrap();
-        let current = VersionParts::parse("26.6.801").unwrap();
+        let legacy = VersionParts::parse("2026.6.5").unwrap();
+        let current = VersionParts::parse("26.6.501").unwrap();
 
         assert!(current > legacy);
+    }
+
+    #[test]
+    fn compares_new_calendar_day_after_previous_revision() {
+        assert!(VersionParts::parse("26.6.10").unwrap() > VersionParts::parse("26.6.501").unwrap());
+    }
+
+    #[test]
+    fn compares_same_day_encoded_revision_after_base_release() {
+        assert!(
+            VersionParts::parse("26.6.1001").unwrap() > VersionParts::parse("26.6.10").unwrap()
+        );
     }
 
     #[test]
@@ -921,8 +1146,40 @@ mod tests {
     #[test]
     fn treats_semver_metadata_as_same_day_revision() {
         assert_eq!(
-            VersionParts::parse("2026.6.8+1").unwrap(),
-            VersionParts::parse("26.6.801").unwrap()
+            VersionParts::parse("2026.6.10+1").unwrap(),
+            VersionParts::parse("26.6.1001").unwrap()
+        );
+    }
+
+    #[test]
+    fn extracts_tag_from_mirror_location_header() {
+        assert_eq!(
+            extract_release_tag("/https://github.com/ccpopy/proxy-load/releases/tag/v26.06.10"),
+            Some("v26.06.10".to_string())
+        );
+        assert_eq!(
+            extract_release_tag("https://github.com/ccpopy/proxy-load/releases/tag/v1.2.3?x=1"),
+            Some("v1.2.3".to_string())
+        );
+        assert_eq!(
+            extract_release_tag("https://github.com/ccpopy/proxy-load"),
+            None
+        );
+    }
+
+    #[test]
+    fn extracts_asset_names_from_expanded_assets_html() {
+        let html = r#"
+            <a href="/ccpopy/proxy-load/releases/download/v26.06.10/proxy-load_26.6.10_windows_x64-setup.exe">a</a>
+            <a href="/ccpopy/proxy-load/releases/download/v26.06.10/proxy-load_26.6.10_windows_x64-setup.exe">dup</a>
+            <a href="/ccpopy/proxy-load/releases/download/v26.06.10/proxy-load_26.6.10_x64-portable.exe">b</a>
+        "#;
+        assert_eq!(
+            extract_release_asset_names(html, "v26.06.10"),
+            vec![
+                "proxy-load_26.6.10_windows_x64-setup.exe".to_string(),
+                "proxy-load_26.6.10_x64-portable.exe".to_string()
+            ]
         );
     }
 }

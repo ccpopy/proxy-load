@@ -9,7 +9,7 @@ on:
       release_tag:
         description: "Release tag to upload assets to"
         required: true
-        default: "v26.06.08"
+        default: "v26.06.10"
       target:
         description: "Build target"
         required: true
@@ -123,22 +123,21 @@ jobs:
 
             ### 新增
 
-            - 重新设计应用图标，采用更接近 macOS/iOS 主流应用图标的圆角渐变、玻璃层次和简洁分流符号。
-            - 同步生成 Windows、macOS、Linux、iOS 和 Android 所需的 Tauri 图标资源。
+            - 新增代理配置导入导出，可选择代理列表、DNS 映射和代理分组后导出或导入。
+            - 新增 GitHub Release 更新国内加速，可通过 gh-proxy 镜像查询和下载更新包。
 
             ### 调整
 
-            - 优化输入框和下拉选择框的 hover/focus 视觉状态，减少突兀阴影和背景跳变。
-            - 将代理编辑弹窗的测试地址选择入口整合进输入框内部，交互形态更接近标准 combobox。
-            - 发布包版本、产物命名和 Windows 安装包内部应用版本统一使用 `26.6.8`。
+            - 移除高级设置中的配置导出入口，统一放到侧边栏导入导出页面。
+            - 发布包版本、产物命名和 Windows 安装包内部应用版本统一使用 `26.6.10`。
 
             ### 修复
 
-            - 修复代理编辑弹窗中测试地址候选列表偏离输入框的问题，下拉现在从输入框正下方展开并与输入框等宽。
+            - 修复 GitHub 访问受限环境下无法获取更新包的问题。
 
             ### 文档
 
-            - 更新 README 中 Windows portable、Windows 安装包和 macOS dmg 的示例文件名。
+            - 更新 README 中当前版本产物示例文件名。
           releaseDraft: false
           prerelease: ${{ contains(env.RELEASE_TAG, '-') }}
           assetNamePattern: proxy-load_${{ steps.package-version.outputs.version }}_[platform]_[arch][setup][ext]

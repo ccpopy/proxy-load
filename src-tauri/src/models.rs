@@ -147,3 +147,97 @@ pub struct ServerEvent {
     pub data: Value,
     pub timestamp: i64,
 }
+
+pub const CONFIG_BUNDLE_KIND: &str = "proxy-load-config";
+
+fn default_enabled() -> i64 {
+    1
+}
+
+fn default_priority() -> i64 {
+    999
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigBundle {
+    pub kind: String,
+    pub version: String,
+    #[serde(rename = "exportedAt")]
+    pub exported_at: String,
+    #[serde(default)]
+    pub proxies: Vec<BundleProxy>,
+    #[serde(rename = "dnsMappings", default)]
+    pub dns_mappings: Vec<BundleDns>,
+    #[serde(rename = "proxyGroups", default)]
+    pub proxy_groups: Vec<BundleGroup>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BundleProxy {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub proxy_type: String,
+    pub host: String,
+    pub port: i64,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+    #[serde(default = "default_enabled")]
+    pub enabled: i64,
+    #[serde(default = "default_priority")]
+    pub priority: i64,
+    #[serde(default)]
+    pub test_url: Option<String>,
+    #[serde(default)]
+    pub test_timeout: Option<i64>,
+    #[serde(default)]
+    pub skip_cert_verify: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BundleDns {
+    pub domain: String,
+    pub ip: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default = "default_enabled")]
+    pub enabled: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BundleGroupMember {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub proxy_type: String,
+    pub host: String,
+    pub port: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BundleGroup {
+    pub name: String,
+    #[serde(default)]
+    pub is_default: i64,
+    #[serde(default = "default_enabled")]
+    pub enabled: i64,
+    #[serde(default)]
+    pub domains: Vec<String>,
+    #[serde(default)]
+    pub members: Vec<BundleGroupMember>,
+}
+
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct ImportCounts {
+    pub added: i64,
+    pub skipped: i64,
+}
+
+#[derive(Debug, Default, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportSummary {
+    pub proxies: ImportCounts,
+    pub dns_mappings: ImportCounts,
+    pub proxy_groups: ImportCounts,
+    pub unresolved_members: i64,
+}

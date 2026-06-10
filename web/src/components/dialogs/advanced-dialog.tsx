@@ -1,7 +1,6 @@
 import type { ReactNode } from "react"
 import {
   Database,
-  Download,
   RotateCcw,
   Save,
   Settings,
@@ -63,17 +62,6 @@ export function AdvancedDialog({
     await onChanged()
   }
 
-  async function exportConfig() {
-    const payload = await api<unknown>("/api/advanced-config/export")
-    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" })
-    const url = URL.createObjectURL(blob)
-    const link = document.createElement("a")
-    link.href = url
-    link.download = `proxy-config-${new Date().toISOString().slice(0, 10)}.json`
-    link.click()
-    URL.revokeObjectURL(url)
-  }
-
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-h-[calc(100vh-4rem)] w-[calc(100vw-3rem)] max-w-none overflow-hidden sm:max-w-6xl">
@@ -116,10 +104,6 @@ export function AdvancedDialog({
           </div>
         </ScrollArea>
         <DialogFooter>
-          <Button variant="outline" onClick={exportConfig}>
-            <Download />
-            导出
-          </Button>
           <Button variant="outline" onClick={reset}>
             <RotateCcw />
             恢复默认
