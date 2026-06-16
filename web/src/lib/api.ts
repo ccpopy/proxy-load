@@ -167,10 +167,13 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   }
 
   if (method === "GET" && route.pathname === "/api/traffic-logs") {
-    return command<T>("traffic_logs", {
+    const args: CommandArgs = {
       page: Number(route.searchParams.get("page") ?? "1"),
       pageSize: Number(route.searchParams.get("page_size") ?? "50"),
-    })
+    }
+    const proxySearch = route.searchParams.get("proxy")?.trim()
+    if (proxySearch) args.proxySearch = proxySearch
+    return command<T>("traffic_logs", args)
   }
   if (method === "DELETE" && route.pathname === "/api/traffic-logs") {
     return command<T>("clear_traffic_logs")

@@ -9,7 +9,7 @@ on:
       release_tag:
         description: "Release tag to upload assets to"
         required: true
-        default: "v26.6.1002"
+        default: "v26.6.16"
       target:
         description: "Build target"
         required: true
@@ -123,11 +123,12 @@ jobs:
 
             ### 修复
 
-            - 修复导出代理分组时未按已选代理过滤成员的问题，避免导出未勾选代理的地址引用。
+            - 修复清除流量日志会同时清空上方统计图表的问题。
 
             ### 调整
 
-            - 发布包版本、产物命名和 Windows 安装包内部应用版本统一使用 `26.6.1002`。
+            - 流量日志新增代理模糊搜索，并隐藏目标地址中的默认 `80` / `443` 端口。
+            - 发布包版本、产物命名和 Windows 安装包内部应用版本统一使用 `26.6.16`。
 
             ### 文档
 

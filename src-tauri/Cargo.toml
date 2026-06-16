@@ -1,6 +1,6 @@
 [package]
 name = "proxy-load-tauri"
-version = "26.6.1002"
+version = "26.6.16"
 description = "代理负载均衡管理系统"
 authors = ["linmew"]
 license = "MIT"

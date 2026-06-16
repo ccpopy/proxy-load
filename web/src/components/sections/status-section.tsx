@@ -71,6 +71,7 @@ import {
   TableRow,
 } from "@/components/ui/table"
 import { EmptyState } from "@/components/common/empty-state"
+import { Input } from "@/components/ui/input"
 
 const rankingChartMargin = { top: 8, right: 12, bottom: 32, left: 0 } as const
 
@@ -80,6 +81,8 @@ export function StatusSection({
   proxyUsage,
   targetStats,
   logs,
+  searchValue,
+  onSearchChange,
   onPageChange,
   onPageSizeChange,
   onChanged,
@@ -89,6 +92,8 @@ export function StatusSection({
   proxyUsage: ProxyUsageStat[]
   targetStats: TargetStat[]
   logs: TrafficLogPage
+  searchValue: string
+  onSearchChange: (value: string) => void
   onPageChange: (page: number) => void
   onPageSizeChange: (pageSize: number) => void
   onChanged: () => Promise<void>
@@ -234,11 +239,18 @@ export function StatusSection({
               await onChanged()
             }}
           >
-            <Trash2 />
+            <Trash2 data-icon="inline-start" />
             清除日志
           </Button>
         </CardHeader>
         <CardContent className="flex flex-col gap-4">
+          <Input
+            aria-label="搜索代理日志"
+            className="md:max-w-sm"
+            value={searchValue}
+            onChange={(event) => onSearchChange(event.target.value)}
+            placeholder="搜索代理名称、地址或端口"
+          />
           <Table>
             <TableHeader>
               <TableRow>
@@ -257,7 +269,7 @@ export function StatusSection({
                     {formatDate(log.created_at)}
                   </TableCell>
                   <TableCell className="font-mono tabular-nums">
-                    {log.target_host}:{log.target_port}
+                    {formatTarget(log.target_host, log.target_port)}
                   </TableCell>
                   <TableCell>{log.proxy_name || "-"}</TableCell>
                   <TableCell>
@@ -396,4 +408,13 @@ function MetricTile({
       <div className="mt-2 font-mono text-xl tabular-nums">{value}</div>
     </div>
   )
+}
+
+function formatTarget(host?: string | null, port?: number | null) {
+  const trimmedHost = host?.trim()
+  if (!trimmedHost) return "-"
+  if (port === 80) return `http://${trimmedHost}`
+  if (port === 443) return `https://${trimmedHost}`
+  if (port && port > 0) return `${trimmedHost}:${port}`
+  return trimmedHost
 }

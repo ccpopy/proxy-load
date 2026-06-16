@@ -76,6 +76,7 @@ export function App() {
     total: 0,
     totalPages: 1,
   })
+  const [trafficLogProxySearch, setTrafficLogProxySearch] = useState("")
   const [version, setVersion] = useState<VersionInfo | null>(null)
   const [proxyDialog, setProxyDialog] = useState<ProxyRecord | "new" | null>(null)
   const [dnsDialog, setDnsDialog] = useState<DnsMapping | "new" | null>(null)
@@ -88,12 +89,21 @@ export function App() {
     localStorage.setItem("zwfw-theme", theme)
   }, [theme])
 
-  const loadTrafficLogs = useCallback(async (page: number, pageSize: number) => {
-    const nextLogs = await api<TrafficLogPage>(
-      `/api/traffic-logs?page=${page}&page_size=${pageSize}`
-    )
-    setTrafficLogs(nextLogs)
-  }, [])
+  const loadTrafficLogs = useCallback(
+    async (page: number, pageSize: number, proxySearch = "") => {
+      const params = new URLSearchParams({
+        page: String(page),
+        page_size: String(pageSize),
+      })
+      const trimmedSearch = proxySearch.trim()
+      if (trimmedSearch) params.set("proxy", trimmedSearch)
+      const nextLogs = await api<TrafficLogPage>(
+        `/api/traffic-logs?${params.toString()}`
+      )
+      setTrafficLogs(nextLogs)
+    },
+    []
+  )
 
   const refresh = useCallback(async () => {
     const [
@@ -180,14 +190,17 @@ export function App() {
           "proxy_group_updated",
           "proxy_group_deleted",
           "config_imported",
-          "traffic_logs_cleared",
           "request_logged",
           "proxy_service_status_changed",
         ].includes(message.type)
       ) {
         Promise.all([
           refresh(),
-          loadTrafficLogs(trafficLogs.page, trafficLogs.pageSize),
+          loadTrafficLogs(
+            trafficLogs.page,
+            trafficLogs.pageSize,
+            trafficLogProxySearch
+          ),
         ]).catch((error) => toast.error(describeError(error)))
       }
     })
@@ -208,7 +221,14 @@ export function App() {
       closed = true
       unlisten?.()
     }
-  }, [apiReady, loadTrafficLogs, refresh, trafficLogs.page, trafficLogs.pageSize])
+  }, [
+    apiReady,
+    loadTrafficLogs,
+    refresh,
+    trafficLogProxySearch,
+    trafficLogs.page,
+    trafficLogs.pageSize,
+  ])
 
   const currentTitle =
     navItems.find((item) => item.key === section)?.label ?? "代理配置"
@@ -224,7 +244,11 @@ export function App() {
     try {
       await Promise.all([
         refresh(),
-        loadTrafficLogs(trafficLogs.page, trafficLogs.pageSize),
+        loadTrafficLogs(
+          trafficLogs.page,
+          trafficLogs.pageSize,
+          trafficLogProxySearch
+        ),
       ])
       toast.success("数据已刷新")
     } catch (error) {
@@ -309,13 +333,29 @@ export function App() {
                   proxyUsage={proxyUsage}
                   targetStats={targetStats}
                   logs={trafficLogs}
-                  onPageChange={(page) => loadTrafficLogs(page, trafficLogs.pageSize)}
-                  onPageSizeChange={(pageSize) => loadTrafficLogs(1, pageSize)}
+                  searchValue={trafficLogProxySearch}
+                  onSearchChange={(value) => {
+                    setTrafficLogProxySearch(value)
+                    loadTrafficLogs(1, trafficLogs.pageSize, value).catch((error) =>
+                      toast.error(describeError(error))
+                    )
+                  }}
+                  onPageChange={(page) =>
+                    loadTrafficLogs(
+                      page,
+                      trafficLogs.pageSize,
+                      trafficLogProxySearch
+                    )
+                  }
+                  onPageSizeChange={(pageSize) =>
+                    loadTrafficLogs(1, pageSize, trafficLogProxySearch)
+                  }
                   onChanged={async () => {
-                    await Promise.all([
-                      refresh(),
-                      loadTrafficLogs(1, trafficLogs.pageSize),
-                    ])
+                    await loadTrafficLogs(
+                      1,
+                      trafficLogs.pageSize,
+                      trafficLogProxySearch
+                    )
                   }}
                 />
               )}

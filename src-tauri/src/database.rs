@@ -15,6 +15,8 @@ use crate::models::{
     ProxyRecord, TrafficLog, CONFIG_BUNDLE_KIND,
 };
 
+const TRAFFIC_LOG_VISIBLE_AFTER_ID_KEY: &str = "traffic_log_visible_after_id";
+
 #[derive(Clone)]
 pub struct Database {
     conn: Arc<Mutex<Connection>>,
@@ -929,47 +931,128 @@ impl Database {
         Ok(conn.last_insert_rowid())
     }
 
-    pub fn traffic_logs(&self, page: i64, page_size: i64) -> Result<(Vec<TrafficLog>, i64)> {
+    pub fn traffic_logs(
+        &self,
+        page: i64,
+        page_size: i64,
+        proxy_search: Option<&str>,
+    ) -> Result<(Vec<TrafficLog>, i64)> {
         let page = page.max(1);
         let page_size = page_size.max(1);
         let offset = (page - 1) * page_size;
         let conn = self.connection()?;
-        let total = conn.query_row("SELECT COUNT(*) FROM request_logs", [], |row| row.get(0))?;
-        let mut stmt = conn.prepare(
-            r#"
-            SELECT rl.id, rl.proxy_id, p.name AS proxy_name, p.type AS proxy_type,
-              p.host AS proxy_host, p.port AS proxy_port, rl.target_host, rl.target_port,
-              rl.success, rl.response_time, rl.error_message, rl.result_type, rl.created_at
-            FROM request_logs rl
-            LEFT JOIN proxies p ON p.id = rl.proxy_id
-            ORDER BY rl.id DESC
-            LIMIT ? OFFSET ?
-            "#,
-        )?;
-        let rows = stmt.query_map(params![page_size, offset], |row| {
-            Ok(TrafficLog {
-                id: row.get("id")?,
-                proxy_id: row.get("proxy_id")?,
-                proxy_name: row.get("proxy_name")?,
-                proxy_type: row.get("proxy_type")?,
-                proxy_host: row.get("proxy_host")?,
-                proxy_port: row.get("proxy_port")?,
-                target_host: row.get("target_host")?,
-                target_port: row.get("target_port")?,
-                success: row.get("success")?,
-                response_time: row.get("response_time")?,
-                error_message: row.get("error_message")?,
-                result_type: row.get("result_type")?,
-                created_at: row.get("created_at")?,
-            })
-        })?;
-        Ok((rows.collect::<rusqlite::Result<Vec<_>>>()?, total))
+        let visible_after_id = traffic_log_visible_after_id(&conn)?;
+        let proxy_search = proxy_search
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+
+        let (total, items) = if let Some(proxy_search) = proxy_search {
+            let pattern = like_pattern(proxy_search);
+            let total = conn.query_row(
+                r#"
+                SELECT COUNT(*)
+                FROM request_logs rl
+                LEFT JOIN proxies p ON p.id = rl.proxy_id
+                WHERE rl.id > ?
+                  AND (
+                    COALESCE(p.name, '') LIKE ? ESCAPE '\'
+                    OR COALESCE(p.type, '') LIKE ? ESCAPE '\'
+                    OR COALESCE(p.host, '') LIKE ? ESCAPE '\'
+                    OR COALESCE(p.host, '') || ':' || COALESCE(p.port, '') LIKE ? ESCAPE '\'
+                    OR CAST(COALESCE(p.port, 0) AS TEXT) LIKE ? ESCAPE '\'
+                  )
+                "#,
+                params![
+                    visible_after_id,
+                    pattern,
+                    pattern,
+                    pattern,
+                    pattern,
+                    pattern
+                ],
+                |row| row.get(0),
+            )?;
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT rl.id, rl.proxy_id, p.name AS proxy_name, p.type AS proxy_type,
+                  p.host AS proxy_host, p.port AS proxy_port, rl.target_host, rl.target_port,
+                  rl.success, rl.response_time, rl.error_message, rl.result_type, rl.created_at
+                FROM request_logs rl
+                LEFT JOIN proxies p ON p.id = rl.proxy_id
+                WHERE rl.id > ?
+                  AND (
+                    COALESCE(p.name, '') LIKE ? ESCAPE '\'
+                    OR COALESCE(p.type, '') LIKE ? ESCAPE '\'
+                    OR COALESCE(p.host, '') LIKE ? ESCAPE '\'
+                    OR COALESCE(p.host, '') || ':' || COALESCE(p.port, '') LIKE ? ESCAPE '\'
+                    OR CAST(COALESCE(p.port, 0) AS TEXT) LIKE ? ESCAPE '\'
+                  )
+                ORDER BY rl.id DESC
+                LIMIT ? OFFSET ?
+                "#,
+            )?;
+            let rows = stmt.query_map(
+                params![
+                    visible_after_id,
+                    pattern,
+                    pattern,
+                    pattern,
+                    pattern,
+                    pattern,
+                    page_size,
+                    offset
+                ],
+                traffic_log_from_row,
+            )?;
+            (total, rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        } else {
+            let total = conn.query_row(
+                "SELECT COUNT(*) FROM request_logs WHERE id > ?",
+                params![visible_after_id],
+                |row| row.get(0),
+            )?;
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT rl.id, rl.proxy_id, p.name AS proxy_name, p.type AS proxy_type,
+                  p.host AS proxy_host, p.port AS proxy_port, rl.target_host, rl.target_port,
+                  rl.success, rl.response_time, rl.error_message, rl.result_type, rl.created_at
+                FROM request_logs rl
+                LEFT JOIN proxies p ON p.id = rl.proxy_id
+                WHERE rl.id > ?
+                ORDER BY rl.id DESC
+                LIMIT ? OFFSET ?
+                "#,
+            )?;
+            let rows = stmt.query_map(
+                params![visible_after_id, page_size, offset],
+                traffic_log_from_row,
+            )?;
+            (total, rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        };
+
+        Ok((items, total))
     }
 
     pub fn clear_traffic_logs(&self) -> Result<i64> {
         let conn = self.connection()?;
-        let deleted = conn.execute("DELETE FROM request_logs", [])?;
-        Ok(deleted as i64)
+        let visible_after_id = traffic_log_visible_after_id(&conn)?;
+        let (visible_count, max_visible_id): (i64, Option<i64>) = conn.query_row(
+            "SELECT COUNT(*), MAX(id) FROM request_logs WHERE id > ?",
+            params![visible_after_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let next_visible_after_id = max_visible_id.unwrap_or(visible_after_id);
+        conn.execute(
+            r#"
+            INSERT OR REPLACE INTO settings (key, value)
+            VALUES (?, ?)
+            "#,
+            params![
+                TRAFFIC_LOG_VISIBLE_AFTER_ID_KEY,
+                next_visible_after_id.to_string()
+            ],
+        )?;
+        Ok(visible_count)
     }
 
     pub fn scalar_json(&self, sql: &str) -> Result<Value> {
@@ -1253,6 +1336,56 @@ fn proxy_from_row(row: &Row<'_>) -> rusqlite::Result<ProxyRecord> {
     })
 }
 
+fn traffic_log_from_row(row: &Row<'_>) -> rusqlite::Result<TrafficLog> {
+    Ok(TrafficLog {
+        id: row.get("id")?,
+        proxy_id: row.get("proxy_id")?,
+        proxy_name: row.get("proxy_name")?,
+        proxy_type: row.get("proxy_type")?,
+        proxy_host: row.get("proxy_host")?,
+        proxy_port: row.get("proxy_port")?,
+        target_host: row.get("target_host")?,
+        target_port: row.get("target_port")?,
+        success: row.get("success")?,
+        response_time: row.get("response_time")?,
+        error_message: row.get("error_message")?,
+        result_type: row.get("result_type")?,
+        created_at: row.get("created_at")?,
+    })
+}
+
+fn traffic_log_visible_after_id(conn: &Connection) -> Result<i64> {
+    let value: Option<String> = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key = ?",
+            params![TRAFFIC_LOG_VISIBLE_AFTER_ID_KEY],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match value {
+        Some(value) => value.parse::<i64>().with_context(|| {
+            format!("{TRAFFIC_LOG_VISIBLE_AFTER_ID_KEY} 不是有效的日志游标: {value}")
+        }),
+        None => Ok(0),
+    }
+}
+
+fn like_pattern(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len() + 2);
+    escaped.push('%');
+    for character in value.chars() {
+        match character {
+            '%' | '_' | '\\' => {
+                escaped.push('\\');
+                escaped.push(character);
+            }
+            _ => escaped.push(character),
+        }
+    }
+    escaped.push('%');
+    escaped
+}
+
 fn dns_from_row(row: &Row<'_>) -> rusqlite::Result<DnsMapping> {
     Ok(DnsMapping {
         id: row.get("id")?,
@@ -1417,6 +1550,12 @@ fn domain_matches(host: &str, pattern: &str) -> bool {
 mod tests {
     use super::Database;
     use crate::models::{ProxyGroupInput, ProxyInput};
+    use std::sync::{Mutex, OnceLock};
+
+    fn test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     fn proxy_input(name: &str, host: &str, port: i64) -> ProxyInput {
         ProxyInput {
@@ -1435,8 +1574,9 @@ mod tests {
 
     #[test]
     fn export_bundle_filters_group_members_by_selected_proxies() {
+        let _guard = test_lock().lock().unwrap();
         let data_dir =
-            std::env::temp_dir().join(format!("proxy-load-db-test-{}", std::process::id()));
+            std::env::temp_dir().join(format!("proxy-load-db-test-{}-export", std::process::id()));
         let _ = std::fs::remove_dir_all(&data_dir);
         std::env::set_var("DATA_DIR", &data_dir);
         let db = Database::open().expect("打开测试数据库");
@@ -1479,5 +1619,79 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&data_dir);
+        std::env::remove_var("DATA_DIR");
+    }
+
+    #[test]
+    fn traffic_log_search_and_clear_keep_stats() {
+        let _guard = test_lock().lock().unwrap();
+        let data_dir =
+            std::env::temp_dir().join(format!("proxy-load-db-test-{}-traffic", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        std::env::set_var("DATA_DIR", &data_dir);
+        let db = Database::open().expect("打开测试数据库");
+
+        let matched = db
+            .create_proxy(proxy_input("宁波企服平台http", "10.68.201.207", 7890))
+            .unwrap();
+        let other = db
+            .create_proxy(proxy_input("台州水务socks", "172.31.98.133", 1080))
+            .unwrap();
+        db.log_request(
+            Some(matched.id),
+            "www.tzswater.com",
+            443,
+            false,
+            None,
+            Some("timeout"),
+            "health_failure",
+        )
+        .unwrap();
+        db.log_request(
+            Some(other.id),
+            "10.68.201.207",
+            30333,
+            true,
+            Some(101),
+            None,
+            "health_success",
+        )
+        .unwrap();
+
+        let (items, total) = db.traffic_logs(1, 25, Some("企服")).unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(items[0].proxy_id, Some(matched.id));
+        let (items, total) = db.traffic_logs(1, 25, Some("172.31.98.133:1080")).unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(items[0].proxy_id, Some(other.id));
+
+        let (_, total) = db.traffic_logs(1, 25, None).unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(db.clear_traffic_logs().unwrap(), 2);
+        let (items, total) = db.traffic_logs(1, 25, None).unwrap();
+        assert_eq!(total, 0);
+        assert!(items.is_empty());
+
+        let overview = db.overview(60).unwrap();
+        assert_eq!(overview["totalRequests"].as_i64(), Some(2));
+        assert_eq!(overview["successRequests"].as_i64(), Some(1));
+        assert_eq!(overview["failedRequests"].as_i64(), Some(1));
+
+        db.log_request(
+            Some(matched.id),
+            "next.example.com",
+            80,
+            true,
+            Some(88),
+            None,
+            "health_success",
+        )
+        .unwrap();
+        let (items, total) = db.traffic_logs(1, 25, None).unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(items[0].target_host.as_deref(), Some("next.example.com"));
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+        std::env::remove_var("DATA_DIR");
     }
 }

@@ -557,10 +557,13 @@ pub fn traffic_logs(
     state: tauri::State<'_, Arc<AppState>>,
     page: Option<i64>,
     page_size: Option<i64>,
+    proxy_search: Option<String>,
 ) -> CommandResult<Value> {
     let page = ensure_positive(page.unwrap_or(1), "page")?;
     let page_size = ensure_positive(page_size.unwrap_or(50), "pageSize")?;
-    let (items, total) = state.db.traffic_logs(page, page_size)?;
+    let (items, total) = state
+        .db
+        .traffic_logs(page, page_size, proxy_search.as_deref())?;
     let total_pages = (total as f64 / page_size as f64).ceil().max(1.0) as i64;
     Ok(json!({
         "items": items,
@@ -1126,6 +1129,9 @@ mod tests {
     #[test]
     fn compares_new_calendar_day_after_previous_revision() {
         assert!(VersionParts::parse("26.6.10").unwrap() > VersionParts::parse("26.6.501").unwrap());
+        assert!(
+            VersionParts::parse("26.6.16").unwrap() > VersionParts::parse("26.6.1002").unwrap()
+        );
     }
 
     #[test]
@@ -1161,8 +1167,8 @@ mod tests {
     #[test]
     fn extracts_tag_from_mirror_location_header() {
         assert_eq!(
-            extract_release_tag("/https://github.com/ccpopy/proxy-load/releases/tag/v26.6.1002"),
-            Some("v26.6.1002".to_string())
+            extract_release_tag("/https://github.com/ccpopy/proxy-load/releases/tag/v26.6.16"),
+            Some("v26.6.16".to_string())
         );
         assert_eq!(
             extract_release_tag("https://github.com/ccpopy/proxy-load/releases/tag/v1.2.3?x=1"),
@@ -1177,15 +1183,15 @@ mod tests {
     #[test]
     fn extracts_asset_names_from_expanded_assets_html() {
         let html = r#"
-            <a href="/ccpopy/proxy-load/releases/download/v26.6.1002/proxy-load_26.6.1002_windows_x64-setup.exe">a</a>
-            <a href="/ccpopy/proxy-load/releases/download/v26.6.1002/proxy-load_26.6.1002_windows_x64-setup.exe">dup</a>
-            <a href="/ccpopy/proxy-load/releases/download/v26.6.1002/proxy-load_26.6.1002_x64-portable.exe">b</a>
+            <a href="/ccpopy/proxy-load/releases/download/v26.6.16/proxy-load_26.6.16_windows_x64-setup.exe">a</a>
+            <a href="/ccpopy/proxy-load/releases/download/v26.6.16/proxy-load_26.6.16_windows_x64-setup.exe">dup</a>
+            <a href="/ccpopy/proxy-load/releases/download/v26.6.16/proxy-load_26.6.16_x64-portable.exe">b</a>
         "#;
         assert_eq!(
-            extract_release_asset_names(html, "v26.6.1002"),
+            extract_release_asset_names(html, "v26.6.16"),
             vec![
-                "proxy-load_26.6.1002_windows_x64-setup.exe".to_string(),
-                "proxy-load_26.6.1002_x64-portable.exe".to_string()
+                "proxy-load_26.6.16_windows_x64-setup.exe".to_string(),
+                "proxy-load_26.6.16_x64-portable.exe".to_string()
             ]
         );
     }
