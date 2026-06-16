@@ -954,22 +954,9 @@ impl Database {
                 FROM request_logs rl
                 LEFT JOIN proxies p ON p.id = rl.proxy_id
                 WHERE rl.id > ?
-                  AND (
-                    COALESCE(p.name, '') LIKE ? ESCAPE '\'
-                    OR COALESCE(p.type, '') LIKE ? ESCAPE '\'
-                    OR COALESCE(p.host, '') LIKE ? ESCAPE '\'
-                    OR COALESCE(p.host, '') || ':' || COALESCE(p.port, '') LIKE ? ESCAPE '\'
-                    OR CAST(COALESCE(p.port, 0) AS TEXT) LIKE ? ESCAPE '\'
-                  )
+                  AND COALESCE(p.name, '') LIKE ? ESCAPE '\'
                 "#,
-                params![
-                    visible_after_id,
-                    pattern,
-                    pattern,
-                    pattern,
-                    pattern,
-                    pattern
-                ],
+                params![visible_after_id, pattern],
                 |row| row.get(0),
             )?;
             let mut stmt = conn.prepare(
@@ -980,28 +967,13 @@ impl Database {
                 FROM request_logs rl
                 LEFT JOIN proxies p ON p.id = rl.proxy_id
                 WHERE rl.id > ?
-                  AND (
-                    COALESCE(p.name, '') LIKE ? ESCAPE '\'
-                    OR COALESCE(p.type, '') LIKE ? ESCAPE '\'
-                    OR COALESCE(p.host, '') LIKE ? ESCAPE '\'
-                    OR COALESCE(p.host, '') || ':' || COALESCE(p.port, '') LIKE ? ESCAPE '\'
-                    OR CAST(COALESCE(p.port, 0) AS TEXT) LIKE ? ESCAPE '\'
-                  )
+                  AND COALESCE(p.name, '') LIKE ? ESCAPE '\'
                 ORDER BY rl.id DESC
                 LIMIT ? OFFSET ?
                 "#,
             )?;
             let rows = stmt.query_map(
-                params![
-                    visible_after_id,
-                    pattern,
-                    pattern,
-                    pattern,
-                    pattern,
-                    pattern,
-                    page_size,
-                    offset
-                ],
+                params![visible_after_id, pattern, page_size, offset],
                 traffic_log_from_row,
             )?;
             (total, rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -1662,8 +1634,8 @@ mod tests {
         assert_eq!(total, 1);
         assert_eq!(items[0].proxy_id, Some(matched.id));
         let (items, total) = db.traffic_logs(1, 25, Some("172.31.98.133:1080")).unwrap();
-        assert_eq!(total, 1);
-        assert_eq!(items[0].proxy_id, Some(other.id));
+        assert_eq!(total, 0);
+        assert!(items.is_empty());
 
         let (_, total) = db.traffic_logs(1, 25, None).unwrap();
         assert_eq!(total, 2);

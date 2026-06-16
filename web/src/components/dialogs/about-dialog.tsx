@@ -1,8 +1,7 @@
-import { useState, type ReactNode } from "react"
+import { type ReactNode } from "react"
 import { Download, Loader2, Network, RefreshCw } from "lucide-react"
-import { toast } from "sonner"
 
-import { command, commandErrorMessage, type ServiceInfo } from "@/lib/api"
+import { type ServiceInfo } from "@/lib/api"
 import type { UpdateInfo, VersionInfo } from "@/types"
 import { Button } from "@/components/ui/button"
 import {
@@ -21,72 +20,40 @@ import {
 } from "@/components/ui/field"
 import { Switch } from "@/components/ui/switch"
 
-const MIRROR_STORAGE_KEY = "proxy-load-update-mirror"
-
 export function AboutDialog({
   open,
   onOpenChange,
   version,
   serviceInfo,
+  updateInfo,
+  checking,
+  installing,
+  useMirror,
+  autoCheckUpdates,
+  onUseMirrorChange,
+  onAutoCheckUpdatesChange,
+  onCheckUpdates,
+  onInstallUpdate,
 }: {
   open: boolean
   onOpenChange: (open: boolean) => void
   version: VersionInfo | null
   serviceInfo: ServiceInfo | null
+  updateInfo: UpdateInfo | null
+  checking: boolean
+  installing: boolean
+  useMirror: boolean
+  autoCheckUpdates: boolean
+  onUseMirrorChange: (value: boolean) => void
+  onAutoCheckUpdatesChange: (value: boolean) => void
+  onCheckUpdates: () => void
+  onInstallUpdate: () => void
 }) {
-  const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null)
-  const [checking, setChecking] = useState(false)
-  const [installing, setInstalling] = useState(false)
-  const [useMirror, setUseMirror] = useState(
-    () => localStorage.getItem(MIRROR_STORAGE_KEY) === "1"
-  )
-
-  function toggleMirror(value: boolean) {
-    setUseMirror(value)
-    localStorage.setItem(MIRROR_STORAGE_KEY, value ? "1" : "0")
-    setUpdateInfo(null)
-  }
-
-  async function handleCheck() {
-    setChecking(true)
-    try {
-      const info = await command<UpdateInfo>("check_for_updates", { useMirror })
-      setUpdateInfo(info)
-      if (info.hasUpdate) {
-        toast.success(`发现新版本 ${info.latest?.version}`)
-      } else {
-        toast.info("当前已是最新版本")
-      }
-    } catch (error) {
-      toast.error(commandErrorMessage(error, "检查更新失败"))
-    } finally {
-      setChecking(false)
-    }
-  }
-
-  async function handleInstall() {
-    if (!updateInfo?.latest) return
-
-    setInstalling(true)
-    try {
-      const result = await command<{ message?: string }>("install_update", {
-        artifactPath: updateInfo.latest.path,
-        useMirror,
-      })
-      toast.success(result.message ?? "已启动更新安装程序")
-      onOpenChange(false)
-    } catch (error) {
-      toast.error(commandErrorMessage(error, "安装更新失败"))
-    } finally {
-      setInstalling(false)
-    }
-  }
-
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-xl">
         <DialogHeader>
-          <DialogTitle>关于</DialogTitle>
+          <DialogTitle>关于与更新</DialogTitle>
           <DialogDescription>应用版本与运行信息</DialogDescription>
         </DialogHeader>
 
@@ -129,20 +96,46 @@ export function AboutDialog({
                 通过 gh.lessdo.top 镜像检查更新与下载，适用于无法直连 GitHub 的网络
               </FieldDescription>
             </FieldContent>
-            <Switch checked={useMirror} onCheckedChange={toggleMirror} />
+            <Switch
+              aria-label="启用国内加速"
+              checked={useMirror}
+              onCheckedChange={onUseMirrorChange}
+            />
+          </Field>
+
+          <Field orientation="horizontal" className="rounded-md border bg-card/40 p-4">
+            <FieldContent>
+              <FieldTitle>自动检查更新</FieldTitle>
+              <FieldDescription>
+                默认关闭；开启后应用启动和运行期间会自动检查，发现新版本时弹出可直接更新的通知
+              </FieldDescription>
+            </FieldContent>
+            <Switch
+              aria-label="自动检查更新"
+              checked={autoCheckUpdates}
+              onCheckedChange={onAutoCheckUpdatesChange}
+            />
           </Field>
         </div>
 
         <DialogFooter>
-          <Button variant="outline" onClick={handleCheck} disabled={checking}>
-            {checking ? <Loader2 className="animate-spin" /> : <RefreshCw />}
+          <Button variant="outline" onClick={onCheckUpdates} disabled={checking}>
+            {checking ? (
+              <Loader2 data-icon="inline-start" className="animate-spin" />
+            ) : (
+              <RefreshCw data-icon="inline-start" />
+            )}
             检查更新
           </Button>
           <Button
-            onClick={handleInstall}
+            onClick={onInstallUpdate}
             disabled={!updateInfo?.latest || installing}
           >
-            {installing ? <Loader2 className="animate-spin" /> : <Download />}
+            {installing ? (
+              <Loader2 data-icon="inline-start" className="animate-spin" />
+            ) : (
+              <Download data-icon="inline-start" />
+            )}
             {updateInfo?.installMode === "portable" ? "下载并重启" : "安装更新"}
           </Button>
         </DialogFooter>

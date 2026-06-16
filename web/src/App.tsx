@@ -1,8 +1,10 @@
-import { useCallback, useEffect, useState } from "react"
+import { useCallback, useEffect, useRef, useState } from "react"
 import { toast } from "sonner"
 
 import {
   api,
+  command,
+  commandErrorMessage,
   initServiceInfo,
   onServerEvent,
   type ServerEvent,
@@ -27,8 +29,15 @@ import type {
   ProxyUsageStat,
   TargetStat,
   TrafficLogPage,
+  UpdateInfo,
   VersionInfo,
 } from "@/types"
+import {
+  UPDATE_AUTO_CHECK_STORAGE_KEY,
+  UPDATE_MIRROR_STORAGE_KEY,
+  readBooleanPreference,
+  writeBooleanPreference,
+} from "@/lib/update-preferences"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { SidebarInset, SidebarProvider } from "@/components/ui/sidebar"
 import { Toaster } from "@/components/ui/sonner"
@@ -46,6 +55,8 @@ import { DnsDialog } from "@/components/dialogs/dns-dialog"
 import { GroupDialog } from "@/components/dialogs/group-dialog"
 import { AdvancedDialog } from "@/components/dialogs/advanced-dialog"
 import { AboutDialog } from "@/components/dialogs/about-dialog"
+
+const AUTO_UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000
 
 export function App() {
   const [section, setSection] = useState<SectionKey>("proxies")
@@ -78,6 +89,17 @@ export function App() {
   })
   const [trafficLogProxySearch, setTrafficLogProxySearch] = useState("")
   const [version, setVersion] = useState<VersionInfo | null>(null)
+  const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null)
+  const [updateChecking, setUpdateChecking] = useState(false)
+  const [updateInstalling, setUpdateInstalling] = useState(false)
+  const [useUpdateMirror, setUseUpdateMirror] = useState(() =>
+    readBooleanPreference(UPDATE_MIRROR_STORAGE_KEY)
+  )
+  const [autoCheckUpdates, setAutoCheckUpdates] = useState(() =>
+    readBooleanPreference(UPDATE_AUTO_CHECK_STORAGE_KEY)
+  )
+  const notifiedUpdateVersions = useRef(new Set<string>())
+  const updateInstallingRef = useRef(false)
   const [proxyDialog, setProxyDialog] = useState<ProxyRecord | "new" | null>(null)
   const [dnsDialog, setDnsDialog] = useState<DnsMapping | "new" | null>(null)
   const [groupDialog, setGroupDialog] = useState<ProxyGroup | "new" | null>(null)
@@ -144,6 +166,88 @@ export function App() {
     setConnectionState(proxyConnectionState(nextProxyServiceStatus))
   }, [])
 
+  const installUpdate = useCallback(
+    async (info: UpdateInfo | null, useMirror = useUpdateMirror) => {
+      if (!info?.latest) return
+      if (updateInstallingRef.current) return
+
+      updateInstallingRef.current = true
+      setUpdateInstalling(true)
+      try {
+        const result = await command<{ message?: string }>("install_update", {
+          artifactPath: info.latest.path,
+          useMirror,
+        })
+        toast.success(result.message ?? "已启动更新安装程序")
+        setAboutOpen(false)
+      } catch (error) {
+        toast.error(commandErrorMessage(error, "安装更新失败"))
+      } finally {
+        updateInstallingRef.current = false
+        setUpdateInstalling(false)
+      }
+    },
+    [useUpdateMirror]
+  )
+
+  const showUpdateAvailableToast = useCallback(
+    (info: UpdateInfo, useMirror: boolean, dedupe: boolean) => {
+      const latestVersion = info.latest?.version
+      if (!latestVersion) return
+      if (dedupe && notifiedUpdateVersions.current.has(latestVersion)) return
+
+      notifiedUpdateVersions.current.add(latestVersion)
+      toast.info(`发现新版本：v${latestVersion}`, {
+        action: {
+          label: "更新",
+          onClick: () => {
+            void installUpdate(info, useMirror)
+          },
+        },
+        duration: 30000,
+      })
+    },
+    [installUpdate]
+  )
+
+  const checkForUpdates = useCallback(
+    async ({ automatic = false }: { automatic?: boolean } = {}) => {
+      if (!automatic) setUpdateChecking(true)
+      const useMirror = useUpdateMirror
+
+      try {
+        const info = await command<UpdateInfo>("check_for_updates", { useMirror })
+        setUpdateInfo(info)
+        if (info.hasUpdate) {
+          showUpdateAvailableToast(info, useMirror, automatic)
+        } else if (!automatic) {
+          toast.info("当前已是最新版本")
+        }
+      } catch (error) {
+        toast.error(
+          commandErrorMessage(
+            error,
+            automatic ? "自动检查更新失败" : "检查更新失败"
+          )
+        )
+      } finally {
+        if (!automatic) setUpdateChecking(false)
+      }
+    },
+    [showUpdateAvailableToast, useUpdateMirror]
+  )
+
+  const handleUseUpdateMirrorChange = useCallback((value: boolean) => {
+    setUseUpdateMirror(value)
+    writeBooleanPreference(UPDATE_MIRROR_STORAGE_KEY, value)
+    setUpdateInfo(null)
+  }, [])
+
+  const handleAutoCheckUpdatesChange = useCallback((value: boolean) => {
+    setAutoCheckUpdates(value)
+    writeBooleanPreference(UPDATE_AUTO_CHECK_STORAGE_KEY, value)
+  }, [])
+
   useEffect(() => {
     let closed = false
     initServiceInfo()
@@ -168,6 +272,22 @@ export function App() {
       closed = true
     }
   }, [loadTrafficLogs, refresh])
+
+  useEffect(() => {
+    if (!apiReady || !autoCheckUpdates) return undefined
+
+    const timer = window.setTimeout(() => {
+      void checkForUpdates({ automatic: true })
+    }, 1500)
+    const interval = window.setInterval(() => {
+      void checkForUpdates({ automatic: true })
+    }, AUTO_UPDATE_CHECK_INTERVAL_MS)
+
+    return () => {
+      window.clearTimeout(timer)
+      window.clearInterval(interval)
+    }
+  }, [apiReady, autoCheckUpdates, checkForUpdates])
 
   useEffect(() => {
     if (!apiReady) return undefined
@@ -401,6 +521,15 @@ export function App() {
         onOpenChange={setAboutOpen}
         version={version}
         serviceInfo={serviceInfo}
+        updateInfo={updateInfo}
+        checking={updateChecking}
+        installing={updateInstalling}
+        useMirror={useUpdateMirror}
+        autoCheckUpdates={autoCheckUpdates}
+        onUseMirrorChange={handleUseUpdateMirrorChange}
+        onAutoCheckUpdatesChange={handleAutoCheckUpdatesChange}
+        onCheckUpdates={() => checkForUpdates()}
+        onInstallUpdate={() => installUpdate(updateInfo)}
       />
       <Toaster />
     </SidebarProvider>

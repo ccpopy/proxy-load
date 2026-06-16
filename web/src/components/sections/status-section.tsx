@@ -218,7 +218,7 @@ export function StatusSection({
       </div>
 
       <Card>
-        <CardHeader className="flex flex-row items-start justify-between gap-4">
+        <CardHeader className="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
           <div>
             <CardTitle>流量日志</CardTitle>
             <CardDescription>
@@ -231,26 +231,28 @@ export function StatusSection({
               <span className="font-mono tabular-nums">{logs.totalPages}</span> 页
             </CardDescription>
           </div>
-          <Button
-            variant="destructive"
-            onClick={async () => {
-              await api("/api/traffic-logs", { method: "DELETE" })
-              toast.success("流量日志已清除")
-              await onChanged()
-            }}
-          >
-            <Trash2 data-icon="inline-start" />
-            清除日志
-          </Button>
+          <div className="flex w-full flex-col gap-2 sm:flex-row md:w-auto md:items-center">
+            <Input
+              aria-label="搜索代理名称"
+              className="sm:w-64"
+              value={searchValue}
+              onChange={(event) => onSearchChange(event.target.value)}
+              placeholder="搜索代理名称"
+            />
+            <Button
+              variant="destructive"
+              onClick={async () => {
+                await api("/api/traffic-logs", { method: "DELETE" })
+                toast.success("流量日志已清除")
+                await onChanged()
+              }}
+            >
+              <Trash2 data-icon="inline-start" />
+              清除日志
+            </Button>
+          </div>
         </CardHeader>
         <CardContent className="flex flex-col gap-4">
-          <Input
-            aria-label="搜索代理日志"
-            className="md:max-w-sm"
-            value={searchValue}
-            onChange={(event) => onSearchChange(event.target.value)}
-            placeholder="搜索代理名称、地址或端口"
-          />
           <Table>
             <TableHeader>
               <TableRow>
