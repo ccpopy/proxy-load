@@ -483,12 +483,30 @@ pub fn list_dns_mappings(state: tauri::State<'_, Arc<AppState>>) -> CommandResul
     Ok(serde_json::to_value(state.db.list_dns_mappings()?)?)
 }
 
+/// 动态映射在保存前先按域名解析一次拿到当前真实 IP；解析失败则回退到用户填写的 IP。
+async fn resolve_dynamic_input(mut input: DnsInput) -> CommandResult<DnsInput> {
+    if input.dynamic == Some(1) {
+        match crate::state::resolve_ipv4(&input.domain).await {
+            Some(ip) => input.ip = ip,
+            None if input.ip.trim().is_empty() => {
+                return Err(CommandError::new(format!(
+                    "动态解析失败：无法解析域名 {}，请先填写一个初始/备用 IP",
+                    input.domain.trim()
+                )));
+            }
+            None => {}
+        }
+    }
+    Ok(input)
+}
+
 #[tauri::command]
 pub async fn create_dns_mapping(
     state: tauri::State<'_, Arc<AppState>>,
     input: DnsInput,
 ) -> CommandResult<Value> {
     let state = state.inner().clone();
+    let input = resolve_dynamic_input(input).await?;
     let mapping = state.db.create_dns_mapping(input)?;
     state.proxy_runtime.refresh_dns_cache().await?;
     state.emit("dns_mapping_added", serde_json::to_value(&mapping)?);
@@ -502,10 +520,44 @@ pub async fn update_dns_mapping(
     input: DnsInput,
 ) -> CommandResult<Value> {
     let state = state.inner().clone();
+    let input = resolve_dynamic_input(input).await?;
     let mapping = state.db.update_dns_mapping(id, input)?;
     state.proxy_runtime.refresh_dns_cache().await?;
     state.emit("dns_mapping_updated", serde_json::to_value(&mapping)?);
     Ok(json!({ "success": true }))
+}
+
+#[tauri::command]
+pub async fn refresh_dns_mapping(
+    state: tauri::State<'_, Arc<AppState>>,
+    id: i64,
+) -> CommandResult<Value> {
+    let state = state.inner().clone();
+    let mapping = state
+        .db
+        .get_dns_mapping(id)?
+        .ok_or_else(|| CommandError::new("DNS 映射不存在"))?;
+    match crate::state::resolve_ipv4(&mapping.domain).await {
+        Some(ip) => {
+            let changed = ip != mapping.ip;
+            if changed {
+                state.db.update_dns_ip(id, &ip)?;
+                state.proxy_runtime.refresh_dns_cache().await?;
+                let updated = state.db.get_dns_mapping(id)?;
+                state.emit("dns_mapping_updated", serde_json::to_value(&updated)?);
+            }
+            Ok(json!({
+                "success": true,
+                "changed": changed,
+                "ip": ip,
+                "previousIp": mapping.ip
+            }))
+        }
+        None => Err(CommandError::new(format!(
+            "无法解析域名 {}，请检查网络或 DNS 配置",
+            mapping.domain
+        ))),
+    }
 }
 
 #[tauri::command]

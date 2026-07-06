@@ -1,6 +1,6 @@
 [package]
 name = "proxy-load-tauri"
-version = "26.6.1601"
+version = "26.7.6"
 description = "代理负载均衡管理系统"
 authors = ["linmew"]
 license = "MIT"
@@ -18,7 +18,8 @@ rfd = "0.15"
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-opener = "2"
 tokio = { version = "1", features = ["full"] }
 url = "2"
+

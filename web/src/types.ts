@@ -46,6 +46,8 @@ export interface DnsMapping {
   ip: string
   description?: string | null
   enabled: number
+  dynamic: number
+  last_resolved?: string | null
   created_at?: string | null
   updated_at?: string | null
 }
@@ -189,6 +191,11 @@ export interface ExportResult {
 export interface AdvancedConfig {
   proxy_port: number
   periodic_test_interval: number
+  probe_recovery_interval: number
+  probe_concurrency: number
+  dns_refresh_interval: number
+  background_run: boolean
+  start_minimized: boolean
   log_retention_days: number
   stats_retention_days: number
   pool_max_size: number

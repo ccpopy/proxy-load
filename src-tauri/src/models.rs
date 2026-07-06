@@ -60,6 +60,8 @@ pub struct DnsMapping {
     pub ip: String,
     pub description: Option<String>,
     pub enabled: i64,
+    pub dynamic: i64,
+    pub last_resolved: Option<String>,
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
 }
@@ -70,6 +72,8 @@ pub struct DnsInput {
     pub ip: String,
     pub description: Option<String>,
     pub enabled: Option<i64>,
+    #[serde(default)]
+    pub dynamic: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -203,6 +207,8 @@ pub struct BundleDns {
     pub description: Option<String>,
     #[serde(default = "default_enabled")]
     pub enabled: i64,
+    #[serde(default)]
+    pub dynamic: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

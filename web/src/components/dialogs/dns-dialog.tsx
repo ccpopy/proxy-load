@@ -13,7 +13,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
-import { Field, FieldGroup, FieldLabel, FieldTitle } from "@/components/ui/field"
+import { Field, FieldContent, FieldDescription, FieldGroup, FieldLabel, FieldTitle } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
 import { Switch } from "@/components/ui/switch"
 
@@ -34,6 +34,7 @@ export function DnsDialog({
     ip: "",
     description: "",
     enabled: true,
+    dynamic: false,
   })
 
   useEffect(() => {
@@ -42,13 +43,18 @@ export function DnsDialog({
       ip: mapping?.ip ?? "",
       description: mapping?.description ?? "",
       enabled: mapping ? mapping.enabled === 1 : true,
+      dynamic: mapping ? mapping.dynamic === 1 : false,
     })
   }, [mapping, value])
 
   async function save() {
     await api(mapping ? `/api/dns-mappings/${mapping.id}` : "/api/dns-mappings", {
       method: mapping ? "PUT" : "POST",
-      body: JSON.stringify({ ...form, enabled: form.enabled ? 1 : 0 }),
+      body: JSON.stringify({
+        ...form,
+        enabled: form.enabled ? 1 : 0,
+        dynamic: form.dynamic ? 1 : 0,
+      }),
     })
     toast.success(mapping ? "DNS映射已更新" : "DNS映射已创建")
     await onSaved()
@@ -70,18 +76,38 @@ export function DnsDialog({
             />
           </Field>
           <Field>
-            <FieldLabel className={consoleLabel}>IP地址</FieldLabel>
+            <FieldLabel className={consoleLabel}>
+              {form.dynamic ? "IP地址（初始/备用，自动更新）" : "IP地址"}
+            </FieldLabel>
             <Input
               className="font-mono tabular-nums"
               value={form.ip}
               onChange={(event) => setForm({ ...form, ip: event.target.value })}
             />
+            {form.dynamic && (
+              <FieldDescription>
+                已启用动态解析：保存时会按域名解析一次，之后后台定期解析并在 IP
+                变化时自动更新此处。若当前解析不到，可先填一个备用 IP。
+              </FieldDescription>
+            )}
           </Field>
           <Field>
             <FieldLabel className={consoleLabel}>说明</FieldLabel>
             <Input
               value={form.description}
               onChange={(event) => setForm({ ...form, description: event.target.value })}
+            />
+          </Field>
+          <Field orientation="horizontal">
+            <FieldContent>
+              <FieldTitle className={consoleLabel}>动态解析</FieldTitle>
+              <FieldDescription>
+                按域名自动解析并定期更新 IP，适合 IP 会变化的内网/政务域名
+              </FieldDescription>
+            </FieldContent>
+            <Switch
+              checked={form.dynamic}
+              onCheckedChange={(dynamic) => setForm({ ...form, dynamic })}
             />
           </Field>
           <Field orientation="horizontal">

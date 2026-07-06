@@ -177,6 +177,13 @@ impl Database {
         add_column_if_missing(&conn, "proxies", "test_timeout", "INTEGER DEFAULT NULL")?;
         add_column_if_missing(&conn, "proxies", "skip_cert_verify", "INTEGER DEFAULT 0")?;
         add_column_if_missing(&conn, "request_logs", "result_type", "TEXT")?;
+        add_column_if_missing(&conn, "dns_mappings", "dynamic", "INTEGER DEFAULT 0")?;
+        add_column_if_missing(
+            &conn,
+            "dns_mappings",
+            "last_resolved",
+            "DATETIME DEFAULT NULL",
+        )?;
 
         let test_url: Option<String> = conn
             .query_row(
@@ -393,7 +400,10 @@ impl Database {
             if !keys.contains(&key) {
                 continue;
             }
-            let value = parse_setting_value(&raw);
+            let value = match config.get(&key) {
+                Some(Value::Bool(_)) => parse_bool_setting_value(&raw),
+                _ => parse_setting_value(&raw),
+            };
             config.insert(key, value);
         }
         Ok(Value::Object(config))
@@ -449,6 +459,7 @@ impl Database {
                 ip: mapping.ip,
                 description: mapping.description,
                 enabled: mapping.enabled,
+                dynamic: mapping.dynamic,
             })
             .collect();
 
@@ -558,12 +569,13 @@ impl Database {
                 continue;
             }
             tx.execute(
-                "INSERT INTO dns_mappings (domain, ip, description, enabled) VALUES (?, ?, ?, ?)",
+                "INSERT INTO dns_mappings (domain, ip, description, enabled, dynamic) VALUES (?, ?, ?, ?, ?)",
                 params![
                     domain,
                     mapping.ip.trim(),
                     mapping.description,
-                    i64::from(mapping.enabled != 0)
+                    i64::from(mapping.enabled != 0),
+                    i64::from(mapping.dynamic != 0)
                 ],
             )?;
             summary.dns_mappings.added += 1;
@@ -649,12 +661,13 @@ impl Database {
         }
         let conn = self.connection()?;
         conn.execute(
-            "INSERT INTO dns_mappings (domain, ip, description, enabled) VALUES (?, ?, ?, ?)",
+            "INSERT INTO dns_mappings (domain, ip, description, enabled, dynamic) VALUES (?, ?, ?, ?, ?)",
             params![
                 input.domain.trim().to_lowercase(),
                 input.ip.trim(),
                 input.description,
-                input.enabled.unwrap_or(1)
+                input.enabled.unwrap_or(1),
+                input.dynamic.unwrap_or(0)
             ],
         )?;
         let id = conn.last_insert_rowid();
@@ -683,7 +696,7 @@ impl Database {
         conn.execute(
             r#"
             UPDATE dns_mappings
-            SET domain = ?, ip = ?, description = ?, enabled = ?, updated_at = CURRENT_TIMESTAMP
+            SET domain = ?, ip = ?, description = ?, enabled = ?, dynamic = ?, updated_at = CURRENT_TIMESTAMP
             WHERE id = ?
             "#,
             params![
@@ -691,12 +704,35 @@ impl Database {
                 input.ip.trim(),
                 input.description,
                 input.enabled.unwrap_or(1),
+                input.dynamic.unwrap_or(0),
                 id
             ],
         )?;
         drop(conn);
         self.get_dns_mapping(id)?
             .ok_or_else(|| anyhow!("DNS 映射不存在"))
+    }
+
+    /// 动态解析后仅更新 IP 与解析时间，不改动域名/说明等其它字段。
+    pub fn update_dns_ip(&self, id: i64, ip: &str) -> Result<()> {
+        validate_ipv4(ip)?;
+        let conn = self.connection()?;
+        conn.execute(
+            "UPDATE dns_mappings SET ip = ?, last_resolved = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            params![ip.trim(), id],
+        )?;
+        Ok(())
+    }
+
+    /// 启用中的动态映射，供后台定期解析刷新。
+    pub fn list_dynamic_dns_mappings(&self) -> Result<Vec<DnsMapping>> {
+        let conn = self.connection()?;
+        let mut stmt = conn.prepare(
+            "SELECT * FROM dns_mappings WHERE dynamic = 1 AND enabled = 1 ORDER BY domain ASC",
+        )?;
+        let rows = stmt.query_map([], dns_from_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 
     pub fn delete_dns_mapping(&self, id: i64) -> Result<()> {
@@ -1249,6 +1285,11 @@ pub fn default_advanced_config() -> Map<String, Value> {
     Map::from_iter([
         ("proxy_port".to_string(), json!(proxy_port)),
         ("periodic_test_interval".to_string(), json!(5 * 60 * 1000)),
+        ("probe_recovery_interval".to_string(), json!(60 * 1000)),
+        ("probe_concurrency".to_string(), json!(8)),
+        ("dns_refresh_interval".to_string(), json!(5 * 60 * 1000)),
+        ("background_run".to_string(), json!(false)),
+        ("start_minimized".to_string(), json!(false)),
         ("log_retention_days".to_string(), json!(7)),
         ("stats_retention_days".to_string(), json!(30)),
         ("pool_max_size".to_string(), json!(50)),
@@ -1365,6 +1406,8 @@ fn dns_from_row(row: &Row<'_>) -> rusqlite::Result<DnsMapping> {
         ip: row.get("ip")?,
         description: row.get("description")?,
         enabled: row.get::<_, Option<i64>>("enabled")?.unwrap_or(1),
+        dynamic: row.get::<_, Option<i64>>("dynamic")?.unwrap_or(0),
+        last_resolved: row.get("last_resolved")?,
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
     })
@@ -1486,6 +1529,10 @@ fn parse_setting_value(raw: &str) -> Value {
             .or_else(|_| raw.parse::<f64>().map(Value::from))
             .unwrap_or_else(|_| Value::String(raw.to_string()))
     })
+}
+
+fn parse_bool_setting_value(raw: &str) -> Value {
+    Value::Bool(raw == "1" || raw.eq_ignore_ascii_case("true"))
 }
 
 fn setting_value_to_string(value: &Value) -> String {

@@ -107,6 +107,9 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
     if (method === "PUT" && parts[3] === "toggle") {
       return command<T>("toggle_dns_mapping", { id })
     }
+    if (method === "POST" && parts[3] === "refresh") {
+      return command<T>("refresh_dns_mapping", { id })
+    }
   }
 
   if (method === "GET" && route.pathname === "/api/proxy-groups") {

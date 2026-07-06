@@ -1,4 +1,4 @@
-import { BadgeCheck, Edit, Globe2, Plus, Trash2 } from "lucide-react"
+import { Ban, BadgeCheck, Edit, Globe2, Plus, RefreshCw, Trash2 } from "lucide-react"
 import { toast } from "sonner"
 
 import { api } from "@/lib/api"
@@ -49,6 +49,26 @@ export function DnsSection({
     await onChanged()
   }
 
+  async function refreshMapping(mapping: DnsMapping) {
+    try {
+      const result = await api<{
+        changed: boolean
+        ip: string
+        previousIp: string
+      }>(`/api/dns-mappings/${mapping.id}/refresh`, { method: "POST" })
+      if (result.changed) {
+        toast.success(
+          `${mapping.domain} 已更新：${result.previousIp} → ${result.ip}`
+        )
+      } else {
+        toast.info(`${mapping.domain} 解析未变化（${result.ip}）`)
+      }
+      await onChanged()
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "域名解析失败")
+    }
+  }
+
   return (
     <Card>
       <CardHeader className="flex flex-row items-start justify-between gap-4">
@@ -78,14 +98,26 @@ export function DnsSection({
               </TableHeader>
               <TableBody>
                 {mappings.map((mapping) => {
-                  const toggleLabel = mapping.enabled === 1 ? "禁用" : "启用"
+                  const isEnabled = mapping.enabled === 1
+                  const isDynamic = mapping.dynamic === 1
                   return (
                     <TableRow key={mapping.id}>
                     <TableCell className="font-mono font-medium tabular-nums">
                       {mapping.domain}
                     </TableCell>
                     <TableCell className="font-mono tabular-nums text-foreground/90">
-                      {mapping.ip}
+                      <div className="flex items-center gap-2">
+                        <span>{mapping.ip}</span>
+                        {isDynamic && (
+                          <Badge
+                            variant="outline"
+                            className="gap-1 rounded-sm border-primary/30 bg-primary/10 px-1.5 py-0 text-[0.65rem] font-normal text-primary"
+                          >
+                            <RefreshCw className="size-2.5" />
+                            动态
+                          </Badge>
+                        )}
+                      </div>
                     </TableCell>
                     <TableCell className="text-muted-foreground">
                       {mapping.description || "—"}
@@ -103,13 +135,28 @@ export function DnsSection({
                           <Edit />
                           编辑
                         </Button>
+                        {isDynamic && (
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() => refreshMapping(mapping)}
+                          >
+                            <RefreshCw />
+                            刷新
+                          </Button>
+                        )}
                         <Button
                           variant="outline"
                           size="sm"
+                          className={cn(
+                            isEnabled
+                              ? "border-destructive/30 text-destructive hover:bg-destructive/10 hover:text-destructive"
+                              : "border-success/40 text-success hover:bg-success/10 hover:text-success"
+                          )}
                           onClick={() => toggleMapping(mapping)}
                         >
-                          <BadgeCheck />
-                          {toggleLabel}
+                          {isEnabled ? <Ban /> : <BadgeCheck />}
+                          {isEnabled ? "禁用" : "启用"}
                         </Button>
                         <Button
                           variant="ghost"

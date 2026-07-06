@@ -1,4 +1,5 @@
 use std::{
+    collections::{HashMap, HashSet},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -6,7 +7,7 @@ use std::{
 use anyhow::{anyhow, Context, Result};
 use serde::Serialize;
 use serde_json::{json, Value};
-use tokio::{sync::broadcast, time};
+use tokio::{sync::broadcast, sync::Semaphore, task::JoinSet, time};
 use url::Url;
 
 use crate::{
@@ -15,6 +16,8 @@ use crate::{
     proxy::{self, ProxyRuntime},
     proxy_tester,
 };
+
+const PROXY_LISTEN_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 pub struct AppState {
@@ -45,12 +48,7 @@ impl AppState {
             .unwrap_or(5678);
         let proxy_runtime = Arc::new(ProxyRuntime::new(db.clone(), events.clone(), proxy_port));
 
-        let runtime_for_proxy = proxy_runtime.clone();
-        tauri::async_runtime::spawn(async move {
-            if let Err(error) = proxy::serve(runtime_for_proxy, proxy_port).await {
-                eprintln!("代理服务启动失败: {error:#}");
-            }
-        });
+        spawn_proxy_server(proxy_runtime.clone(), proxy_port);
 
         let state = Self {
             db,
@@ -60,6 +58,7 @@ impl AppState {
             proxy_runtime,
         };
         state.spawn_periodic_proxy_tests();
+        state.spawn_dynamic_dns_refresh();
         Ok(state)
     }
 
@@ -91,6 +90,69 @@ impl AppState {
         self.test_proxy_record(proxy).await
     }
 
+    fn spawn_dynamic_dns_refresh(&self) {
+        let state = self.clone();
+        tauri::async_runtime::spawn(async move {
+            state.dynamic_dns_loop().await;
+        });
+    }
+
+    async fn dynamic_dns_loop(self) {
+        loop {
+            if let Err(error) = self.refresh_dynamic_mappings().await {
+                eprintln!("动态DNS刷新失败: {error:#}");
+            }
+            time::sleep(self.dns_refresh_interval()).await;
+        }
+    }
+
+    /// 解析所有“启用+动态”的映射，IP 变化才写库并刷新代理 DNS 缓存，广播事件让前端同步。
+    async fn refresh_dynamic_mappings(&self) -> Result<()> {
+        let mappings = self.db.list_dynamic_dns_mappings()?;
+        if mappings.is_empty() {
+            return Ok(());
+        }
+        let mut changed = false;
+        for mapping in mappings {
+            let Some(ip) = resolve_ipv4(&mapping.domain).await else {
+                continue;
+            };
+            if ip == mapping.ip {
+                continue;
+            }
+            if let Err(error) = self.db.update_dns_ip(mapping.id, &ip) {
+                eprintln!("动态DNS更新失败 {}: {error:#}", mapping.domain);
+                continue;
+            }
+            changed = true;
+            let updated = self.db.get_dns_mapping(mapping.id)?;
+            self.emit(
+                "dns_mapping_updated",
+                json!({
+                    "mapping": updated,
+                    "previousIp": mapping.ip,
+                    "ip": ip,
+                    "dynamic": true
+                }),
+            );
+        }
+        if changed {
+            self.proxy_runtime.refresh_dns_cache().await?;
+        }
+        Ok(())
+    }
+
+    fn dns_refresh_interval(&self) -> Duration {
+        let ms = self
+            .db
+            .load_advanced_config()
+            .ok()
+            .and_then(|config| config.get("dns_refresh_interval").and_then(Value::as_u64))
+            .filter(|value| *value > 0)
+            .unwrap_or(5 * 60 * 1000);
+        Duration::from_millis(ms)
+    }
+
     fn spawn_periodic_proxy_tests(&self) {
         let state = self.clone();
         tauri::async_runtime::spawn(async move {
@@ -99,29 +161,83 @@ impl AppState {
     }
 
     async fn periodic_proxy_tests(self) {
+        // 记录每个代理上一次“主动测活”的时间，配合真实流量的成功时间做自适应调度。
+        let mut last_probe: HashMap<i64, i64> = HashMap::new();
         loop {
-            if let Err(error) = self.test_enabled_proxies().await {
-                eprintln!("定期代理测试失败: {error:#}");
-            }
-
-            let interval = match self.periodic_test_interval() {
-                Ok(value) => value,
+            let schedule = match self.probe_schedule() {
+                Ok(schedule) => schedule,
                 Err(error) => {
                     eprintln!("定期代理测试停止: {error:#}");
                     break;
                 }
             };
-            time::sleep(interval).await;
+            if let Err(error) = self.run_probe_cycle(&schedule, &mut last_probe).await {
+                eprintln!("定期代理测试失败: {error:#}");
+            }
+            time::sleep(schedule.tick).await;
         }
     }
 
-    async fn test_enabled_proxies(&self) -> Result<()> {
+    /// 一轮自适应测活：
+    /// - 近期有真实流量成功的代理直接跳过（被动健康已覆盖，降低测活频次）；
+    /// - 活跃代理按基础间隔复检，失败/未知代理按更短的恢复间隔重测；
+    /// - 到期代理并发测活，缩短整轮耗时。
+    async fn run_probe_cycle(
+        &self,
+        schedule: &ProbeSchedule,
+        last_probe: &mut HashMap<i64, i64>,
+    ) -> Result<()> {
         let proxies = self.db.list_enabled_proxies()?;
+        let live_ids: HashSet<i64> = proxies.iter().map(|proxy| proxy.id).collect();
+        last_probe.retain(|id, _| live_ids.contains(id));
+
+        let recent_success = self.proxy_runtime.recent_success_map().await;
+        let now = now_millis();
+        let active_window = schedule.active_window.as_millis() as i64;
+        let base_interval = schedule.base_interval.as_millis() as i64;
+        let recovery_interval = schedule.recovery_interval.as_millis() as i64;
+
+        let mut due = Vec::new();
         for proxy in proxies {
-            if let Err(error) = self.test_proxy_record(proxy).await {
-                eprintln!("代理定期测试失败: {error:#}");
+            let last_success = recent_success.get(&proxy.id).copied().unwrap_or(0);
+            if last_success > 0 && now - last_success < active_window {
+                continue;
+            }
+            let interval = if proxy.status.as_deref() == Some("active") {
+                base_interval
+            } else {
+                recovery_interval
+            };
+            let due_now = last_probe
+                .get(&proxy.id)
+                .map_or(true, |last| now - last >= interval);
+            if due_now {
+                due.push(proxy);
             }
         }
+
+        if due.is_empty() {
+            return Ok(());
+        }
+        for proxy in &due {
+            last_probe.insert(proxy.id, now);
+        }
+
+        let semaphore = Arc::new(Semaphore::new(schedule.concurrency));
+        let mut tasks = JoinSet::new();
+        for proxy in due {
+            let Ok(permit) = semaphore.clone().acquire_owned().await else {
+                break;
+            };
+            let state = self.clone();
+            tasks.spawn(async move {
+                let _permit = permit;
+                if let Err(error) = state.test_proxy_record(proxy).await {
+                    eprintln!("代理定期测试失败: {error:#}");
+                }
+            });
+        }
+        while tasks.join_next().await.is_some() {}
         Ok(())
     }
 
@@ -178,6 +294,9 @@ impl AppState {
         }
 
         let updated = self.db.get_proxy(proxy.id)?;
+        self.proxy_runtime
+            .note_pushed_status(proxy.id, if result.success { "active" } else { "inactive" })
+            .await;
         self.emit(
             "proxy_tested",
             json!({
@@ -188,19 +307,60 @@ impl AppState {
         Ok(result)
     }
 
-    fn periodic_test_interval(&self) -> Result<Duration> {
+    fn probe_schedule(&self) -> Result<ProbeSchedule> {
         let config = self.db.load_advanced_config()?;
-        let value = match config.get("periodic_test_interval") {
+        let base_ms = match config.get("periodic_test_interval") {
             Some(value) => value
                 .as_u64()
                 .ok_or_else(|| anyhow!("periodic_test_interval 必须是数字"))?,
             None => 5 * 60 * 1000,
         };
-        if value == 0 {
+        if base_ms == 0 {
             return Err(anyhow!("periodic_test_interval 必须大于 0"));
         }
-        Ok(Duration::from_millis(value))
+        let recovery_ms = config
+            .get("probe_recovery_interval")
+            .and_then(Value::as_u64)
+            .unwrap_or(60 * 1000)
+            .clamp(1, base_ms);
+        let concurrency = config
+            .get("probe_concurrency")
+            .and_then(Value::as_u64)
+            .unwrap_or(8)
+            .clamp(1, 64) as usize;
+        Ok(ProbeSchedule {
+            base_interval: Duration::from_millis(base_ms),
+            recovery_interval: Duration::from_millis(recovery_ms),
+            // 真实流量在基础间隔内成功即视为“新鲜”，可跳过主动测活。
+            active_window: Duration::from_millis(base_ms),
+            concurrency,
+            tick: Duration::from_millis(recovery_ms),
+        })
     }
+}
+
+fn spawn_proxy_server(runtime: Arc<ProxyRuntime>, proxy_port: u16) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            if let Err(error) = proxy::serve(runtime.clone(), proxy_port).await {
+                eprintln!(
+                    "代理服务监听失败，将在 {} 秒后重试: {error:#}",
+                    PROXY_LISTEN_RETRY_INTERVAL.as_secs()
+                );
+                time::sleep(PROXY_LISTEN_RETRY_INTERVAL).await;
+                continue;
+            }
+            break;
+        }
+    });
+}
+
+struct ProbeSchedule {
+    base_interval: Duration,
+    recovery_interval: Duration,
+    active_window: Duration,
+    concurrency: usize,
+    tick: Duration,
 }
 
 pub fn now_millis() -> i64 {
@@ -208,4 +368,19 @@ pub fn now_millis() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
         .unwrap_or_default()
+}
+
+/// 用系统解析器（getaddrinfo，与命令行 ping/nslookup 一致）解析域名，取首个 IPv4。
+pub async fn resolve_ipv4(domain: &str) -> Option<String> {
+    let host = domain.trim();
+    if host.is_empty() {
+        return None;
+    }
+    let addrs = tokio::net::lookup_host((host, 0u16)).await.ok()?;
+    for addr in addrs {
+        if let std::net::IpAddr::V4(ipv4) = addr.ip() {
+            return Some(ipv4.to_string());
+        }
+    }
+    None
 }

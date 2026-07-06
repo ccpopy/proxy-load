@@ -50,7 +50,13 @@ export function LoadSettingsSection({
   }, [settings])
 
   async function save() {
-    await api("/api/settings", jsonBody(form))
+    const body = {
+      load_mode: form.load_mode,
+      algorithm: form.algorithm,
+      test_url: form.test_url,
+      timeout: form.timeout,
+    }
+    await api("/api/settings", jsonBody(body))
     toast.success("负载设置已保存")
     await onChanged()
   }
