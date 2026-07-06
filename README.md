@@ -324,6 +324,10 @@ cargo check --manifest-path src-tauri/Cargo.toml
 npm run tauri:build
 ```
 
+## 致谢
+
+感谢 L站用户 @fengtang 在本次更新中帮助测试消息编辑功能。
+
 ## 许可证
 
 以仓库根目录 `LICENSE` 文件为准。
