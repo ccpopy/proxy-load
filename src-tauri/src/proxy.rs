@@ -71,6 +71,8 @@ struct ProxyMetrics {
     requests: VecDeque<RequestMetric>,
     score: f64,
     last_used: i64,
+    last_success: i64,
+    pushed_status: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -207,9 +209,20 @@ impl ProxyRuntime {
         result_type: &str,
     ) {
         if let Some(proxy_id) = proxy_id {
-            let mut metrics = self.metrics.write().await;
-            let metric = metrics.entry(proxy_id).or_insert_with(ProxyMetrics::new);
-            metric.push(success, response_time);
+            let mark_active = {
+                let mut metrics = self.metrics.write().await;
+                let metric = metrics.entry(proxy_id).or_insert_with(ProxyMetrics::new);
+                metric.push(success, response_time);
+                success && metric.pushed_status.as_deref() != Some("active") && {
+                    metric.pushed_status = Some("active".to_string());
+                    true
+                }
+            };
+            if mark_active {
+                // 真实流量已证明该代理存活，立即把状态刷成 active，无需等待下一轮主动测活。
+                self.apply_passive_status(proxy_id, "active", response_time)
+                    .await;
+            }
         }
 
         if let Err(db_error) = self.db.log_request(
@@ -344,11 +357,68 @@ impl ProxyRuntime {
     }
 
     async fn record_breaker_failure(&self, proxy_id: i64) {
-        let mut breakers = self.circuit_breakers.write().await;
-        breakers
-            .entry(proxy_id)
-            .or_insert_with(CircuitBreaker::default)
-            .record_failure();
+        let just_opened = {
+            let mut breakers = self.circuit_breakers.write().await;
+            let breaker = breakers
+                .entry(proxy_id)
+                .or_insert_with(CircuitBreaker::default);
+            let was_open = breaker.state == "OPEN";
+            breaker.record_failure();
+            !was_open && breaker.state == "OPEN"
+        };
+        if just_opened {
+            // 熔断器刚打开，说明真实流量已连续失败，立即把状态刷成 inactive，
+            // 让主动测活以更短的“恢复间隔”盯住它。
+            {
+                let mut metrics = self.metrics.write().await;
+                let metric = metrics.entry(proxy_id).or_insert_with(ProxyMetrics::new);
+                metric.pushed_status = Some("inactive".to_string());
+            }
+            self.apply_passive_status(proxy_id, "inactive", None).await;
+        }
+    }
+
+    /// 各代理最近一次“真实流量成功”的时间戳（毫秒），供主动测活判断是否可跳过。
+    pub async fn recent_success_map(&self) -> HashMap<i64, i64> {
+        self.metrics
+            .read()
+            .await
+            .iter()
+            .map(|(id, metric)| (*id, metric.last_success))
+            .collect()
+    }
+
+    /// 供主动测活在写库后同步“已推送状态”，避免与被动健康判断产生分歧
+    /// （否则测活标记 inactive 后，真实流量再成功也不会把状态刷回 active）。
+    pub async fn note_pushed_status(&self, proxy_id: i64, status: &str) {
+        let mut metrics = self.metrics.write().await;
+        let metric = metrics.entry(proxy_id).or_insert_with(ProxyMetrics::new);
+        metric.pushed_status = Some(status.to_string());
+    }
+
+    /// 被动更新代理状态：只在状态发生变化时写库并广播事件，避免写放大。
+    async fn apply_passive_status(&self, proxy_id: i64, status: &str, response_time: Option<i64>) {
+        if let Err(error) = self
+            .db
+            .update_proxy_status(proxy_id, status, response_time, 0, 0)
+        {
+            eprintln!("被动更新代理状态失败 proxy_id={proxy_id}: {error:#}");
+            return;
+        }
+        if let Ok(Some(proxy)) = self.db.get_proxy(proxy_id) {
+            let _ = self.events.send(ServerEvent {
+                event_type: "proxy_tested".to_string(),
+                data: json!({
+                    "proxy": proxy,
+                    "result": {
+                        "success": status == "active",
+                        "responseTime": response_time.unwrap_or(0)
+                    },
+                    "passive": true
+                }),
+                timestamp: now_millis(),
+            });
+        }
     }
 
     async fn resolve_target(&self, mut request: TargetRequest) -> TargetRequest {
@@ -636,6 +706,13 @@ async fn connect_socks5(proxy: &ProxyRecord, request: &TargetRequest) -> Result<
 
 async fn connect_socks4(proxy: &ProxyRecord, request: &TargetRequest) -> Result<TcpStream> {
     let mut stream = TcpStream::connect((proxy.host.as_str(), proxy.port as u16)).await?;
+    // SOCKS4 没有账号/密码认证机制，仅有一个 USERID 字段（RFC/identd 用途）。
+    // 这里把配置的用户名放进 USERID，尽量兼容以 USERID 做校验的上游；配置的密码在
+    // SOCKS4 下无处发送，只能忽略——因此“照搬 SOCKS5 的账号密码”通常会被上游拒绝。
+    let userid = proxy.username.as_deref().unwrap_or("");
+    if userid.len() > 255 {
+        return Err(anyhow!("SOCKS4 用户标识过长"));
+    }
     let mut packet = vec![
         0x04,
         SOCKS_CMD_CONNECT,
@@ -644,6 +721,7 @@ async fn connect_socks4(proxy: &ProxyRecord, request: &TargetRequest) -> Result<
     ];
     if let Ok(target_ip) = request.host.parse::<Ipv4Addr>() {
         packet.extend_from_slice(&target_ip.octets());
+        packet.extend_from_slice(userid.as_bytes());
         packet.push(0x00);
     } else {
         if request.host.contains(':') {
@@ -653,6 +731,7 @@ async fn connect_socks4(proxy: &ProxyRecord, request: &TargetRequest) -> Result<
             return Err(anyhow!("SOCKS4a目标域名过长"));
         }
         packet.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+        packet.extend_from_slice(userid.as_bytes());
         packet.push(0x00);
         packet.extend_from_slice(request.host.as_bytes());
         packet.push(0x00);
@@ -661,9 +740,25 @@ async fn connect_socks4(proxy: &ProxyRecord, request: &TargetRequest) -> Result<
     let mut response = [0u8; 8];
     stream.read_exact(&mut response).await?;
     if response[1] != 0x5a {
-        return Err(anyhow!("SOCKS4连接目标失败，响应码 {}", response[1]));
+        return Err(anyhow!("{}", socks4_reply_message(response[1], proxy)));
     }
     Ok(stream)
+}
+
+fn socks4_reply_message(code: u8, proxy: &ProxyRecord) -> String {
+    let has_password = proxy
+        .password
+        .as_deref()
+        .is_some_and(|value| !value.is_empty());
+    match code {
+        0x5b if has_password => "SOCKS4 请求被拒绝(0x5b)：SOCKS4 协议不支持用户名/密码认证，\
+             无法照搬 SOCKS5 的账号密码。若上游要求认证，请将该代理类型改为 SOCKS5"
+            .to_string(),
+        0x5b => "SOCKS4 请求被拒绝或失败(0x5b)".to_string(),
+        0x5c => "SOCKS4 请求失败(0x5c)：无法连接到客户端 identd 服务".to_string(),
+        0x5d => "SOCKS4 请求失败(0x5d)：identd 无法确认用户标识".to_string(),
+        other => format!("SOCKS4 连接目标失败，响应码 0x{other:02x}"),
+    }
 }
 
 async fn connect_http_proxy(proxy: &ProxyRecord, request: &TargetRequest) -> Result<TcpStream> {
@@ -1036,6 +1131,8 @@ impl ProxyMetrics {
             requests: VecDeque::new(),
             score: 50.0,
             last_used: now_millis(),
+            last_success: 0,
+            pushed_status: None,
         }
     }
 
@@ -1055,6 +1152,9 @@ impl ProxyMetrics {
             self.requests.pop_front();
         }
         self.last_used = now;
+        if success {
+            self.last_success = now;
+        }
         self.score = self.calculate_score();
     }
 

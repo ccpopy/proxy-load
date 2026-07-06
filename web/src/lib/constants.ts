@@ -40,6 +40,8 @@ export const emptyOverview: Overview = {
 export const defaultAdvanced: AdvancedConfig = {
   proxy_port: 5678,
   periodic_test_interval: 300000,
+  probe_recovery_interval: 60000,
+  probe_concurrency: 8,
   log_retention_days: 7,
   stats_retention_days: 30,
   pool_max_size: 50,

@@ -73,7 +73,11 @@ export function AdvancedDialog({
           <div className="grid gap-6 pb-1 lg:grid-cols-2">
             <ConfigGroup title="基础配置" icon={Settings}>
               <NumberField label="代理服务端口" value={config.proxy_port} onChange={(value) => update("proxy_port", value)} />
-              <NumberField label="定期测试间隔（分钟）" value={Math.round(config.periodic_test_interval / 60000)} onChange={(value) => update("periodic_test_interval", value * 60000)} />
+              <NumberField label="活跃节点测活间隔（分钟）" value={Math.round(config.periodic_test_interval / 60000)} onChange={(value) => update("periodic_test_interval", value * 60000)} />
+              <FieldGroup className="grid gap-4 sm:grid-cols-2">
+                <NumberField label="失败节点重测间隔（秒）" value={Math.round(config.probe_recovery_interval / 1000)} onChange={(value) => update("probe_recovery_interval", value * 1000)} />
+                <NumberField label="并发测活数" value={config.probe_concurrency} onChange={(value) => update("probe_concurrency", value)} />
+              </FieldGroup>
               <FieldGroup className="grid gap-4 sm:grid-cols-2">
                 <NumberField label="请求日志保留天数" value={config.log_retention_days} onChange={(value) => update("log_retention_days", value)} />
                 <NumberField label="统计保留天数" value={config.stats_retention_days} onChange={(value) => update("stats_retention_days", value)} />

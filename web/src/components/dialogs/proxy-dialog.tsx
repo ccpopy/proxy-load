@@ -169,6 +169,11 @@ export function ProxyDialog({
                   </SelectGroup>
                 </SelectContent>
               </Select>
+              {form.type === "socks4" && (
+                <FieldDescription className="text-amber-600 dark:text-amber-500">
+                  SOCKS4 协议不支持用户名/密码认证：用户名仅作为 USERID 发送，密码会被忽略。若上游代理需要账号密码，请改用 SOCKS5。
+                </FieldDescription>
+              )}
             </Field>
             <div className="grid gap-4 sm:grid-cols-2">
               <Field>

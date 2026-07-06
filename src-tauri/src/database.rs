@@ -1249,6 +1249,8 @@ pub fn default_advanced_config() -> Map<String, Value> {
     Map::from_iter([
         ("proxy_port".to_string(), json!(proxy_port)),
         ("periodic_test_interval".to_string(), json!(5 * 60 * 1000)),
+        ("probe_recovery_interval".to_string(), json!(60 * 1000)),
+        ("probe_concurrency".to_string(), json!(8)),
         ("log_retention_days".to_string(), json!(7)),
         ("stats_retention_days".to_string(), json!(30)),
         ("pool_max_size".to_string(), json!(50)),
