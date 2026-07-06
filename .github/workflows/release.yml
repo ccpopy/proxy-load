@@ -9,7 +9,7 @@ on:
       release_tag:
         description: "Release tag to upload assets to"
         required: true
-        default: "v26.7.601"
+        default: "v26.7.602"
       target:
         description: "Build target"
         required: true
@@ -123,8 +123,9 @@ jobs:
 
             ### 调整
 
-            - 调整桌面应用图标主体占比，增加透明边距，使任务栏显示尺寸与常见应用图标更接近。
-            - 发布包版本、产物命名和 Windows 安装包内部应用版本统一使用 `26.7.601`。
+            - 使用新的 PL 白底圆角应用图标，并基于同一源图重新生成 Windows、macOS、Linux、iOS 和 Android 图标资源。
+            - 同步更新 Web favicon，保持桌面应用和 Web 入口图标一致。
+            - 发布包版本、产物命名和 Windows 安装包内部应用版本统一使用 `26.7.602`。
 
             ### 文档
 
