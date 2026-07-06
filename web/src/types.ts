@@ -189,8 +189,6 @@ export interface ExportResult {
 export interface AdvancedConfig {
   proxy_port: number
   periodic_test_interval: number
-  probe_recovery_interval: number
-  probe_concurrency: number
   log_retention_days: number
   stats_retention_days: number
   pool_max_size: number

@@ -2775,7 +2775,7 @@ dependencies = [
 
 [[package]]
 name = "proxy-load-tauri"
-version = "0.3.3"
+version = "26.6.1601"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
