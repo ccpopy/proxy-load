@@ -13,6 +13,9 @@ use std::sync::{
     Arc,
 };
 
+use anyhow::{anyhow, Result};
+use models::ServerEvent;
+use serde_json::Value;
 use state::{AppState, ServiceInfo};
 use tauri::{
     menu::MenuBuilder,
@@ -22,6 +25,7 @@ use tauri::{
 
 const BACKGROUND_RUN_KEY: &str = "background_run";
 const START_MINIMIZED_KEY: &str = "start_minimized";
+const TRAY_ID: &str = "main-tray";
 
 #[tauri::command]
 fn get_service_info(state: tauri::State<'_, Arc<AppState>>) -> ServiceInfo {
@@ -30,8 +34,14 @@ fn get_service_info(state: tauri::State<'_, Arc<AppState>>) -> ServiceInfo {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let app = tauri::Builder::default()
-        .plugin(tauri_plugin_opener::init())
+    let builder = tauri::Builder::default().plugin(tauri_plugin_opener::init());
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        show_main_window(app);
+    }));
+
+    let app = builder
         .setup(|app| {
             let app_state = Arc::new(AppState::bootstrap()?);
             app.manage(app_state.clone());
@@ -55,8 +65,9 @@ pub fn run() {
             // 标记“用户主动退出”：托盘退出菜单会置位，避免退出流程被后台运行逻辑拦截。
             let quit_flag = Arc::new(AtomicBool::new(false));
 
-            if let Err(error) = setup_tray(app, quit_flag.clone()) {
-                eprintln!("系统托盘初始化失败: {error:#}");
+            match setup_tray(app, quit_flag.clone(), app_state.clone()) {
+                Ok(()) => spawn_tray_tooltip_updates(app.handle().clone(), app_state.clone()),
+                Err(error) => eprintln!("系统托盘初始化失败: {error:#}"),
             }
 
             if let Some(window) = app.get_webview_window("main") {
@@ -145,15 +156,20 @@ pub fn run() {
     });
 }
 
-fn setup_tray(app: &App, quit_flag: Arc<AtomicBool>) -> tauri::Result<()> {
+fn setup_tray(
+    app: &App,
+    quit_flag: Arc<AtomicBool>,
+    app_state: Arc<AppState>,
+) -> tauri::Result<()> {
     let menu = MenuBuilder::new(app)
         .text("show", "显示主界面")
         .separator()
         .text("quit", "退出")
         .build()?;
 
-    let mut builder = TrayIconBuilder::with_id("main-tray")
-        .tooltip("代理管理系统")
+    let tray_state = app_state.clone();
+    let mut builder = TrayIconBuilder::with_id(TRAY_ID)
+        .tooltip("代理状态加载中")
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(move |app, event| match event.id.as_ref() {
@@ -164,15 +180,22 @@ fn setup_tray(app: &App, quit_flag: Arc<AtomicBool>) -> tauri::Result<()> {
             }
             _ => {}
         })
-        .on_tray_icon_event(|tray, event| {
-            if let TrayIconEvent::Click {
+        .on_tray_icon_event(move |tray, event| match event {
+            TrayIconEvent::Click {
                 button: MouseButton::Left,
                 button_state: MouseButtonState::Up,
                 ..
-            } = event
-            {
-                show_main_window(tray.app_handle());
+            } => show_main_window(tray.app_handle()),
+            TrayIconEvent::Enter { .. } => {
+                let app_handle = tray.app_handle().clone();
+                let state = tray_state.clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Err(error) = update_tray_tooltip(&app_handle, &state).await {
+                        eprintln!("系统托盘状态刷新失败: {error:#}");
+                    }
+                });
             }
+            _ => {}
         });
 
     if let Some(icon) = app.default_window_icon() {
@@ -180,6 +203,91 @@ fn setup_tray(app: &App, quit_flag: Arc<AtomicBool>) -> tauri::Result<()> {
     }
     builder.build(app)?;
     Ok(())
+}
+
+fn spawn_tray_tooltip_updates(app_handle: AppHandle, state: Arc<AppState>) {
+    tauri::async_runtime::spawn(async move {
+        if let Err(error) = update_tray_tooltip(&app_handle, &state).await {
+            eprintln!("系统托盘状态初始化失败: {error:#}");
+        }
+
+        let mut events = state.events.subscribe();
+        loop {
+            match events.recv().await {
+                Ok(event) if should_refresh_tray_tooltip(&event) => {
+                    if let Err(error) = update_tray_tooltip(&app_handle, &state).await {
+                        eprintln!("系统托盘状态刷新失败: {error:#}");
+                    }
+                }
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    if let Err(error) = update_tray_tooltip(&app_handle, &state).await {
+                        eprintln!("系统托盘状态刷新失败: {error:#}");
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+}
+
+fn should_refresh_tray_tooltip(event: &ServerEvent) -> bool {
+    matches!(
+        event.event_type.as_str(),
+        "proxy_service_status_changed"
+            | "request_logged"
+            | "traffic_logs_cleared"
+            | "proxy_testing"
+            | "proxy_tested"
+            | "proxy_created"
+            | "proxy_updated"
+            | "proxy_deleted"
+            | "dns_mapping_updated"
+    )
+}
+
+async fn update_tray_tooltip(app: &AppHandle, state: &AppState) -> Result<()> {
+    let tooltip = build_tray_tooltip(state).await?;
+    let tray = app
+        .tray_by_id(TRAY_ID)
+        .ok_or_else(|| anyhow!("找不到系统托盘图标: {TRAY_ID}"))?;
+    tray.set_tooltip(Some(tooltip))?;
+    Ok(())
+}
+
+async fn build_tray_tooltip(state: &AppState) -> Result<String> {
+    let service = state.proxy_runtime.service_status().await;
+    let overview = state.db.overview(state.uptime_seconds())?;
+    let active_proxies = json_i64(&overview, "activeProxies")?;
+    let total_requests = json_i64(&overview, "totalRequests")?;
+    let avg_response_time = json_i64(&overview, "avgResponseTime")?;
+
+    if !service.running {
+        let label = if service.state == "starting" {
+            "代理启动中"
+        } else {
+            "代理未运行"
+        };
+        return Ok(format!("{label}\n端口 {}", service.port));
+    }
+
+    let avg_label = if total_requests > 0 && avg_response_time > 0 {
+        format!("平均 {avg_response_time}ms")
+    } else {
+        "平均 --".to_string()
+    };
+
+    Ok(format!(
+        "代理运行中 · 在线 {}\n{}",
+        active_proxies, avg_label
+    ))
+}
+
+fn json_i64(value: &Value, key: &str) -> Result<i64> {
+    value
+        .get(key)
+        .and_then(Value::as_i64)
+        .ok_or_else(|| anyhow!("系统状态缺少字段: {key}"))
 }
 
 fn show_main_window(app: &AppHandle) {

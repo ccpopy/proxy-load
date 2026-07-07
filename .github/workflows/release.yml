@@ -9,7 +9,7 @@ on:
       release_tag:
         description: "Release tag to upload assets to"
         required: true
-        default: "v26.7.602"
+        default: "v26.7.7"
       target:
         description: "Build target"
         required: true
@@ -121,11 +121,15 @@ jobs:
           releaseBody: |
             ## Changes
 
+            ### 修复
+
+            - 修复应用可同时启动多个进程的问题，重复启动时会唤起并聚焦已有主窗口。
+            - 修复便携版更新流程与单实例机制冲突的问题，避免新版启动被旧实例拦截。
+
             ### 调整
 
-            - 使用新的 PL 白底圆角应用图标，并基于同一源图重新生成 Windows、macOS、Linux、iOS 和 Android 图标资源。
-            - 同步更新 Web favicon，保持桌面应用和 Web 入口图标一致。
-            - 发布包版本、产物命名和 Windows 安装包内部应用版本统一使用 `26.7.602`。
+            - 托盘图标悬停文案改为简洁运行状态，显示在线代理数和平均响应。
+            - 发布包版本、产物命名和 Windows 安装包内部应用版本统一使用 `26.7.7`。
 
             ### 文档
 

@@ -12,6 +12,7 @@ use std::os::windows::process::CommandExt;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+use tauri::AppHandle;
 
 use crate::{
     models::{ConfigBundle, DnsInput, ProxyGroupInput, ProxyInput, CONFIG_BUNDLE_KIND},
@@ -670,6 +671,7 @@ pub async fn check_for_updates(use_mirror: Option<bool>) -> CommandResult<Update
 
 #[tauri::command]
 pub async fn install_update(
+    app: AppHandle,
     artifact_path: Option<String>,
     use_mirror: Option<bool>,
 ) -> CommandResult<Value> {
@@ -699,7 +701,7 @@ pub async fn install_update(
         ));
     }
     download_release_asset(&selected.download_url, &selected_path, !use_mirror).await?;
-    launch_update_installer(&selected_path, &app_dir, &selected.kind)?;
+    launch_update_installer(&app, &selected_path, &app_dir, &selected.kind)?;
 
     let message = if selected.kind == "windows-portable" {
         "已下载便携更新包到当前应用目录，应用即将启动新版本"
@@ -715,7 +717,12 @@ pub async fn install_update(
     }))
 }
 
-fn launch_update_installer(selected_path: &Path, app_dir: &Path, kind: &str) -> CommandResult<()> {
+fn launch_update_installer(
+    app: &AppHandle,
+    selected_path: &Path,
+    app_dir: &Path,
+    kind: &str,
+) -> CommandResult<()> {
     let extension = selected_path
         .extension()
         .and_then(|value| value.to_str())
@@ -723,7 +730,7 @@ fn launch_update_installer(selected_path: &Path, app_dir: &Path, kind: &str) -> 
         .to_ascii_lowercase();
 
     if kind == "windows-portable" {
-        return launch_portable_update(selected_path, app_dir);
+        return launch_portable_update(app, selected_path, app_dir);
     }
 
     match extension.as_str() {
@@ -753,16 +760,14 @@ fn launch_update_installer(selected_path: &Path, app_dir: &Path, kind: &str) -> 
 }
 
 #[cfg(target_os = "windows")]
-fn launch_portable_update(selected_path: &Path, app_dir: &Path) -> CommandResult<()> {
-    let restart_command = format!(
-        "ping 127.0.0.1 -n 3 > nul && start \"\" /D \"{}\" \"{}\"",
-        app_dir.display(),
-        selected_path.display()
-    );
+fn launch_portable_update(
+    app: &AppHandle,
+    selected_path: &Path,
+    app_dir: &Path,
+) -> CommandResult<()> {
+    tauri_plugin_single_instance::destroy(app);
 
-    Command::new("cmd")
-        .arg("/C")
-        .arg(restart_command)
+    Command::new(selected_path)
         .current_dir(app_dir)
         .creation_flags(CREATE_NO_WINDOW)
         .spawn()?;
@@ -776,7 +781,11 @@ fn launch_portable_update(selected_path: &Path, app_dir: &Path) -> CommandResult
 }
 
 #[cfg(not(target_os = "windows"))]
-fn launch_portable_update(selected_path: &Path, _app_dir: &Path) -> CommandResult<()> {
+fn launch_portable_update(
+    _app: &AppHandle,
+    selected_path: &Path,
+    _app_dir: &Path,
+) -> CommandResult<()> {
     Err(CommandError::new(format!(
         "当前平台暂不支持直接安装便携更新包: {}",
         selected_path.display()
