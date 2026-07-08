@@ -142,7 +142,7 @@ release/
 Windows 本地构建还会额外复制一个可直接运行的便携 exe：
 
 ```text
-release/proxy-load_26.7.7_x64-portable.exe
+release/proxy-load_26.7.8_x64-portable.exe
 ```
 
 这个文件主要用于本机验证，可以直接双击运行；正式更新安装仍建议使用 setup 或 msi 安装包。
@@ -153,14 +153,14 @@ release/proxy-load_26.7.7_x64-portable.exe
 
 Windows：
 
-- 便携运行：下载 `proxy-load_26.7.7_x64-portable.exe`，放到目标目录后直接双击运行。
-- 安装运行：下载 Windows x64 的 `setup.exe` 或 `.msi` 安装包，按安装向导完成安装。GitHub Release 文件名会使用 `proxy-load_26.7.7_windows_*` 前缀。
+- 便携运行：下载 `proxy-load_26.7.8_x64-portable.exe`，放到目标目录后直接双击运行。
+- 安装运行：下载 Windows x64 的 `setup.exe` 或 `.msi` 安装包，按安装向导完成安装。GitHub Release 文件名会使用 `proxy-load_26.7.8_windows_*` 前缀。
 - 启动后应用会监听默认代理端口 `5678`，浏览器或系统代理可配置为 `SOCKS5 127.0.0.1:5678` 或 `HTTP 127.0.0.1:5678`。
 
 macOS：
 
-- Intel 芯片下载 `proxy-load_26.7.7_darwin_x64.dmg`。
-- Apple Silicon 芯片下载 `proxy-load_26.7.7_darwin_aarch64.dmg`。
+- Intel 芯片下载 `proxy-load_26.7.8_darwin_x64.dmg`。
+- Apple Silicon 芯片下载 `proxy-load_26.7.8_darwin_aarch64.dmg`。
 - `.app.tar.gz` 是同架构的应用包压缩产物，通常优先使用 `.dmg` 安装。
 - 打开 `.dmg` 后把应用拖入 `Applications`。未签名构建首次打开时可能需要在系统设置的“隐私与安全性”中允许打开。
 - 启动后代理端口同样默认为 `5678`，可在系统网络代理或浏览器代理中配置 `127.0.0.1:5678`。
@@ -232,14 +232,15 @@ cp "$SOURCE_DATA"/proxy.db* "$TARGET_DATA"/
 
 - 开发环境：直接返回错误，避免把本地调试产物误当成线上更新。
 - 生产环境：请求 GitHub Releases 最新版本，选择当前平台可用的安装包。
-- 安装包运行：Windows 下会启动下载的 setup 或 msi，并把安装目录指向当前应用所在目录，例如 `F:\proxy-load`。
+- 安装包运行：Windows 下会静默启动下载的 setup 或 msi，并把安装目录指向当前应用所在目录，例如 `F:\proxy-load`，随后退出当前应用以便安装器覆盖旧版本。如果目标目录需要管理员权限，系统仍可能弹出 UAC 权限确认。
 - 便携版运行：Windows 下会下载 portable exe 到当前应用目录，退出当前应用后启动新版本文件。
+- macOS 运行：下载对应架构的 `.dmg` 到 `~/Downloads` 并自动打开，用户需要退出当前应用后在 DMG 中把应用拖入 `Applications` 覆盖旧版。
 
-更新检查不会默认安装到系统盘其他位置；应用放在 `F:\proxy-load` 时，更新也会以该目录作为安装位置。
+Windows 更新检查不会默认安装到系统盘其他位置；应用放在 `F:\proxy-load` 时，更新也会以该目录作为安装位置。
 
-应用内显示的“更新目标目录”和“下载保存目录”都会指向当前应用所在目录。比如便携 exe 放在 `F:\project\proxy-load\release` 中运行时，更新也会下载到 `F:\project\proxy-load\release`，不会再放到 `F:\project\proxy-load\release\release`。
+Windows 下应用内显示的“更新目标目录”和“下载保存目录”都会指向当前应用所在目录。比如便携 exe 放在 `F:\project\proxy-load\release` 中运行时，更新也会下载到 `F:\project\proxy-load\release`，不会再放到 `F:\project\proxy-load\release\release`。macOS 下“下载保存目录”会显示为 `~/Downloads`。
 
-便携 exe 在运行时不能直接覆盖自身，所以更新时会直接下载 GitHub Release 中的新版本文件名，例如 `proxy-load_26.7.7_x64-portable.exe`，然后退出当前应用并启动这个新版本文件。
+便携 exe 在运行时不能直接覆盖自身，所以更新时会直接下载 GitHub Release 中的新版本文件名，例如 `proxy-load_26.7.8_x64-portable.exe`，然后退出当前应用并启动这个新版本文件。
 
 如果发布仓库是私有仓库，GitHub 未认证访问会返回 `404`。生产环境需要在启动应用前设置环境变量：
 

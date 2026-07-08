@@ -30,7 +30,7 @@ const GITHUB_TOKEN_ENV: &str = "PROXY_LOAD_GITHUB_TOKEN";
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 #[cfg(target_os = "windows")]
-const PORTABLE_EXIT_DELAY: Duration = Duration::from_millis(800);
+const UPDATE_EXIT_DELAY: Duration = Duration::from_millis(800);
 
 type CommandResult<T> = Result<T, CommandError>;
 
@@ -703,10 +703,15 @@ pub async fn install_update(
     download_release_asset(&selected.download_url, &selected_path, !use_mirror).await?;
     launch_update_installer(&app, &selected_path, &app_dir, &selected.kind)?;
 
-    let message = if selected.kind == "windows-portable" {
-        "已下载便携更新包到当前应用目录，应用即将启动新版本"
-    } else {
-        "已下载 GitHub Release 更新包，并启动安装程序，安装目录已指向当前应用所在目录"
+    let message = match selected.kind.as_str() {
+        "windows-portable" => "已下载便携更新包到当前应用目录，应用即将启动新版本",
+        "windows-nsis" | "windows-msi" => {
+            "已下载更新包并静默启动安装，安装目录已指向当前应用所在目录，应用即将退出"
+        }
+        "macos-dmg" => {
+            "已下载并打开 macOS 更新包，请退出当前应用后在 DMG 中拖动应用到 Applications 并覆盖旧版"
+        }
+        _ => "已下载 GitHub Release 更新包，并启动安装程序，安装目录已指向当前应用所在目录",
     };
 
     Ok(json!({
@@ -732,10 +737,14 @@ fn launch_update_installer(
     if kind == "windows-portable" {
         return launch_portable_update(app, selected_path, app_dir);
     }
+    if kind == "macos-dmg" {
+        return launch_macos_dmg_update(selected_path);
+    }
 
     match extension.as_str() {
         "exe" => {
             Command::new(&selected_path)
+                .arg("/S")
                 .arg(format!("/D={}", app_dir.display()))
                 .current_dir(&app_dir)
                 .spawn()?;
@@ -744,6 +753,8 @@ fn launch_update_installer(
             Command::new("msiexec")
                 .arg("/i")
                 .arg(&selected_path)
+                .arg("/qn")
+                .arg("/norestart")
                 .arg(format!("TARGETDIR={}", app_dir.display()))
                 .current_dir(&app_dir)
                 .spawn()?;
@@ -754,6 +765,12 @@ fn launch_update_installer(
                 selected_path.display()
             )));
         }
+    }
+
+    #[cfg(target_os = "windows")]
+    if matches!(kind, "windows-nsis" | "windows-msi") {
+        tauri_plugin_single_instance::destroy(app);
+        schedule_update_exit();
     }
 
     Ok(())
@@ -772,12 +789,17 @@ fn launch_portable_update(
         .creation_flags(CREATE_NO_WINDOW)
         .spawn()?;
 
-    std::thread::spawn(|| {
-        std::thread::sleep(PORTABLE_EXIT_DELAY);
-        std::process::exit(0);
-    });
+    schedule_update_exit();
 
     Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn schedule_update_exit() {
+    std::thread::spawn(|| {
+        std::thread::sleep(UPDATE_EXIT_DELAY);
+        std::process::exit(0);
+    });
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -788,6 +810,20 @@ fn launch_portable_update(
 ) -> CommandResult<()> {
     Err(CommandError::new(format!(
         "当前平台暂不支持直接安装便携更新包: {}",
+        selected_path.display()
+    )))
+}
+
+#[cfg(target_os = "macos")]
+fn launch_macos_dmg_update(selected_path: &Path) -> CommandResult<()> {
+    Command::new("open").arg(selected_path).spawn()?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn launch_macos_dmg_update(selected_path: &Path) -> CommandResult<()> {
+    Err(CommandError::new(format!(
+        "当前平台暂不支持直接安装 macOS 更新包: {}",
         selected_path.display()
     )))
 }
@@ -808,6 +844,7 @@ async fn build_update_info(use_mirror: bool) -> CommandResult<UpdateInfo> {
     }
 
     let app_dir = current_app_dir()?;
+    let download_dir = current_update_download_dir(&app_dir)?;
     let executable = std::env::current_exe()?;
     let install_mode = current_install_mode(&executable);
 
@@ -848,7 +885,7 @@ async fn build_update_info(use_mirror: bool) -> CommandResult<UpdateInfo> {
     Ok(UpdateInfo {
         current_version,
         app_dir: app_dir.display().to_string(),
-        download_dir: app_dir.display().to_string(),
+        download_dir: download_dir.display().to_string(),
         install_mode: install_mode.to_string(),
         source: if use_mirror {
             "gh-proxy-mirror".to_string()
@@ -867,6 +904,15 @@ fn current_app_dir() -> CommandResult<PathBuf> {
         .parent()
         .map(Path::to_path_buf)
         .ok_or_else(|| CommandError::new("无法确定当前应用目录"))
+}
+
+fn current_update_download_dir(app_dir: &Path) -> CommandResult<PathBuf> {
+    if cfg!(target_os = "macos") {
+        let home = std::env::var_os("HOME")
+            .ok_or_else(|| CommandError::new("无法确定 macOS 下载目录，缺少 HOME 环境变量"))?;
+        return Ok(PathBuf::from(home).join("Downloads"));
+    }
+    Ok(app_dir.to_path_buf())
 }
 
 fn current_install_mode(executable: &Path) -> &'static str {

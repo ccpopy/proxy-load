@@ -9,7 +9,7 @@ on:
       release_tag:
         description: "Release tag to upload assets to"
         required: true
-        default: "v26.7.7"
+        default: "v26.7.8"
       target:
         description: "Build target"
         required: true
@@ -121,19 +121,15 @@ jobs:
           releaseBody: |
             ## Changes
 
-            ### 修复
-
-            - 修复应用可同时启动多个进程的问题，重复启动时会唤起并聚焦已有主窗口。
-            - 修复便携版更新流程与单实例机制冲突的问题，避免新版启动被旧实例拦截。
-
             ### 调整
 
-            - 托盘图标悬停文案改为简洁运行状态，显示在线代理数和平均响应。
-            - 发布包版本、产物命名和 Windows 安装包内部应用版本统一使用 `26.7.7`。
+            - Windows setup 和 msi 更新安装改为静默启动，并继续把安装目录指向当前应用所在目录。
+            - Windows 安装包更新启动后会释放单实例锁并退出当前应用，避免覆盖旧程序时文件被占用。
+            - macOS `.dmg` 更新包改为下载到 `~/Downloads` 后自动打开，避免写入应用包内部目录。
 
             ### 文档
 
-            - 更新 README 中当前版本产物示例文件名。
+            - 补充 Windows 静默更新和 macOS DMG 更新流程说明。
           releaseDraft: false
           prerelease: ${{ contains(env.RELEASE_TAG, '-') }}
           assetNamePattern: proxy-load_${{ steps.package-version.outputs.version }}_[platform]_[arch][setup][ext]
