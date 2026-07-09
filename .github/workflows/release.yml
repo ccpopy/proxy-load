@@ -9,7 +9,7 @@ on:
       release_tag:
         description: "Release tag to upload assets to"
         required: true
-        default: "v26.7.9"
+        default: "v26.7.901"
       target:
         description: "Build target"
         required: true
@@ -123,13 +123,13 @@ jobs:
 
             ### 调整
 
-            - 代理主动测活调整为轻量心跳策略，活跃节点默认每 3 分钟检测一次。
-            - 路由时离线状态只降低优先级，不再直接剔除代理，避免偶发测活失败导致可用代理无法被尝试。
-            - 后台心跳成功后会同步恢复熔断器状态，避免代理已恢复但仍被熔断状态挡住。
+            - Windows setup 和 msi 静默更新改为由独立辅助进程接管，等待旧应用退出后再执行安装。
+            - Windows 安装版静默更新完成后会自动启动安装目录中的新版本应用。
+            - 更新安装提示文案补充安装完成后会自动重新启动应用。
 
             ### 文档
 
-            - 更新高级配置默认心跳间隔说明和 26.7.9 下载文件名示例。
+            - 更新 26.7.901 下载文件名示例。
           releaseDraft: false
           prerelease: ${{ contains(env.RELEASE_TAG, '-') }}
           assetNamePattern: proxy-load_${{ steps.package-version.outputs.version }}_[platform]_[arch][setup][ext]

@@ -1,12 +1,15 @@
 use std::{
     collections::{HashMap, HashSet},
+    ffi::OsString,
     fs,
     path::{Path, PathBuf},
     process::Command,
     sync::Arc,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(target_os = "windows")]
+use anyhow::{anyhow, Context, Result as AnyhowResult};
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 
@@ -31,6 +34,18 @@ const GITHUB_TOKEN_ENV: &str = "PROXY_LOAD_GITHUB_TOKEN";
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 #[cfg(target_os = "windows")]
 const UPDATE_EXIT_DELAY: Duration = Duration::from_millis(800);
+#[cfg(target_os = "windows")]
+const UPDATE_HELPER_ARG: &str = "--proxy-load-update-helper";
+#[cfg(target_os = "windows")]
+const UPDATE_HELPER_PARENT_PID_ARG: &str = "--parent-pid";
+#[cfg(target_os = "windows")]
+const UPDATE_HELPER_INSTALLER_PATH_ARG: &str = "--installer-path";
+#[cfg(target_os = "windows")]
+const UPDATE_HELPER_INSTALLER_KIND_ARG: &str = "--installer-kind";
+#[cfg(target_os = "windows")]
+const UPDATE_HELPER_INSTALL_DIR_ARG: &str = "--install-dir";
+#[cfg(target_os = "windows")]
+const UPDATE_HELPER_LAUNCH_PATH_ARG: &str = "--launch-path";
 
 type CommandResult<T> = Result<T, CommandError>;
 
@@ -706,7 +721,7 @@ pub async fn install_update(
     let message = match selected.kind.as_str() {
         "windows-portable" => "已下载便携更新包到当前应用目录，应用即将启动新版本",
         "windows-nsis" | "windows-msi" => {
-            "已下载更新包并静默启动安装，安装目录已指向当前应用所在目录，应用即将退出"
+            "已下载更新包并静默启动安装，安装完成后会自动重新启动应用"
         }
         "macos-dmg" => {
             "已下载并打开 macOS 更新包，请退出当前应用后在 DMG 中拖动应用到 Applications 并覆盖旧版"
@@ -739,6 +754,11 @@ fn launch_update_installer(
     }
     if kind == "macos-dmg" {
         return launch_macos_dmg_update(selected_path);
+    }
+
+    #[cfg(target_os = "windows")]
+    if matches!(kind, "windows-nsis" | "windows-msi") {
+        return launch_windows_installer_update(app, selected_path, app_dir, kind);
     }
 
     match extension.as_str() {
@@ -777,6 +797,51 @@ fn launch_update_installer(
 }
 
 #[cfg(target_os = "windows")]
+fn launch_windows_installer_update(
+    app: &AppHandle,
+    selected_path: &Path,
+    app_dir: &Path,
+    kind: &str,
+) -> CommandResult<()> {
+    tauri_plugin_single_instance::destroy(app);
+
+    let launch_path = std::env::current_exe()?;
+    let helper_path = windows_update_helper_path()?;
+    fs::copy(&launch_path, &helper_path)?;
+
+    Command::new(&helper_path)
+        .arg(UPDATE_HELPER_ARG)
+        .arg(UPDATE_HELPER_PARENT_PID_ARG)
+        .arg(std::process::id().to_string())
+        .arg(UPDATE_HELPER_INSTALLER_PATH_ARG)
+        .arg(selected_path)
+        .arg(UPDATE_HELPER_INSTALLER_KIND_ARG)
+        .arg(kind)
+        .arg(UPDATE_HELPER_INSTALL_DIR_ARG)
+        .arg(app_dir)
+        .arg(UPDATE_HELPER_LAUNCH_PATH_ARG)
+        .arg(&launch_path)
+        .current_dir(app_dir)
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()?;
+
+    schedule_update_exit();
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn windows_update_helper_path() -> CommandResult<PathBuf> {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| CommandError::new(format!("无法生成更新辅助进程文件名: {error}")))?
+        .as_millis();
+    Ok(std::env::temp_dir().join(format!(
+        "proxy-load-update-helper-{}-{stamp}.exe",
+        std::process::id()
+    )))
+}
+
+#[cfg(target_os = "windows")]
 fn launch_portable_update(
     app: &AppHandle,
     selected_path: &Path,
@@ -800,6 +865,209 @@ fn schedule_update_exit() {
         std::thread::sleep(UPDATE_EXIT_DELAY);
         std::process::exit(0);
     });
+}
+
+#[cfg(target_os = "windows")]
+pub fn run_windows_update_helper_from_args() -> AnyhowResult<bool> {
+    let Some(args) = WindowsUpdateHelperArgs::from_process_args()? else {
+        return Ok(false);
+    };
+
+    wait_for_process_exit(args.parent_pid)
+        .with_context(|| format!("等待旧应用进程退出失败: {}", args.parent_pid))?;
+
+    let installer_status =
+        spawn_windows_update_installer(&args).context("启动或等待 Windows 更新安装器失败")?;
+    if !installer_status.success() {
+        return Err(anyhow!(
+            "Windows 更新安装器退出码异常: {}",
+            installer_status
+        ));
+    }
+
+    Command::new(&args.launch_path)
+        .current_dir(&args.install_dir)
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+        .with_context(|| format!("启动更新后的应用失败: {}", args.launch_path.display()))?;
+
+    Ok(true)
+}
+
+#[cfg(target_os = "windows")]
+fn spawn_windows_update_installer(
+    args: &WindowsUpdateHelperArgs,
+) -> std::io::Result<std::process::ExitStatus> {
+    let mut command = match args.installer_kind.as_str() {
+        "windows-nsis" => {
+            let mut command = Command::new(&args.installer_path);
+            command
+                .arg("/S")
+                .arg(format!("/D={}", args.install_dir.display()));
+            command
+        }
+        "windows-msi" => {
+            let mut command = Command::new("msiexec");
+            command
+                .arg("/i")
+                .arg(&args.installer_path)
+                .arg("/qn")
+                .arg("/norestart")
+                .arg(format!("TARGETDIR={}", args.install_dir.display()));
+            command
+        }
+        other => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("不支持的 Windows 更新安装器类型: {other}"),
+            ));
+        }
+    };
+
+    command
+        .current_dir(&args.install_dir)
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()?
+        .wait()
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Debug)]
+struct WindowsUpdateHelperArgs {
+    parent_pid: u32,
+    installer_path: PathBuf,
+    installer_kind: String,
+    install_dir: PathBuf,
+    launch_path: PathBuf,
+}
+
+#[cfg(target_os = "windows")]
+impl WindowsUpdateHelperArgs {
+    fn from_process_args() -> AnyhowResult<Option<Self>> {
+        let args = std::env::args_os().skip(1).collect::<Vec<_>>();
+        if !args
+            .iter()
+            .any(|arg| arg.to_string_lossy() == UPDATE_HELPER_ARG)
+        {
+            return Ok(None);
+        }
+        Self::parse(args).map(Some)
+    }
+
+    fn parse(args: Vec<OsString>) -> AnyhowResult<Self> {
+        let mut parent_pid = None;
+        let mut installer_path = None;
+        let mut installer_kind = None;
+        let mut install_dir = None;
+        let mut launch_path = None;
+
+        let mut iter = args.into_iter();
+        while let Some(arg) = iter.next() {
+            let key = arg.to_string_lossy();
+            match key.as_ref() {
+                UPDATE_HELPER_ARG => {}
+                UPDATE_HELPER_PARENT_PID_ARG => {
+                    let value = next_update_helper_value(&mut iter, UPDATE_HELPER_PARENT_PID_ARG)?;
+                    parent_pid = Some(
+                        value
+                            .to_string_lossy()
+                            .parse::<u32>()
+                            .context("更新辅助进程 parent pid 无效")?,
+                    );
+                }
+                UPDATE_HELPER_INSTALLER_PATH_ARG => {
+                    installer_path = Some(PathBuf::from(next_update_helper_value(
+                        &mut iter,
+                        UPDATE_HELPER_INSTALLER_PATH_ARG,
+                    )?));
+                }
+                UPDATE_HELPER_INSTALLER_KIND_ARG => {
+                    installer_kind = Some(
+                        next_update_helper_value(&mut iter, UPDATE_HELPER_INSTALLER_KIND_ARG)?
+                            .to_string_lossy()
+                            .to_string(),
+                    );
+                }
+                UPDATE_HELPER_INSTALL_DIR_ARG => {
+                    install_dir = Some(PathBuf::from(next_update_helper_value(
+                        &mut iter,
+                        UPDATE_HELPER_INSTALL_DIR_ARG,
+                    )?));
+                }
+                UPDATE_HELPER_LAUNCH_PATH_ARG => {
+                    launch_path = Some(PathBuf::from(next_update_helper_value(
+                        &mut iter,
+                        UPDATE_HELPER_LAUNCH_PATH_ARG,
+                    )?));
+                }
+                other => return Err(anyhow!("未知更新辅助进程参数: {other}")),
+            }
+        }
+
+        Ok(Self {
+            parent_pid: parent_pid.ok_or_else(|| anyhow!("缺少更新辅助进程 parent pid"))?,
+            installer_path: installer_path.ok_or_else(|| anyhow!("缺少更新安装器路径"))?,
+            installer_kind: installer_kind.ok_or_else(|| anyhow!("缺少更新安装器类型"))?,
+            install_dir: install_dir.ok_or_else(|| anyhow!("缺少更新安装目录"))?,
+            launch_path: launch_path.ok_or_else(|| anyhow!("缺少更新后启动路径"))?,
+        })
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn next_update_helper_value(
+    iter: &mut impl Iterator<Item = OsString>,
+    key: &str,
+) -> AnyhowResult<OsString> {
+    iter.next()
+        .ok_or_else(|| anyhow!("更新辅助进程参数 {key} 缺少值"))
+}
+
+#[cfg(target_os = "windows")]
+fn wait_for_process_exit(pid: u32) -> std::io::Result<()> {
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+    const WAIT_OBJECT_0: u32 = 0x0000_0000;
+    const WAIT_FAILED: u32 = 0xffff_ffff;
+    const INFINITE: u32 = 0xffff_ffff;
+    const ERROR_INVALID_PARAMETER: u32 = 87;
+
+    unsafe {
+        let handle = OpenProcess(SYNCHRONIZE, 0, pid);
+        if handle.is_null() {
+            let error = GetLastError();
+            if error == ERROR_INVALID_PARAMETER {
+                return Ok(());
+            }
+            return Err(std::io::Error::from_raw_os_error(error as i32));
+        }
+
+        let wait = WaitForSingleObject(handle, INFINITE);
+        let close_result = CloseHandle(handle);
+        if close_result == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if wait == WAIT_OBJECT_0 {
+            Ok(())
+        } else if wait == WAIT_FAILED {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("等待进程退出返回未知状态: {wait}"),
+            ))
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+type WindowsHandle = *mut std::ffi::c_void;
+
+#[cfg(target_os = "windows")]
+extern "system" {
+    fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: i32, dwProcessId: u32) -> WindowsHandle;
+    fn WaitForSingleObject(hHandle: WindowsHandle, dwMilliseconds: u32) -> u32;
+    fn CloseHandle(hObject: WindowsHandle) -> i32;
+    fn GetLastError() -> u32;
 }
 
 #[cfg(not(target_os = "windows"))]

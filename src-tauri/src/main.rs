@@ -311,5 +311,15 @@ fn read_flag(state: &AppState, key: &str) -> bool {
 }
 
 fn main() {
+    #[cfg(target_os = "windows")]
+    match commands::run_windows_update_helper_from_args() {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(error) => {
+            eprintln!("Windows 更新辅助进程失败: {error:#}");
+            std::process::exit(1);
+        }
+    }
+
     run();
 }
