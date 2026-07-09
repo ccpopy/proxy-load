@@ -1,17 +1,21 @@
 use std::{
     collections::{HashMap, HashSet},
-    ffi::OsString,
     fs,
     path::{Path, PathBuf},
     process::Command,
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 #[cfg(target_os = "windows")]
 use anyhow::{anyhow, Context, Result as AnyhowResult};
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
+#[cfg(target_os = "windows")]
+use std::{
+    ffi::OsString,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
