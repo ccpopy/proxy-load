@@ -39,7 +39,7 @@ export const emptyOverview: Overview = {
 
 export const defaultAdvanced: AdvancedConfig = {
   proxy_port: 5678,
-  periodic_test_interval: 300000,
+  periodic_test_interval: 180000,
   probe_recovery_interval: 60000,
   probe_concurrency: 8,
   dns_refresh_interval: 300000,

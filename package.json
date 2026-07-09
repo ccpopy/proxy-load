@@ -1,6 +1,6 @@
 {
   "name": "proxy-load",
-  "version": "26.7.8",
+  "version": "26.7.9",
   "description": "代理负载均衡管理系统",
   "scripts": {
     "start": "npm run tauri:dev",

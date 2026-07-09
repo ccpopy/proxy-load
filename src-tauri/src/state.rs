@@ -179,8 +179,8 @@ impl AppState {
     }
 
     /// 一轮自适应测活：
-    /// - 近期有真实流量成功的代理直接跳过（被动健康已覆盖，降低测活频次）；
-    /// - 活跃代理按基础间隔复检，失败/未知代理按更短的恢复间隔重测；
+    /// - 近期有真实流量成功的代理直接跳过（真实流量已覆盖心跳）；
+    /// - 活跃代理按基础间隔发起轻量心跳，失败/未知代理按更短的恢复间隔重测；
     /// - 到期代理并发测活，缩短整轮耗时。
     async fn run_probe_cycle(
         &self,
@@ -270,6 +270,7 @@ impl AppState {
         if result.success {
             self.db
                 .update_proxy_status(proxy.id, "active", Some(result.response_time), 1, 0)?;
+            self.proxy_runtime.record_probe_success(proxy.id).await;
             self.db.log_request(
                 Some(proxy.id),
                 &target_host,
@@ -313,7 +314,7 @@ impl AppState {
             Some(value) => value
                 .as_u64()
                 .ok_or_else(|| anyhow!("periodic_test_interval 必须是数字"))?,
-            None => 5 * 60 * 1000,
+            None => 3 * 60 * 1000,
         };
         if base_ms == 0 {
             return Err(anyhow!("periodic_test_interval 必须大于 0"));
@@ -331,7 +332,7 @@ impl AppState {
         Ok(ProbeSchedule {
             base_interval: Duration::from_millis(base_ms),
             recovery_interval: Duration::from_millis(recovery_ms),
-            // 真实流量在基础间隔内成功即视为“新鲜”，可跳过主动测活。
+            // 真实流量在基础间隔内成功即视为“新鲜”，可跳过主动心跳。
             active_window: Duration::from_millis(base_ms),
             concurrency,
             tick: Duration::from_millis(recovery_ms),

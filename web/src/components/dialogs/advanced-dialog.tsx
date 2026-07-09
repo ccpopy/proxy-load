@@ -75,7 +75,7 @@ export function AdvancedDialog({
             <div className="grid gap-6">
               <ConfigGroup title="基础配置" icon={Settings}>
                 <NumberField label="代理服务端口" value={config.proxy_port} onChange={(value) => update("proxy_port", value)} />
-                <NumberField label="活跃节点测活间隔（分钟）" value={Math.round(config.periodic_test_interval / 60000)} onChange={(value) => update("periodic_test_interval", value * 60000)} />
+                <NumberField label="活跃节点心跳间隔（分钟）" value={Math.round(config.periodic_test_interval / 60000)} onChange={(value) => update("periodic_test_interval", value * 60000)} />
                 <NumberField label="动态DNS刷新间隔（分钟）" value={Math.round(config.dns_refresh_interval / 60000)} onChange={(value) => update("dns_refresh_interval", value * 60000)} />
                 <FieldGroup className="grid gap-4 sm:grid-cols-2">
                   <NumberField label="失败节点重测间隔（秒）" value={Math.round(config.probe_recovery_interval / 1000)} onChange={(value) => update("probe_recovery_interval", value * 1000)} />

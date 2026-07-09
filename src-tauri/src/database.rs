@@ -1284,7 +1284,7 @@ pub fn default_advanced_config() -> Map<String, Value> {
         .unwrap_or(5678);
     Map::from_iter([
         ("proxy_port".to_string(), json!(proxy_port)),
-        ("periodic_test_interval".to_string(), json!(5 * 60 * 1000)),
+        ("periodic_test_interval".to_string(), json!(3 * 60 * 1000)),
         ("probe_recovery_interval".to_string(), json!(60 * 1000)),
         ("probe_concurrency".to_string(), json!(8)),
         ("dns_refresh_interval".to_string(), json!(5 * 60 * 1000)),

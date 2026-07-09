@@ -288,14 +288,11 @@ impl ProxyRuntime {
             if !self.can_attempt(proxy.id).await {
                 continue;
             }
-            let status = proxy.status.as_deref().unwrap_or("unknown");
-            if status == "active" || status == "unknown" || status == "testing" {
-                eligible.push(proxy);
-            }
+            eligible.push(proxy);
         }
 
         if eligible.is_empty() {
-            eligible = self.db.list_enabled_proxies()?;
+            return Err(anyhow!("没有可尝试的代理"));
         }
 
         self.order_proxies(eligible, algorithm, &group_key).await
@@ -337,7 +334,7 @@ impl ProxyRuntime {
                 proxies.sort_by(|a, b| score_of(b).total_cmp(&score_of(a)));
             }
         }
-        Ok(proxies)
+        Ok(prioritize_route_status(proxies))
     }
 
     async fn can_attempt(&self, proxy_id: i64) -> bool {
@@ -394,6 +391,10 @@ impl ProxyRuntime {
         let mut metrics = self.metrics.write().await;
         let metric = metrics.entry(proxy_id).or_insert_with(ProxyMetrics::new);
         metric.pushed_status = Some(status.to_string());
+    }
+
+    pub async fn record_probe_success(&self, proxy_id: i64) {
+        self.record_breaker_success(proxy_id).await;
     }
 
     /// 被动更新代理状态：只在状态发生变化时写库并广播事件，避免写放大。
@@ -1117,6 +1118,20 @@ fn score_of(proxy: &ProxyRecord) -> f64 {
         .clamp(0.01, 100.0)
 }
 
+fn prioritize_route_status(proxies: Vec<ProxyRecord>) -> Vec<ProxyRecord> {
+    let mut preferred = Vec::new();
+    let mut degraded = Vec::new();
+    for proxy in proxies {
+        if proxy.status.as_deref() == Some("inactive") {
+            degraded.push(proxy);
+        } else {
+            preferred.push(proxy);
+        }
+    }
+    preferred.extend(degraded);
+    preferred
+}
+
 fn stable_hash(value: &str) -> usize {
     let mut hash: i32 = 0;
     for byte in value.bytes() {
@@ -1238,6 +1253,55 @@ impl CircuitBreaker {
         if self.state == "HALF_OPEN" || self.failures >= self.threshold {
             self.state = "OPEN".to_string();
             self.next_attempt = now_millis() + self.timeout_ms;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prioritize_route_status_keeps_inactive_candidates_after_preferred() {
+        let ordered = prioritize_route_status(vec![
+            proxy_with_status(1, "inactive"),
+            proxy_with_status(2, "active"),
+            proxy_with_status(3, "unknown"),
+            proxy_with_status(4, "inactive"),
+        ]);
+
+        let ids = ordered.iter().map(|proxy| proxy.id).collect::<Vec<_>>();
+        assert_eq!(ids, vec![2, 3, 1, 4]);
+    }
+
+    fn proxy_with_status(id: i64, status: &str) -> ProxyRecord {
+        ProxyRecord {
+            id,
+            name: format!("proxy-{id}"),
+            proxy_type: "socks5".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: 1080,
+            username: None,
+            password: None,
+            status: Some(status.to_string()),
+            last_test: None,
+            response_time: None,
+            success_count: 0,
+            fail_count: 0,
+            priority: 999,
+            enabled: 1,
+            skip_cert_verify: 0,
+            bandwidth_bps: None,
+            bandwidth_test_time: None,
+            test_url: None,
+            test_timeout: None,
+            current_weight: None,
+            score: None,
+            active_connections: None,
+            recent_total: None,
+            recent_success: None,
+            recent_fails: None,
+            avg_success_rt: None,
         }
     }
 }
