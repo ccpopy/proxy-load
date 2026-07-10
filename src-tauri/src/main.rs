@@ -22,6 +22,7 @@ use tauri::{
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     App, AppHandle, Emitter, Manager, WindowEvent,
 };
+use tokio::time::{self, Duration, MissedTickBehavior};
 
 const BACKGROUND_RUN_KEY: &str = "background_run";
 const START_MINIMIZED_KEY: &str = "start_minimized";
@@ -65,15 +66,21 @@ pub fn run() {
             // 标记“用户主动退出”：托盘退出菜单会置位，避免退出流程被后台运行逻辑拦截。
             let quit_flag = Arc::new(AtomicBool::new(false));
 
-            match setup_tray(app, quit_flag.clone(), app_state.clone()) {
-                Ok(()) => spawn_tray_tooltip_updates(app.handle().clone(), app_state.clone()),
-                Err(error) => eprintln!("系统托盘初始化失败: {error:#}"),
-            }
+            let tray_ready = match setup_tray(app, quit_flag.clone(), app_state.clone()) {
+                Ok(()) => {
+                    spawn_tray_tooltip_updates(app.handle().clone(), app_state.clone());
+                    true
+                }
+                Err(error) => {
+                    eprintln!("系统托盘初始化失败: {error:#}");
+                    false
+                }
+            };
 
             if let Some(window) = app.get_webview_window("main") {
                 // 窗口在配置里默认隐藏（visible=false），这里按“启动最小化”开关决定是否展示，
                 // 既能实现启动即进托盘，也能避免默认启动时的白屏闪烁。
-                if read_flag(&app_state, START_MINIMIZED_KEY) {
+                if tray_ready && read_flag(&app_state, START_MINIMIZED_KEY) {
                     let _ = window.hide();
                     #[cfg(not(target_os = "macos"))]
                     let _ = window.set_skip_taskbar(true);
@@ -87,7 +94,8 @@ pub fn run() {
                 let close_window = window.clone();
                 window.on_window_event(move |event| {
                     if let WindowEvent::CloseRequested { api, .. } = event {
-                        if !close_flag.load(Ordering::SeqCst)
+                        if tray_ready
+                            && !close_flag.load(Ordering::SeqCst)
                             && read_flag(&close_state, BACKGROUND_RUN_KEY)
                         {
                             // 后台运行：拦截关闭，仅把窗口隐藏到托盘，进程继续运行。
@@ -130,7 +138,6 @@ pub fn run() {
             commands::stats_targets,
             commands::stats_failed_targets,
             commands::stats_circuit_breakers,
-            commands::stats_connection_pools,
             commands::list_dns_mappings,
             commands::create_dns_mapping,
             commands::update_dns_mapping,
@@ -212,20 +219,33 @@ fn spawn_tray_tooltip_updates(app_handle: AppHandle, state: Arc<AppState>) {
         }
 
         let mut events = state.events.subscribe();
+        let mut ticker = time::interval(Duration::from_secs(1));
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        ticker.tick().await;
+        let mut request_refresh_pending = false;
         loop {
-            match events.recv().await {
-                Ok(event) if should_refresh_tray_tooltip(&event) => {
+            tokio::select! {
+                _ = ticker.tick(), if request_refresh_pending => {
+                    request_refresh_pending = false;
                     if let Err(error) = update_tray_tooltip(&app_handle, &state).await {
                         eprintln!("系统托盘状态刷新失败: {error:#}");
                     }
                 }
-                Ok(_) => {}
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                    if let Err(error) = update_tray_tooltip(&app_handle, &state).await {
-                        eprintln!("系统托盘状态刷新失败: {error:#}");
+                message = events.recv() => match message {
+                    Ok(event) if event.event_type == "request_logged" => {
+                        request_refresh_pending = true;
                     }
+                    Ok(event) if should_refresh_tray_tooltip(&event) => {
+                        if let Err(error) = update_tray_tooltip(&app_handle, &state).await {
+                            eprintln!("系统托盘状态刷新失败: {error:#}");
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        request_refresh_pending = true;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
         }
     });
@@ -235,7 +255,6 @@ fn should_refresh_tray_tooltip(event: &ServerEvent) -> bool {
     matches!(
         event.event_type.as_str(),
         "proxy_service_status_changed"
-            | "request_logged"
             | "traffic_logs_cleared"
             | "proxy_testing"
             | "proxy_tested"
@@ -272,9 +291,9 @@ async fn build_tray_tooltip(state: &AppState) -> Result<String> {
     }
 
     let avg_label = if total_requests > 0 && avg_response_time > 0 {
-        format!("平均 {avg_response_time}ms")
+        format!("平均建连 {avg_response_time}ms")
     } else {
-        "平均 --".to_string()
+        "平均建连 --".to_string()
     };
 
     Ok(format!(

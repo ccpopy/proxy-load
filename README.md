@@ -17,7 +17,7 @@
 - 前端界面：React、Vite、TypeScript、shadcn/ui、lucide-react、Recharts
 - 数据存储：SQLite，本地持久化代理、分组、DNS 映射、设置和请求日志
 - 应用通信：前端通过 Tauri IPC 命令和事件访问 Rust 后端，不再启动独立管理 API 服务
-- 代理服务端口：默认 `5678`
+- 代理监听：默认 `127.0.0.1:5678`，只有显式开启“允许局域网连接”后才监听 `0.0.0.0`
 
 正式应用只对外启动代理服务端口。开发时 Tauri 会拉起 Vite 页面服务 `1420` 供应用窗口加载前端资源，但页面数据仍通过 Tauri 应用内通信获取，不支持单独用普通浏览器直连管理 API 调试。
 
@@ -25,10 +25,13 @@
 
 - 代理配置管理：新增、编辑、删除、启用、停用和连通性测试。
 - DNS 映射：按域名覆盖解析结果。
-- 代理分组：按域名规则选择代理组；未命中分组时使用全局已启用代理逐个尝试。
-- 负载设置：支持 `adaptive`、`weighted_round_robin`、`least_connections`、`sticky_host`。
-- 高级配置：代理端口、日志保留、连接池、熔断器、快速失败等运行参数。
-- 系统状态：请求趋势、响应耗时、代理使用排行、目标资源排行。
+- 代理分组：优先使用最具体的域名规则，未命中时使用默认分组；没有默认分组时使用全局已启用代理。
+- 负载设置：支持 `adaptive`、`round_robin`、`least_connections`、`sticky_host`。
+- 混合入站：同一端口支持 SOCKS5、HTTP 和用于 HTTPS 目标的 HTTP CONNECT。
+- 可选入站认证：默认关闭；开启后 SOCKS5 和 HTTP/HTTPS CONNECT 共用一组持久化用户名密码。
+- 自适应测活：默认每三分钟发送轻量请求，真实流量成功可替代当轮心跳，连续失败达到阈值才把节点降级。
+- 高级配置：监听地址、入站认证、测活、日志保留、熔断器和快速失败等真实运行参数。
+- 系统状态：请求趋势、代理建连耗时、代理使用排行、目标资源排行。
 - 流量日志：分页查看请求日志，支持清空日志。
 - 实时刷新：通过 Tauri 事件推送代理、DNS、分组和请求日志变化。
 - 检查更新：开发环境禁止检查更新；生产环境从 GitHub Releases 获取更新包，并按应用所在目录更新。
@@ -45,7 +48,7 @@ proxy-load/
 │   ├── src/
 │   │   ├── commands.rs        # Tauri IPC 命令、事件和更新检查
 │   │   ├── database.rs        # SQLite schema、迁移和数据访问
-│   │   ├── proxy.rs           # 代理服务、负载均衡、连接池和熔断器
+│   │   ├── proxy.rs           # 代理服务、入站认证、负载均衡和熔断器
 │   │   ├── proxy_tester.rs    # 代理连通性测试
 │   │   ├── state.rs           # 应用状态和代理服务启动参数
 │   │   └── version.rs         # 版本信息
@@ -280,14 +283,18 @@ workflow 会创建正式 GitHub Release，并上传 Tauri bundle 和 Windows 便
 | `PROXY_PORT` | `5678` | 首次初始化代理服务端口 |
 | `DATA_DIR` | 未设置 | 强制指定 SQLite 数据目录；未设置时使用上方平台默认数据目录 |
 | `proxy_port` | `5678` | 高级配置中的代理端口，保存于 SQLite |
+| `allow_lan` | `false` | 是否监听所有网卡；修改后需要重启应用 |
+| `inbound_auth_enabled` | `false` | 是否要求 SOCKS5/HTTP 入站用户名密码认证 |
 | `periodic_test_interval` | `180000` | 活跃节点心跳测活间隔，单位毫秒 |
-| `log_retention_days` | `7` | 请求日志保留天数 |
-| `stats_retention_days` | `30` | 统计数据保留天数 |
-| `pool_max_size` | `50` | 连接池最大连接数 |
+| `probe_recovery_interval` | `180000` | 失败或未知节点重测间隔，单位毫秒 |
+| `probe_failure_threshold` | `2` | 定时测活连续失败多少次后标记离线 |
+| `log_retention_days` | `7` | 流量日志及其派生统计保留天数 |
 | `circuit_failure_threshold` | `5` | 熔断失败阈值 |
 | `failfast_enabled` | `true` | 是否启用快速失败 |
 
-部分高级配置保存后需要重启应用才能完全生效，尤其是代理服务端口。
+代理端口和“允许局域网连接”修改后需要重启应用；入站认证、测活、熔断和快速失败参数会立即用于新连接。入站认证密码保存在本地 SQLite 设置表中，以便用户日后在高级设置中重新查看；能够读取本机数据目录的用户也能读取该凭据。SOCKS5 用户名密码和 HTTP Basic 认证本身不加密，开放局域网监听时应只在可信网络中使用。
+
+“HTTPS 代理”在这里指客户端通过 HTTP CONNECT 访问 HTTPS 目标，并不是带服务器证书的 TLS 加密代理监听端口。浏览器或应用可把 HTTP 和 HTTPS 代理地址都设置为同一个 `127.0.0.1:5678`，SOCKS5 也使用该端口。
 
 ## 数据库
 
@@ -300,7 +307,6 @@ workflow 会创建正式 GitHub Release，并上传 Tauri bundle 和 Windows 便
 - `proxy_group_domains`：分组域名规则。
 - `proxy_group_members`：分组成员代理。
 - `request_logs`：请求流量日志。
-- `load_stats`：负载统计数据。
 
 Rust 后端启动时会自动创建表，并补齐缺失字段。
 

@@ -105,6 +105,15 @@ export function App() {
   const [groupDialog, setGroupDialog] = useState<ProxyGroup | "new" | null>(null)
   const [advancedOpen, setAdvancedOpen] = useState(false)
   const [aboutOpen, setAboutOpen] = useState(false)
+  const trafficViewRef = useRef({
+    page: 1,
+    pageSize: INITIAL_TRAFFIC_PAGE_SIZE,
+    proxySearch: "",
+  })
+  const runtimeRefreshTimerRef = useRef<number | null>(null)
+  const runtimeRefreshPendingRef = useRef(false)
+  const runtimeRefreshNeedsLogsRef = useRef(false)
+  const sectionRef = useRef<SectionKey>(section)
 
   useEffect(() => {
     document.documentElement.classList.toggle("dark", theme === "dark")
@@ -133,7 +142,6 @@ export function App() {
       nextDnsMappings,
       nextGroups,
       nextSettings,
-      nextAdvanced,
       nextOverview,
       nextHourly,
       nextProxyUsage,
@@ -145,7 +153,6 @@ export function App() {
       api<DnsMapping[]>("/api/dns-mappings"),
       api<ProxyGroup[]>("/api/proxy-groups"),
       api<Record<string, string>>("/api/settings"),
-      api<AdvancedConfig>("/api/advanced-config"),
       api<Overview>("/api/stats/overview"),
       api<HourlyStat[]>("/api/stats/hourly"),
       api<ProxyUsageStat[]>("/api/stats/proxy-usage"),
@@ -157,7 +164,6 @@ export function App() {
     setDnsMappings(nextDnsMappings)
     setGroups(nextGroups)
     setSettings(nextSettings)
-    setAdvanced(nextAdvanced)
     setOverview(nextOverview)
     setHourlyStats(nextHourly)
     setProxyUsage(nextProxyUsage)
@@ -165,6 +171,55 @@ export function App() {
     setVersion(nextVersion)
     setConnectionState(proxyConnectionState(nextProxyServiceStatus))
   }, [])
+
+  const refreshRuntimeData = useCallback(async () => {
+    const [nextProxies, nextOverview] = await Promise.all([
+      api<ProxyRecord[]>("/api/proxies"),
+      api<Overview>("/api/stats/overview"),
+    ])
+    setProxies(nextProxies)
+    setOverview(nextOverview)
+    if (sectionRef.current !== "status") return
+
+    const [nextHourly, nextProxyUsage, nextTargets] = await Promise.all([
+      api<HourlyStat[]>("/api/stats/hourly"),
+      api<ProxyUsageStat[]>("/api/stats/proxy-usage"),
+      api<TargetStat[]>("/api/stats/targets"),
+    ])
+    setHourlyStats(nextHourly)
+    setProxyUsage(nextProxyUsage)
+    setTargetStats(nextTargets)
+  }, [])
+
+  const scheduleRuntimeRefresh = useCallback(
+    (includeLogs: boolean) => {
+      runtimeRefreshPendingRef.current = true
+      runtimeRefreshNeedsLogsRef.current ||= includeLogs
+      if (runtimeRefreshTimerRef.current !== null) return
+
+      runtimeRefreshTimerRef.current = window.setTimeout(async () => {
+        runtimeRefreshPendingRef.current = false
+        const loadLogs =
+          runtimeRefreshNeedsLogsRef.current && sectionRef.current === "status"
+        runtimeRefreshNeedsLogsRef.current = false
+        try {
+          const view = trafficViewRef.current
+          await Promise.all([
+            refreshRuntimeData(),
+            loadLogs
+              ? loadTrafficLogs(view.page, view.pageSize, view.proxySearch)
+              : Promise.resolve(),
+          ])
+        } catch (error) {
+          toast.error(describeError(error))
+        } finally {
+          runtimeRefreshTimerRef.current = null
+          if (runtimeRefreshPendingRef.current) scheduleRuntimeRefresh(false)
+        }
+      }, 750)
+    },
+    [loadTrafficLogs, refreshRuntimeData]
+  )
 
   const installUpdate = useCallback(
     async (info: UpdateInfo | null, useMirror = useUpdateMirror) => {
@@ -295,13 +350,25 @@ export function App() {
     let closed = false
     let unlisten: (() => void) | undefined
     onServerEvent((message: ServerEvent) => {
+      if (message.type === "request_logged") {
+        scheduleRuntimeRefresh(true)
+        return
+      }
+      if (message.type === "proxy_testing" || message.type === "proxy_tested") {
+        scheduleRuntimeRefresh(false)
+        return
+      }
+      if (message.type === "proxy_service_status_changed") {
+        api<ProxyServiceStatus>("/api/proxy-service-status")
+          .then((status) => setConnectionState(proxyConnectionState(status)))
+          .catch((error) => toast.error(describeError(error)))
+        return
+      }
       if (
         [
           "proxy_created",
           "proxy_updated",
           "proxy_deleted",
-          "proxy_testing",
-          "proxy_tested",
           "dns_mapping_added",
           "dns_mapping_updated",
           "dns_mapping_deleted",
@@ -310,18 +377,9 @@ export function App() {
           "proxy_group_updated",
           "proxy_group_deleted",
           "config_imported",
-          "request_logged",
-          "proxy_service_status_changed",
         ].includes(message.type)
       ) {
-        Promise.all([
-          refresh(),
-          loadTrafficLogs(
-            trafficLogs.page,
-            trafficLogs.pageSize,
-            trafficLogProxySearch
-          ),
-        ]).catch((error) => toast.error(describeError(error)))
+        refresh().catch((error) => toast.error(describeError(error)))
       }
     })
       .then((dispose) => {
@@ -343,12 +401,27 @@ export function App() {
     }
   }, [
     apiReady,
-    loadTrafficLogs,
     refresh,
-    trafficLogProxySearch,
-    trafficLogs.page,
-    trafficLogs.pageSize,
+    scheduleRuntimeRefresh,
   ])
+
+  useEffect(() => {
+    trafficViewRef.current = {
+      page: trafficLogs.page,
+      pageSize: trafficLogs.pageSize,
+      proxySearch: trafficLogProxySearch,
+    }
+  }, [trafficLogProxySearch, trafficLogs.page, trafficLogs.pageSize])
+
+  useEffect(
+    () => () => {
+      if (runtimeRefreshTimerRef.current !== null) {
+        window.clearTimeout(runtimeRefreshTimerRef.current)
+      }
+      runtimeRefreshPendingRef.current = false
+    },
+    []
+  )
 
   const currentTitle =
     navItems.find((item) => item.key === section)?.label ?? "代理配置"
@@ -378,14 +451,35 @@ export function App() {
     }
   }
 
+  async function handleOpenAdvanced() {
+    try {
+      setAdvanced(await api<AdvancedConfig>("/api/advanced-config"))
+      setAdvancedOpen(true)
+    } catch (error) {
+      toast.error(commandErrorMessage(error, "高级配置读取失败"))
+    }
+  }
+
+  function handleSectionChange(nextSection: SectionKey) {
+    setSection(nextSection)
+    sectionRef.current = nextSection
+    if (nextSection === "status") {
+      const view = trafficViewRef.current
+      Promise.all([
+        refreshRuntimeData(),
+        loadTrafficLogs(view.page, view.pageSize, view.proxySearch),
+      ]).catch((error) => toast.error(describeError(error)))
+    }
+  }
+
   return (
     <SidebarProvider className="h-svh overflow-hidden">
       <AppSidebar
         section={section}
-        onSectionChange={setSection}
+        onSectionChange={handleSectionChange}
         theme={theme}
         onToggleTheme={() => setTheme(theme === "dark" ? "light" : "dark")}
-        onOpenAdvanced={() => setAdvancedOpen(true)}
+        onOpenAdvanced={handleOpenAdvanced}
         onOpenAbout={() => setAboutOpen(true)}
       />
 
@@ -471,11 +565,14 @@ export function App() {
                     loadTrafficLogs(1, pageSize, trafficLogProxySearch)
                   }
                   onChanged={async () => {
-                    await loadTrafficLogs(
-                      1,
-                      trafficLogs.pageSize,
-                      trafficLogProxySearch
-                    )
+                    await Promise.all([
+                      refreshRuntimeData(),
+                      loadTrafficLogs(
+                        1,
+                        trafficLogs.pageSize,
+                        trafficLogProxySearch
+                      ),
+                    ])
                   }}
                 />
               )}
@@ -509,13 +606,17 @@ export function App() {
           await refresh()
         }}
       />
-      <AdvancedDialog
-        open={advancedOpen}
-        config={advanced}
-        onOpenChange={setAdvancedOpen}
-        onConfigChange={setAdvanced}
-        onChanged={refresh}
-      />
+      {advancedOpen && (
+        <AdvancedDialog
+          open
+          config={advanced}
+          onOpenChange={(open) => {
+            setAdvancedOpen(open)
+            if (!open) setAdvanced(defaultAdvanced)
+          }}
+          onChanged={refresh}
+        />
+      )}
       <AboutDialog
         open={aboutOpen}
         onOpenChange={setAboutOpen}

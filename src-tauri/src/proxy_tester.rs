@@ -1,7 +1,10 @@
-use std::time::{Duration, Instant};
+use std::{
+    net::Ipv6Addr,
+    time::{Duration, Instant},
+};
 
 use anyhow::{anyhow, Context, Result};
-use reqwest::{Client, Proxy};
+use reqwest::{Client, Proxy, StatusCode};
 use url::Url;
 
 use crate::models::{ProxyRecord, TestResult};
@@ -41,7 +44,13 @@ async fn execute_proxy_test(proxy: &ProxyRecord, test_url: &str, timeout_ms: u64
         .build()?;
 
     let response = client.get(target).send().await?;
-    let status = response.status();
+    validate_probe_status(response.status())
+}
+
+fn validate_probe_status(status: StatusCode) -> Result<u16> {
+    if status == StatusCode::PROXY_AUTHENTICATION_REQUIRED {
+        return Err(anyhow!("上游代理认证失败: HTTP 407"));
+    }
     if status.as_u16() < 200 || status.as_u16() >= 500 {
         return Err(anyhow!("HTTP状态码不符合连通性策略: {}", status.as_u16()));
     }
@@ -50,13 +59,17 @@ async fn execute_proxy_test(proxy: &ProxyRecord, test_url: &str, timeout_ms: u64
 
 fn build_proxy_url(proxy: &ProxyRecord) -> Result<Url> {
     let scheme = match proxy.proxy_type.as_str() {
-        "http" => "http",
-        "https" => "https",
+        "http" | "https" => "http",
         "socks4" => "socks4a",
         "socks5" => "socks5h",
         other => return Err(anyhow!("不支持的代理类型: {other}")),
     };
-    let mut url = Url::parse(&format!("{scheme}://{}:{}", proxy.host, proxy.port))?;
+    let host = if proxy.host.parse::<Ipv6Addr>().is_ok() {
+        format!("[{}]", proxy.host)
+    } else {
+        proxy.host.clone()
+    };
+    let mut url = Url::parse(&format!("{scheme}://{host}:{}", proxy.port))?;
     if let Some(username) = proxy.username.as_deref().filter(|value| !value.is_empty()) {
         url.set_username(username)
             .map_err(|_| anyhow!("代理用户名包含非法字符"))?;
@@ -70,4 +83,16 @@ fn build_proxy_url(proxy: &ProxyRecord) -> Result<Url> {
 
 fn elapsed_ms(start: Instant) -> i64 {
     start.elapsed().as_millis() as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proxy_authentication_required_is_not_a_successful_probe() {
+        assert!(validate_probe_status(StatusCode::PROXY_AUTHENTICATION_REQUIRED).is_err());
+        assert_eq!(validate_probe_status(StatusCode::NOT_FOUND).unwrap(), 404);
+        assert!(validate_probe_status(StatusCode::BAD_GATEWAY).is_err());
+    }
 }

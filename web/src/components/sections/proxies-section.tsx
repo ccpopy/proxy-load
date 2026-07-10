@@ -142,8 +142,8 @@ export function ProxiesSection({
                             : "—"
                         }
                       />
-                      <Stat label="成功" value={proxy.success_count} tone="success" />
-                      <Stat label="失败" value={proxy.fail_count} tone="danger" />
+                      <Stat label="测活成功" value={proxy.success_count} tone="success" />
+                      <Stat label="测活失败" value={proxy.fail_count} tone="danger" />
                     </div>
                   </div>
                   <div className="flex items-center gap-2">

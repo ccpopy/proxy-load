@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core"
 import { listen } from "@tauri-apps/api/event"
 
 export interface ServiceInfo {
+  proxy_host: string
   proxy_port: number
   database_path: string
   started_at: number
@@ -165,10 +166,6 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   if (method === "GET" && route.pathname === "/api/stats/circuit-breakers") {
     return command<T>("stats_circuit_breakers")
   }
-  if (method === "GET" && route.pathname === "/api/stats/connection-pools") {
-    return command<T>("stats_connection_pools")
-  }
-
   if (method === "GET" && route.pathname === "/api/traffic-logs") {
     const args: CommandArgs = {
       page: Number(route.searchParams.get("page") ?? "1"),

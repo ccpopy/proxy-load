@@ -39,44 +39,34 @@ export const emptyOverview: Overview = {
 
 export const defaultAdvanced: AdvancedConfig = {
   proxy_port: 5678,
+  allow_lan: false,
+  inbound_auth_enabled: false,
+  inbound_auth_username: "",
+  inbound_auth_password: "",
   periodic_test_interval: 180000,
-  probe_recovery_interval: 60000,
+  probe_recovery_interval: 180000,
   probe_concurrency: 8,
+  probe_failure_threshold: 2,
   dns_refresh_interval: 300000,
   background_run: false,
   start_minimized: false,
   log_retention_days: 7,
-  stats_retention_days: 30,
-  pool_max_size: 50,
-  pool_idle_timeout: 30000,
-  pool_wait_timeout: 10000,
   circuit_failure_threshold: 5,
   circuit_timeout: 60000,
-  circuit_half_open_attempts: 2,
-  health_check_interval: 30000,
-  health_degrade_threshold: 0.5,
-  health_recover_threshold: 0.8,
   failfast_enabled: true,
   failfast_max_attempts: 3,
   failfast_attempt_timeout: 10000,
   failfast_total_timeout: 30000,
-  algorithm_weights: {
-    responseTime: 0.3,
-    successRate: 0.25,
-    connections: 0.2,
-    stability: 0.15,
-    recentPerf: 0.1,
-  },
 }
 
 export const trafficChartConfig = {
   total: { label: "总请求", color: "var(--chart-1)" },
-  success: { label: "成功", color: "var(--chart-2)" },
-  failed: { label: "失败", color: "var(--chart-3)" },
+  success: { label: "建连成功", color: "var(--chart-2)" },
+  failed: { label: "建连失败", color: "var(--chart-3)" },
 } satisfies ChartConfig
 
 export const latencyChartConfig = {
-  avg: { label: "平均响应", color: "var(--chart-1)" },
+  avg: { label: "平均建连", color: "var(--chart-1)" },
 } satisfies ChartConfig
 
 export const barChartConfig = {

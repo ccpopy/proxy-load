@@ -64,7 +64,7 @@ export function MetricBar({
         accent="var(--primary)"
       />
       <MetricTile
-        label="平均响应"
+        label="平均建连"
         value={`${avgResponseMs} ms`}
         icon={Gauge}
         accent="var(--chart-4)"

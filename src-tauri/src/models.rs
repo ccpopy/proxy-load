@@ -19,23 +19,12 @@ pub struct ProxyRecord {
     pub priority: i64,
     pub enabled: i64,
     pub skip_cert_verify: i64,
-    pub bandwidth_bps: Option<i64>,
-    pub bandwidth_test_time: Option<String>,
     pub test_url: Option<String>,
     pub test_timeout: Option<i64>,
-    pub current_weight: Option<f64>,
     #[serde(rename = "_score", skip_serializing_if = "Option::is_none")]
     pub score: Option<f64>,
     #[serde(rename = "_activeConnections", skip_serializing_if = "Option::is_none")]
     pub active_connections: Option<i64>,
-    #[serde(rename = "_recentTotal", skip_serializing_if = "Option::is_none")]
-    pub recent_total: Option<i64>,
-    #[serde(rename = "_recentSuccess", skip_serializing_if = "Option::is_none")]
-    pub recent_success: Option<i64>,
-    #[serde(rename = "_recentFails", skip_serializing_if = "Option::is_none")]
-    pub recent_fails: Option<i64>,
-    #[serde(rename = "_avgSuccRt", skip_serializing_if = "Option::is_none")]
-    pub avg_success_rt: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

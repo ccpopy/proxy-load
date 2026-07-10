@@ -20,7 +20,7 @@ export interface TestResult {
 export interface ProxyRecord {
   id: number
   name: string
-  type: "http" | "https" | "socks4" | "socks5"
+  type: "http" | "socks4" | "socks5"
   host: string
   port: number
   username?: string | null
@@ -35,7 +35,6 @@ export interface ProxyRecord {
   skip_cert_verify: number
   test_url?: string | null
   test_timeout?: number | null
-  current_weight?: number | null
   _score?: number
   _activeConnections?: number
 }
@@ -190,32 +189,22 @@ export interface ExportResult {
 
 export interface AdvancedConfig {
   proxy_port: number
+  allow_lan: boolean
+  inbound_auth_enabled: boolean
+  inbound_auth_username: string
+  inbound_auth_password: string
   periodic_test_interval: number
   probe_recovery_interval: number
   probe_concurrency: number
+  probe_failure_threshold: number
   dns_refresh_interval: number
   background_run: boolean
   start_minimized: boolean
   log_retention_days: number
-  stats_retention_days: number
-  pool_max_size: number
-  pool_idle_timeout: number
-  pool_wait_timeout: number
   circuit_failure_threshold: number
   circuit_timeout: number
-  circuit_half_open_attempts: number
-  health_check_interval: number
-  health_degrade_threshold: number
-  health_recover_threshold: number
   failfast_enabled: boolean
   failfast_max_attempts: number
   failfast_attempt_timeout: number
   failfast_total_timeout: number
-  algorithm_weights: {
-    responseTime: number
-    successRate: number
-    connections: number
-    stability: number
-    recentPerf: number
-  }
 }

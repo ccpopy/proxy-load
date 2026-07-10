@@ -85,7 +85,10 @@ export function AboutDialog({
             )}
             {version?.arch && <Meta label="架构" value={version.arch} />}
             {serviceInfo && (
-              <Meta label="代理端口" value={serviceInfo.proxy_port} />
+              <Meta
+                label="代理监听"
+                value={`${serviceInfo.proxy_host}:${serviceInfo.proxy_port}`}
+              />
             )}
           </div>
 

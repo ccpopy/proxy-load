@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react"
 import { Check, ChevronsUpDown, Save } from "lucide-react"
 import { toast } from "sonner"
 
-import { api } from "@/lib/api"
+import { api, commandErrorMessage } from "@/lib/api"
 import { cn } from "@/lib/utils"
 import type { ProxyRecord } from "@/types"
 import { Button } from "@/components/ui/button"
@@ -78,7 +78,7 @@ export function ProxyDialog({
       host: proxy?.host ?? "",
       port: proxy?.port ?? 1080,
       username: proxy?.username ?? "",
-      password: proxy?.password ?? "",
+      password: proxy?.type === "socks4" ? "" : (proxy?.password ?? ""),
       enabled: proxy ? proxy.enabled === 1 : true,
       test_url: proxy?.test_url ?? "",
       test_timeout: proxy?.test_timeout ? String(proxy.test_timeout) : "",
@@ -115,12 +115,16 @@ export function ProxyDialog({
       test_timeout: form.test_timeout ? Number(form.test_timeout) : null,
       skip_cert_verify: form.skip_cert_verify ? 1 : 0,
     }
-    await api(proxy ? `/api/proxies/${proxy.id}` : "/api/proxies", {
-      method: proxy ? "PUT" : "POST",
-      body: JSON.stringify(body),
-    })
-    toast.success(proxy ? "代理已更新" : "代理已创建")
-    await onSaved()
+    try {
+      await api(proxy ? `/api/proxies/${proxy.id}` : "/api/proxies", {
+        method: proxy ? "PUT" : "POST",
+        body: JSON.stringify(body),
+      })
+      toast.success(proxy ? "代理已更新" : "代理已创建")
+      await onSaved()
+    } catch (error) {
+      toast.error(commandErrorMessage(error, proxy ? "代理更新失败" : "代理创建失败"))
+    }
   }
 
   return (
@@ -155,15 +159,20 @@ export function ProxyDialog({
               <FieldLabel>类型</FieldLabel>
               <Select
                 value={form.type}
-                onValueChange={(type) => setForm({ ...form, type })}
+                onValueChange={(type) =>
+                  setForm({
+                    ...form,
+                    type,
+                    password: type === "socks4" ? "" : form.password,
+                  })
+                }
               >
                 <SelectTrigger className="w-full">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
                   <SelectGroup>
-                    <SelectItem value="http">HTTP</SelectItem>
-                    <SelectItem value="https">HTTPS</SelectItem>
+                    <SelectItem value="http">HTTP（支持 HTTPS CONNECT）</SelectItem>
                     <SelectItem value="socks4">SOCKS4</SelectItem>
                     <SelectItem value="socks5">SOCKS5</SelectItem>
                   </SelectGroup>
@@ -171,7 +180,7 @@ export function ProxyDialog({
               </Select>
               {form.type === "socks4" && (
                 <FieldDescription className="text-amber-600 dark:text-amber-500">
-                  SOCKS4 协议不支持用户名/密码认证：用户名仅作为 USERID 发送，密码会被忽略。若上游代理需要账号密码，请改用 SOCKS5。
+                  SOCKS4 仅支持 USERID，不支持密码认证。若上游代理需要账号密码，请改用 SOCKS5。
                 </FieldDescription>
               )}
             </Field>
@@ -211,6 +220,7 @@ export function ProxyDialog({
                 <FieldLabel>密码</FieldLabel>
                 <Input
                   type="password"
+                  disabled={form.type === "socks4"}
                   value={form.password}
                   onChange={(event) =>
                     setForm({ ...form, password: event.target.value })
@@ -229,6 +239,9 @@ export function ProxyDialog({
             <Field>
               <FieldLabel>超时时间（秒）</FieldLabel>
               <Input
+                type="number"
+                min={1}
+                max={300}
                 className="font-mono tabular-nums"
                 value={form.test_timeout}
                 onChange={(event) =>

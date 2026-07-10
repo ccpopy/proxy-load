@@ -11,7 +11,7 @@ import {
 } from "recharts"
 import { toast } from "sonner"
 
-import { api } from "@/lib/api"
+import { api, commandErrorMessage } from "@/lib/api"
 import { cn } from "@/lib/utils"
 import {
   barChartConfig,
@@ -134,18 +134,18 @@ export function StatusSection({
       <Card>
         <CardHeader>
           <CardTitle>运行状态</CardTitle>
-          <CardDescription>24小时请求、失败和响应概览</CardDescription>
+          <CardDescription>24小时请求、失败和建连耗时概览</CardDescription>
         </CardHeader>
         <CardContent className="grid gap-4 md:grid-cols-4">
           <MetricTile label="活跃代理" value={overview.activeProxies} />
-          <MetricTile label="成功请求" value={overview.successRequests} />
-          <MetricTile label="失败请求" value={overview.failedRequests} />
+          <MetricTile label="建连成功" value={overview.successRequests} />
+          <MetricTile label="建连失败" value={overview.failedRequests} />
           <MetricTile label="运行时长" value={formatDuration(overview.uptime)} />
         </CardContent>
       </Card>
 
       <div className="grid gap-6 xl:grid-cols-2">
-        <ChartCard title="请求趋势" description="最近24小时成功和失败请求">
+        <ChartCard title="请求趋势" description="最近24小时代理建连结果">
           <ChartContainer config={trafficChartConfig} className="h-64 w-full">
             <AreaChart data={hourlyData}>
               <CartesianGrid vertical={false} />
@@ -158,7 +158,7 @@ export function StatusSection({
           </ChartContainer>
         </ChartCard>
 
-        <ChartCard title="响应耗时" description="最近24小时平均响应时间">
+        <ChartCard title="建连耗时" description="最近24小时平均代理建连时间">
           <ChartContainer config={latencyChartConfig} className="h-64 w-full">
             <AreaChart data={hourlyData}>
               <CartesianGrid vertical={false} />
@@ -242,9 +242,13 @@ export function StatusSection({
             <Button
               variant="destructive"
               onClick={async () => {
-                await api("/api/traffic-logs", { method: "DELETE" })
-                toast.success("流量日志已清除")
-                await onChanged()
+                try {
+                  await api("/api/traffic-logs", { method: "DELETE" })
+                  toast.success("流量日志及对应统计已清除")
+                  await onChanged()
+                } catch (error) {
+                  toast.error(commandErrorMessage(error, "流量日志清除失败"))
+                }
               }}
             >
               <Trash2 data-icon="inline-start" />
@@ -261,7 +265,7 @@ export function StatusSection({
                 <TableHead>代理</TableHead>
                 <TableHead>状态</TableHead>
                 <TableHead>类型</TableHead>
-                <TableHead className="text-right">响应</TableHead>
+                <TableHead className="text-right">建连</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -275,20 +279,20 @@ export function StatusSection({
                   </TableCell>
                   <TableCell>{log.proxy_name || "-"}</TableCell>
                   <TableCell>
-                    {log.success ? (
+                      {log.success ? (
                       <Badge
                         variant="outline"
                         className="border-success/30 bg-success/10 text-success"
                       >
-                        成功
+                        建连成功
                       </Badge>
                     ) : (
-                      <Badge variant="destructive">失败</Badge>
+                      <Badge variant="destructive">建连失败</Badge>
                     )}
                   </TableCell>
                   <TableCell>
                     <span className="text-muted-foreground">
-                      {log.result_type || "-"}
+                      {resultTypeLabel(log.result_type)}
                     </span>
                   </TableCell>
                   <TableCell className="text-right font-mono tabular-nums">
@@ -410,6 +414,23 @@ function MetricTile({
       <div className="mt-2 font-mono text-xl tabular-nums">{value}</div>
     </div>
   )
+}
+
+function resultTypeLabel(resultType?: string | null) {
+  switch (resultType) {
+    case "proxy_connected":
+    case "direct_success":
+      return "代理建连"
+    case "request_forwarded":
+      return "请求已转发"
+    case "client_handshake_error":
+    case "tunnel_setup_error":
+      return "隧道建立失败"
+    case "proxy_exhausted":
+      return "候选代理耗尽"
+    default:
+      return resultType || "-"
+  }
 }
 
 function formatTarget(host?: string | null, port?: number | null) {

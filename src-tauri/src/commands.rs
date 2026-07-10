@@ -22,6 +22,7 @@ use serde_json::{json, Map, Value};
 use tauri::AppHandle;
 
 use crate::{
+    database::default_advanced_config,
     models::{ConfigBundle, DnsInput, ProxyGroupInput, ProxyInput, CONFIG_BUNDLE_KIND},
     proxy::ProxyServiceStatus,
     state::AppState,
@@ -112,23 +113,11 @@ impl From<reqwest::Error> for CommandError {
 pub async fn list_proxies(state: tauri::State<'_, Arc<AppState>>) -> CommandResult<Value> {
     let state = state.inner().clone();
     let mut proxies = state.db.list_proxies()?;
-    let mode = state
-        .db
-        .settings_map()?
-        .get("load_mode")
-        .cloned()
-        .unwrap_or_else(|| "auto".to_string());
-
-    if mode == "auto" {
-        let stats = state.proxy_runtime.stats().await;
-        for proxy in &mut proxies {
-            if let Some(stat) = stats
-                .iter()
-                .find(|item| item.get("proxyId").and_then(Value::as_i64) == Some(proxy.id))
-            {
-                proxy.score = stat.get("weight").and_then(Value::as_f64);
-                proxy.active_connections = stat.get("activeConnections").and_then(Value::as_i64);
-            }
+    let stats = state.proxy_runtime.stats().await;
+    for proxy in &mut proxies {
+        if let Some(stat) = stats.get(&proxy.id) {
+            proxy.score = Some(stat.score);
+            proxy.active_connections = Some(stat.active_connections);
         }
     }
 
@@ -150,24 +139,31 @@ pub fn create_proxy(
     input: ProxyInput,
 ) -> CommandResult<Value> {
     let proxy = state.db.create_proxy(input)?;
+    state.notify_proxy_config_changed();
     state.emit("proxy_created", serde_json::to_value(&proxy)?);
     Ok(serde_json::to_value(proxy)?)
 }
 
 #[tauri::command]
-pub fn update_proxy(
+pub async fn update_proxy(
     state: tauri::State<'_, Arc<AppState>>,
     id: i64,
     input: ProxyInput,
 ) -> CommandResult<Value> {
-    let proxy = state.db.update_proxy(id, input)?;
+    let _status_guard = state.proxy_runtime.lock_proxy_status(id).await;
+    let (proxy, connection_changed) = state.db.update_proxy(id, input)?;
+    if connection_changed {
+        state.proxy_configuration_changed(id).await;
+    }
     state.emit("proxy_updated", serde_json::to_value(&proxy)?);
     Ok(serde_json::to_value(proxy)?)
 }
 
 #[tauri::command]
-pub fn delete_proxy(state: tauri::State<'_, Arc<AppState>>, id: i64) -> CommandResult<Value> {
+pub async fn delete_proxy(state: tauri::State<'_, Arc<AppState>>, id: i64) -> CommandResult<Value> {
+    let _status_guard = state.proxy_runtime.lock_proxy_status(id).await;
     state.db.delete_proxy(id)?;
+    state.proxy_deleted(id).await;
     state.emit("proxy_deleted", json!({ "id": id }));
     Ok(json!({ "message": "代理已删除" }))
 }
@@ -187,10 +183,11 @@ pub fn update_proxy_priorities(
     state: tauri::State<'_, Arc<AppState>>,
     priorities: HashMap<String, i64>,
 ) -> CommandResult<Value> {
-    for (id, priority) in priorities {
-        let id = id.parse::<i64>()?;
-        state.db.update_proxy_priority(id, priority)?;
-    }
+    let priorities = priorities
+        .into_iter()
+        .map(|(id, priority)| Ok((id.parse::<i64>()?, priority)))
+        .collect::<CommandResult<Vec<_>>>()?;
+    state.db.update_proxy_priorities(&priorities)?;
     Ok(json!({ "message": "优先级批量更新成功" }))
 }
 
@@ -243,28 +240,24 @@ pub fn delete_proxy_group(state: tauri::State<'_, Arc<AppState>>, id: i64) -> Co
 
 #[tauri::command]
 pub fn get_settings(state: tauri::State<'_, Arc<AppState>>) -> CommandResult<Value> {
-    Ok(serde_json::to_value(state.db.settings_map()?)?)
+    let mut settings = state.db.settings_map()?;
+    settings.retain(|key, _| matches!(key.as_str(), "algorithm" | "test_url" | "timeout"));
+    Ok(serde_json::to_value(settings)?)
 }
 
 #[tauri::command]
-pub fn save_settings(
+pub async fn save_settings(
     state: tauri::State<'_, Arc<AppState>>,
     settings: Map<String, Value>,
 ) -> CommandResult<Value> {
-    let mut normalized = Map::new();
-    for (key, value) in settings {
-        if key == "algorithm" {
-            let value = value.as_str().unwrap_or("adaptive");
-            let normalized_value = match value {
-                "weighted_round_robin" | "least_connections" | "adaptive" | "sticky_host" => value,
-                _ => "adaptive",
-            };
-            normalized.insert(key, Value::String(normalized_value.to_string()));
-        } else {
-            normalized.insert(key, value);
-        }
-    }
+    let normalized = normalize_load_settings(settings)?;
+    let _settings_guard = state.settings_update_guard().await;
     state.db.save_settings(&normalized)?;
+    state
+        .proxy_runtime
+        .update_load_settings(&normalized)
+        .await?;
+    state.notify_proxy_config_changed();
     Ok(json!({ "message": "设置已保存" }))
 }
 
@@ -274,41 +267,244 @@ pub fn get_advanced_config(state: tauri::State<'_, Arc<AppState>>) -> CommandRes
 }
 
 #[tauri::command]
-pub fn save_advanced_config(
+pub async fn save_advanced_config(
     state: tauri::State<'_, Arc<AppState>>,
     config: Map<String, Value>,
 ) -> CommandResult<Value> {
-    if let Some(value) = config.get("periodic_test_interval") {
-        let interval = value
-            .as_i64()
-            .ok_or_else(|| CommandError::new("定期测试间隔必须是数字"))?;
-        if interval <= 0 {
-            return Err(CommandError::new("定期测试间隔必须大于 0"));
-        }
-    }
-
+    let _settings_guard = state.settings_update_guard().await;
     let current = state.db.load_advanced_config()?;
-    let current_port = current
-        .get("proxy_port")
-        .and_then(Value::as_i64)
-        .unwrap_or(5678);
-    let next_port = config
-        .get("proxy_port")
-        .and_then(Value::as_i64)
-        .unwrap_or(current_port);
+    let normalized = normalize_advanced_config(&current, config)?;
+    let next = Value::Object(normalized.clone());
+    let requires_restart = restart_required(&current, &next);
 
-    state.db.save_settings(&config)?;
+    state.db.save_settings(&normalized)?;
+    state.proxy_runtime.update_advanced_config(&next).await?;
+    state.notify_advanced_config_changed();
     Ok(json!({
         "success": true,
-        "requiresRestart": current_port != next_port,
-        "message": if current_port != next_port { "部分配置需要重启服务才能生效" } else { "配置已应用" }
+        "requiresRestart": requires_restart,
+        "message": if requires_restart { "设置已保存；监听地址或端口将在重启应用后生效" } else { "配置已应用" }
     }))
 }
 
 #[tauri::command]
-pub fn reset_advanced_config(state: tauri::State<'_, Arc<AppState>>) -> CommandResult<Value> {
+pub async fn reset_advanced_config(state: tauri::State<'_, Arc<AppState>>) -> CommandResult<Value> {
+    let _settings_guard = state.settings_update_guard().await;
+    let current = state.db.load_advanced_config()?;
     state.db.reset_advanced_config()?;
-    Ok(json!({ "success": true, "message": "已恢复默认配置" }))
+    let next = state.db.load_advanced_config()?;
+    state.proxy_runtime.update_advanced_config(&next).await?;
+    state.notify_advanced_config_changed();
+    let requires_restart = restart_required(&current, &next);
+    Ok(json!({
+        "success": true,
+        "requiresRestart": requires_restart,
+        "message": if requires_restart { "已恢复默认配置；监听地址或端口将在重启应用后生效" } else { "已恢复默认配置" }
+    }))
+}
+
+fn normalize_load_settings(settings: Map<String, Value>) -> CommandResult<Map<String, Value>> {
+    const ALLOWED_KEYS: &[&str] = &["algorithm", "test_url", "timeout"];
+    let mut normalized = Map::new();
+    for (key, value) in settings {
+        if !ALLOWED_KEYS.contains(&key.as_str()) {
+            return Err(CommandError::new(format!("不支持的负载设置项: {key}")));
+        }
+        match key.as_str() {
+            "algorithm" => {
+                let algorithm = value
+                    .as_str()
+                    .ok_or_else(|| CommandError::new("代理选择算法必须是字符串"))?;
+                let algorithm = match algorithm {
+                    "adaptive" | "round_robin" | "least_connections" | "sticky_host" => algorithm,
+                    "weighted_round_robin" => "round_robin",
+                    _ => return Err(CommandError::new("不支持的代理选择算法")),
+                };
+                normalized.insert(key, Value::String(algorithm.to_string()));
+            }
+            "test_url" => {
+                let test_url = value
+                    .as_str()
+                    .map(str::trim)
+                    .ok_or_else(|| CommandError::new("默认测试地址必须是字符串"))?;
+                validate_test_url(test_url)?;
+                normalized.insert(key, Value::String(test_url.to_string()));
+            }
+            "timeout" => {
+                let timeout = value
+                    .as_str()
+                    .and_then(|value| value.parse::<i64>().ok())
+                    .or_else(|| value.as_i64())
+                    .ok_or_else(|| CommandError::new("默认测试超时必须是整数"))?;
+                if !(1..=300).contains(&timeout) {
+                    return Err(CommandError::new("默认测试超时必须在 1 到 300 秒之间"));
+                }
+                normalized.insert(key, Value::String(timeout.to_string()));
+            }
+            _ => unreachable!(),
+        }
+    }
+    Ok(normalized)
+}
+
+fn normalize_advanced_config(
+    current: &Value,
+    patch: Map<String, Value>,
+) -> CommandResult<Map<String, Value>> {
+    let defaults = default_advanced_config();
+    for key in patch.keys() {
+        if !defaults.contains_key(key) {
+            return Err(CommandError::new(format!("不支持的高级设置项: {key}")));
+        }
+    }
+
+    let mut merged = current
+        .as_object()
+        .cloned()
+        .unwrap_or_else(|| defaults.clone());
+    merged.retain(|key, _| defaults.contains_key(key));
+    for (key, value) in patch {
+        merged.insert(key, value);
+    }
+    for (key, value) in defaults {
+        merged.entry(key).or_insert(value);
+    }
+
+    validate_integer_range(&merged, "proxy_port", "代理服务端口", 1, Some(65_535))?;
+    validate_integer_range(
+        &merged,
+        "periodic_test_interval",
+        "活跃节点心跳间隔",
+        30_000,
+        None,
+    )?;
+    validate_integer_range(
+        &merged,
+        "probe_recovery_interval",
+        "失败节点重测间隔",
+        30_000,
+        None,
+    )?;
+    validate_integer_range(&merged, "probe_concurrency", "并发测活数", 1, Some(64))?;
+    validate_integer_range(&merged, "probe_failure_threshold", "连续失败阈值", 1, None)?;
+    validate_integer_range(
+        &merged,
+        "dns_refresh_interval",
+        "动态 DNS 刷新间隔",
+        30_000,
+        None,
+    )?;
+    validate_integer_range(&merged, "log_retention_days", "日志保留天数", 1, None)?;
+    validate_integer_range(
+        &merged,
+        "circuit_failure_threshold",
+        "熔断失败阈值",
+        1,
+        None,
+    )?;
+    validate_integer_range(&merged, "circuit_timeout", "熔断时长", 1_000, None)?;
+    validate_integer_range(
+        &merged,
+        "failfast_max_attempts",
+        "快速失败最大尝试次数",
+        1,
+        None,
+    )?;
+    let attempt_timeout = validate_integer_range(
+        &merged,
+        "failfast_attempt_timeout",
+        "单次连接超时",
+        100,
+        None,
+    )?;
+    let total_timeout =
+        validate_integer_range(&merged, "failfast_total_timeout", "总连接超时", 100, None)?;
+    if total_timeout < attempt_timeout {
+        return Err(CommandError::new("总连接超时不能小于单次连接超时"));
+    }
+
+    for (key, label) in [
+        ("allow_lan", "允许局域网连接"),
+        ("inbound_auth_enabled", "入站认证"),
+        ("background_run", "后台运行"),
+        ("start_minimized", "启动时最小化"),
+        ("failfast_enabled", "快速失败"),
+    ] {
+        if merged.get(key).and_then(Value::as_bool).is_none() {
+            return Err(CommandError::new(format!("{label}必须是布尔值")));
+        }
+    }
+
+    let username = merged
+        .get("inbound_auth_username")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CommandError::new("入站认证用户名必须是字符串"))?
+        .trim()
+        .to_string();
+    let password = merged
+        .get("inbound_auth_password")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CommandError::new("入站认证密码必须是字符串"))?
+        .to_string();
+    if username.len() > 255 || username.contains(':') || username.chars().any(char::is_control) {
+        return Err(CommandError::new(
+            "入站认证用户名不能超过 255 字节，且不能包含冒号或控制字符",
+        ));
+    }
+    if password.len() > 255 || password.chars().any(char::is_control) {
+        return Err(CommandError::new(
+            "入站认证密码不能超过 255 字节，且不能包含控制字符",
+        ));
+    }
+    if merged
+        .get("inbound_auth_enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        && (username.is_empty() || password.is_empty())
+    {
+        return Err(CommandError::new("启用入站认证前必须填写用户名和密码"));
+    }
+    merged.insert("inbound_auth_username".to_string(), Value::String(username));
+    merged.insert("inbound_auth_password".to_string(), Value::String(password));
+    Ok(merged)
+}
+
+fn validate_integer_range(
+    config: &Map<String, Value>,
+    key: &str,
+    label: &str,
+    minimum: i64,
+    maximum: Option<i64>,
+) -> CommandResult<i64> {
+    let value = config
+        .get(key)
+        .and_then(Value::as_i64)
+        .ok_or_else(|| CommandError::new(format!("{label}必须是整数")))?;
+    if value < minimum || maximum.is_some_and(|maximum| value > maximum) {
+        let range = maximum.map_or_else(
+            || format!("不小于 {minimum}"),
+            |maximum| format!("在 {minimum} 到 {maximum} 之间"),
+        );
+        return Err(CommandError::new(format!("{label}必须{range}")));
+    }
+    Ok(value)
+}
+
+fn validate_test_url(value: &str) -> CommandResult<()> {
+    let parsed = url::Url::parse(value)
+        .map_err(|error| CommandError::new(format!("默认测试地址无效: {error}")))?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return Err(CommandError::new(
+            "默认测试地址必须是包含主机名的 HTTP 或 HTTPS URL",
+        ));
+    }
+    Ok(())
+}
+
+fn restart_required(current: &Value, next: &Value) -> bool {
+    ["proxy_port", "allow_lan"]
+        .into_iter()
+        .any(|key| current.get(key) != next.get(key))
 }
 
 #[derive(Debug, Deserialize)]
@@ -397,6 +593,7 @@ pub async fn import_config_file(state: tauri::State<'_, Arc<AppState>>) -> Comma
 
     let summary = state.db.import_bundle(&bundle)?;
     state.proxy_runtime.refresh_dns_cache().await?;
+    state.notify_proxy_config_changed();
     state.emit("config_imported", serde_json::to_value(&summary)?);
     Ok(json!({ "canceled": false, "summary": summary }))
 }
@@ -418,6 +615,7 @@ pub fn stats_hourly(state: tauri::State<'_, Arc<AppState>>) -> CommandResult<Val
           AVG(CASE WHEN success = 1 THEN response_time END) as avg_response_time
         FROM request_logs
         WHERE created_at >= datetime('now', '-24 hours')
+          AND COALESCE(result_type, '') NOT IN ('health_success', 'health_failure')
         GROUP BY hour
         ORDER BY hour DESC
         "#,
@@ -437,6 +635,7 @@ pub fn stats_proxy_usage(state: tauri::State<'_, Arc<AppState>>) -> CommandResul
         FROM proxies p
         LEFT JOIN request_logs rl ON p.id = rl.proxy_id
           AND rl.created_at >= datetime('now', '-24 hours')
+          AND COALESCE(rl.result_type, '') NOT IN ('health_success', 'health_failure')
         GROUP BY p.id
         ORDER BY total_requests DESC
         "#,
@@ -454,6 +653,7 @@ pub fn stats_targets(state: tauri::State<'_, Arc<AppState>>) -> CommandResult<Va
           AVG(CASE WHEN success = 1 THEN response_time END) as avg_response_time
         FROM request_logs
         WHERE created_at >= datetime('now', '-24 hours')
+          AND COALESCE(result_type, '') NOT IN ('health_success', 'health_failure')
         GROUP BY target_host
         ORDER BY request_count DESC
         LIMIT 20
@@ -471,6 +671,7 @@ pub fn stats_failed_targets(state: tauri::State<'_, Arc<AppState>>) -> CommandRe
           MAX(created_at) as last_fail_time
         FROM request_logs
         WHERE success = 0 AND created_at >= datetime('now', '-24 hours')
+          AND COALESCE(result_type, '') NOT IN ('health_success', 'health_failure')
         GROUP BY target_host, target_port
         ORDER BY fail_count DESC
         LIMIT 10
@@ -485,16 +686,6 @@ pub async fn stats_circuit_breakers(
     let state = state.inner().clone();
     Ok(Value::Array(
         state.proxy_runtime.circuit_breaker_stats().await,
-    ))
-}
-
-#[tauri::command]
-pub async fn stats_connection_pools(
-    state: tauri::State<'_, Arc<AppState>>,
-) -> CommandResult<Value> {
-    let state = state.inner().clone();
-    Ok(Value::Array(
-        state.proxy_runtime.connection_pool_stats().await,
     ))
 }
 
@@ -561,7 +752,19 @@ pub async fn refresh_dns_mapping(
         Some(ip) => {
             let changed = ip != mapping.ip;
             if changed {
-                state.db.update_dns_ip(id, &ip)?;
+                let applied = state.db.update_dns_ip_if_unchanged(
+                    id,
+                    &mapping.domain,
+                    &mapping.ip,
+                    mapping.enabled,
+                    mapping.dynamic,
+                    &ip,
+                )?;
+                if !applied {
+                    return Err(CommandError::new(
+                        "DNS 映射在解析期间发生变化，已丢弃旧解析结果",
+                    ));
+                }
                 state.proxy_runtime.refresh_dns_cache().await?;
                 let updated = state.db.get_dns_mapping(id)?;
                 state.emit("dns_mapping_updated", serde_json::to_value(&updated)?);
@@ -767,20 +970,20 @@ fn launch_update_installer(
 
     match extension.as_str() {
         "exe" => {
-            Command::new(&selected_path)
+            Command::new(selected_path)
                 .arg("/S")
                 .arg(format!("/D={}", app_dir.display()))
-                .current_dir(&app_dir)
+                .current_dir(app_dir)
                 .spawn()?;
         }
         "msi" => {
             Command::new("msiexec")
                 .arg("/i")
-                .arg(&selected_path)
+                .arg(selected_path)
                 .arg("/qn")
                 .arg("/norestart")
                 .arg(format!("TARGETDIR={}", app_dir.display()))
-                .current_dir(&app_dir)
+                .current_dir(app_dir)
                 .spawn()?;
         }
         _ => {
@@ -1055,10 +1258,9 @@ fn wait_for_process_exit(pid: u32) -> std::io::Result<()> {
         } else if wait == WAIT_FAILED {
             Err(std::io::Error::last_os_error())
         } else {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("等待进程退出返回未知状态: {wait}"),
-            ))
+            Err(std::io::Error::other(format!(
+                "等待进程退出返回未知状态: {wait}"
+            )))
         }
     }
 }
@@ -1495,7 +1697,65 @@ impl VersionParts {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_release_asset_names, extract_release_tag, VersionParts};
+    use super::{
+        extract_release_asset_names, extract_release_tag, normalize_advanced_config,
+        normalize_load_settings, restart_required, VersionParts,
+    };
+    use crate::database::default_advanced_config;
+    use serde_json::{json, Map, Value};
+
+    #[test]
+    fn load_settings_reject_removed_manual_mode_and_normalizes_round_robin() {
+        let unsupported = Map::from_iter([("load_mode".to_string(), json!("manual"))]);
+        assert!(normalize_load_settings(unsupported).is_err());
+
+        let settings = Map::from_iter([
+            ("algorithm".to_string(), json!("weighted_round_robin")),
+            ("test_url".to_string(), json!("https://example.com/ping")),
+            ("timeout".to_string(), json!("15")),
+        ]);
+        let normalized = normalize_load_settings(settings).unwrap();
+        assert_eq!(normalized["algorithm"], json!("round_robin"));
+        assert_eq!(normalized["timeout"], json!("15"));
+    }
+
+    #[test]
+    fn advanced_config_requires_persistent_credentials_when_auth_is_enabled() {
+        let current = Value::Object(default_advanced_config());
+        let missing_credentials =
+            Map::from_iter([("inbound_auth_enabled".to_string(), json!(true))]);
+        assert!(normalize_advanced_config(&current, missing_credentials).is_err());
+
+        let valid = Map::from_iter([
+            ("inbound_auth_enabled".to_string(), json!(true)),
+            (
+                "inbound_auth_username".to_string(),
+                json!("f7e7497d-ae52-47d5-9f0d-2d780aac9c65"),
+            ),
+            (
+                "inbound_auth_password".to_string(),
+                json!("32-character-persistent-password"),
+            ),
+        ]);
+        let normalized = normalize_advanced_config(&current, valid).unwrap();
+        assert_eq!(normalized["inbound_auth_enabled"], json!(true));
+    }
+
+    #[test]
+    fn advanced_config_rejects_obsolete_fields_and_reports_listener_restart() {
+        let current = Value::Object(default_advanced_config());
+        let obsolete = Map::from_iter([("pool_max_size".to_string(), json!(50))]);
+        assert!(normalize_advanced_config(&current, obsolete).is_err());
+
+        let next = Value::Object(
+            normalize_advanced_config(
+                &current,
+                Map::from_iter([("allow_lan".to_string(), json!(true))]),
+            )
+            .unwrap(),
+        );
+        assert!(restart_required(&current, &next));
+    }
 
     #[test]
     fn compares_legacy_date_versions_with_windows_safe_versions() {

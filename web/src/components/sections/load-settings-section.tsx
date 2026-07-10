@@ -2,7 +2,7 @@ import { useEffect, useState } from "react"
 import { Save } from "lucide-react"
 import { toast } from "sonner"
 
-import { api, jsonBody } from "@/lib/api"
+import { api, commandErrorMessage, jsonBody } from "@/lib/api"
 import { Button } from "@/components/ui/button"
 import {
   Card,
@@ -34,7 +34,6 @@ export function LoadSettingsSection({
   onChanged: () => Promise<void>
 }) {
   const [form, setForm] = useState({
-    load_mode: settings.load_mode || "auto",
     algorithm: settings.algorithm || "adaptive",
     test_url: settings.test_url || "https://cms.zjzwfw.gov.cn/favicon.ico",
     timeout: settings.timeout || "10",
@@ -42,7 +41,6 @@ export function LoadSettingsSection({
 
   useEffect(() => {
     setForm({
-      load_mode: settings.load_mode || "auto",
       algorithm: settings.algorithm || "adaptive",
       test_url: settings.test_url || "https://cms.zjzwfw.gov.cn/favicon.ico",
       timeout: settings.timeout || "10",
@@ -51,14 +49,17 @@ export function LoadSettingsSection({
 
   async function save() {
     const body = {
-      load_mode: form.load_mode,
       algorithm: form.algorithm,
       test_url: form.test_url,
       timeout: form.timeout,
     }
-    await api("/api/settings", jsonBody(body))
-    toast.success("负载设置已保存")
-    await onChanged()
+    try {
+      await api("/api/settings", jsonBody(body))
+      toast.success("负载设置已保存")
+      await onChanged()
+    } catch (error) {
+      toast.error(commandErrorMessage(error, "负载设置保存失败"))
+    }
   }
 
   return (
@@ -72,24 +73,7 @@ export function LoadSettingsSection({
           <FieldGroup>
             <div className={microLabel}>选择策略</div>
             <Field>
-              <FieldLabel>负载模式</FieldLabel>
-              <Select
-                value={form.load_mode}
-                onValueChange={(value) => setForm({ ...form, load_mode: value })}
-              >
-                <SelectTrigger className="w-full">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectGroup>
-                    <SelectItem value="auto">自动模式</SelectItem>
-                    <SelectItem value="manual">手动模式</SelectItem>
-                  </SelectGroup>
-                </SelectContent>
-              </Select>
-            </Field>
-            <Field>
-              <FieldLabel>自动模式算法</FieldLabel>
+              <FieldLabel>代理选择算法</FieldLabel>
               <Select
                 value={form.algorithm}
                 onValueChange={(value) => setForm({ ...form, algorithm: value })}
@@ -100,7 +84,7 @@ export function LoadSettingsSection({
                 <SelectContent>
                   <SelectGroup>
                     <SelectItem value="adaptive">自适应算法</SelectItem>
-                    <SelectItem value="weighted_round_robin">加权轮询</SelectItem>
+                    <SelectItem value="round_robin">轮询</SelectItem>
                     <SelectItem value="least_connections">最小连接数</SelectItem>
                     <SelectItem value="sticky_host">会话粘滞</SelectItem>
                   </SelectGroup>
@@ -112,6 +96,7 @@ export function LoadSettingsSection({
             <Field>
               <FieldLabel>默认测试地址</FieldLabel>
               <Input
+                type="url"
                 className="font-mono"
                 value={form.test_url}
                 onChange={(event) =>
@@ -124,6 +109,7 @@ export function LoadSettingsSection({
               <Input
                 type="number"
                 min={1}
+                max={300}
                 className="font-mono tabular-nums"
                 value={form.timeout}
                 onChange={(event) =>
