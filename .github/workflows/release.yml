@@ -9,7 +9,7 @@ on:
       release_tag:
         description: "Release tag to upload assets to"
         required: true
-        default: "v26.7.901"
+        default: "v26.7.10"
       target:
         description: "Build target"
         required: true
@@ -123,13 +123,20 @@ jobs:
 
             ### 调整
 
-            - Windows setup 和 msi 静默更新改为由独立辅助进程接管，等待旧应用退出后再执行安装。
-            - Windows 安装版静默更新完成后会自动启动安装目录中的新版本应用。
-            - 更新安装提示文案补充安装完成后会自动重新启动应用。
+            - 代理后台默认每 3 分钟执行一次心跳测活，并通过连续失败阈值降低瞬时网络波动造成的误下线。
+            - 本地混合代理默认仅监听回环地址，可在高级设置中显式允许局域网访问。
+            - 高级设置新增可选入站认证，SOCKS5、HTTP 和 HTTPS CONNECT 共用同一组持久化用户名密码。
+            - 优化运行时配置缓存、事件合并和托盘状态刷新，降低高并发和频繁测活时的额外开销。
+
+            ### 修复
+
+            - 修复 HTTP 转发、CONNECT、预读请求体和 WebSocket Upgrade 场景下的连接处理问题。
+            - 修复代理配置变更、代理分组路由、熔断状态和测活结果之间可能出现的状态竞争与显示偏差。
+            - 修复上游返回 407 时可能被错误判定为代理可用的问题。
 
             ### 文档
 
-            - 更新 26.7.901 下载文件名示例。
+            - 更新 26.7.10 下载文件名示例和本地代理设置说明。
           releaseDraft: false
           prerelease: ${{ contains(env.RELEASE_TAG, '-') }}
           assetNamePattern: proxy-load_${{ steps.package-version.outputs.version }}_[platform]_[arch][setup][ext]

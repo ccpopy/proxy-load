@@ -1,6 +1,6 @@
 [package]
 name = "proxy-load-tauri"
-version = "26.7.901"
+version = "26.7.10"
 description = "代理负载均衡管理系统"
 authors = ["linmew"]
 license = "MIT"
@@ -25,4 +25,3 @@ url = "2"
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-single-instance = "2"
-
