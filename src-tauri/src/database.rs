@@ -1476,6 +1476,7 @@ pub fn default_advanced_config() -> Map<String, Value> {
         ("probe_recovery_interval".to_string(), json!(3 * 60 * 1000)),
         ("probe_concurrency".to_string(), json!(8)),
         ("probe_failure_threshold".to_string(), json!(2)),
+        ("startup_probe_enabled".to_string(), json!(true)),
         ("dns_refresh_interval".to_string(), json!(5 * 60 * 1000)),
         ("background_run".to_string(), json!(false)),
         ("start_minimized".to_string(), json!(false)),
@@ -1892,6 +1893,7 @@ mod tests {
         let config = default_advanced_config();
         assert_eq!(config["periodic_test_interval"].as_i64(), Some(180_000));
         assert_eq!(config["probe_recovery_interval"].as_i64(), Some(180_000));
+        assert_eq!(config["startup_probe_enabled"].as_bool(), Some(true));
     }
 
     #[test]

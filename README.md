@@ -29,7 +29,7 @@
 - 负载设置：支持 `adaptive`、`round_robin`、`least_connections`、`sticky_host`。
 - 混合入站：同一端口支持 SOCKS5、HTTP 和用于 HTTPS 目标的 HTTP CONNECT。
 - 可选入站认证：默认关闭；开启后 SOCKS5 和 HTTP/HTTPS CONNECT 共用一组持久化用户名密码。
-- 自适应测活：默认每三分钟发送轻量请求，真实流量成功可替代当轮心跳，连续失败达到阈值才把节点降级。
+- 自适应测活：默认在应用启动时全量探测已启用代理，运行期间每三分钟发送轻量请求；真实流量成功可替代当轮心跳，连续失败达到阈值才把节点降级。
 - 高级配置：监听地址、入站认证、测活、日志保留、熔断器和快速失败等真实运行参数。
 - 系统状态：请求趋势、代理建连耗时、代理使用排行、目标资源排行。
 - 流量日志：分页查看请求日志，支持清空日志。
@@ -145,7 +145,7 @@ release/
 Windows 本地构建还会额外复制一个可直接运行的便携 exe：
 
 ```text
-release/proxy-load_26.7.10_x64-portable.exe
+release/proxy-load_26.8.3_x64-portable.exe
 ```
 
 这个文件主要用于本机验证，可以直接双击运行；正式更新安装仍建议使用 setup 或 msi 安装包。
@@ -156,14 +156,14 @@ release/proxy-load_26.7.10_x64-portable.exe
 
 Windows：
 
-- 便携运行：下载 `proxy-load_26.7.10_x64-portable.exe`，放到目标目录后直接双击运行。
-- 安装运行：下载 Windows x64 的 `setup.exe` 或 `.msi` 安装包，按安装向导完成安装。GitHub Release 文件名会使用 `proxy-load_26.7.10_windows_*` 前缀。
+- 便携运行：下载 `proxy-load_26.8.3_x64-portable.exe`，放到目标目录后直接双击运行。
+- 安装运行：下载 Windows x64 的 `setup.exe` 或 `.msi` 安装包，按安装向导完成安装。GitHub Release 文件名会使用 `proxy-load_26.8.3_windows_*` 前缀。
 - 启动后应用会监听默认代理端口 `5678`，浏览器或系统代理可配置为 `SOCKS5 127.0.0.1:5678` 或 `HTTP 127.0.0.1:5678`。
 
 macOS：
 
-- Intel 芯片下载 `proxy-load_26.7.10_darwin_x64.dmg`。
-- Apple Silicon 芯片下载 `proxy-load_26.7.10_darwin_aarch64.dmg`。
+- Intel 芯片下载 `proxy-load_26.8.3_darwin_x64.dmg`。
+- Apple Silicon 芯片下载 `proxy-load_26.8.3_darwin_aarch64.dmg`。
 - `.app.tar.gz` 是同架构的应用包压缩产物，通常优先使用 `.dmg` 安装。
 - 打开 `.dmg` 后把应用拖入 `Applications`。未签名构建首次打开时可能需要在系统设置的“隐私与安全性”中允许打开。
 - 启动后代理端口同样默认为 `5678`，可在系统网络代理或浏览器代理中配置 `127.0.0.1:5678`。
@@ -243,7 +243,7 @@ Windows 更新检查不会默认安装到系统盘其他位置；应用放在 `F
 
 Windows 下应用内显示的“更新目标目录”和“下载保存目录”都会指向当前应用所在目录。比如便携 exe 放在 `F:\project\proxy-load\release` 中运行时，更新也会下载到 `F:\project\proxy-load\release`，不会再放到 `F:\project\proxy-load\release\release`。macOS 下“下载保存目录”会显示为 `~/Downloads`。
 
-便携 exe 在运行时不能直接覆盖自身，所以更新时会直接下载 GitHub Release 中的新版本文件名，例如 `proxy-load_26.7.10_x64-portable.exe`，然后退出当前应用并启动这个新版本文件。
+便携 exe 在运行时不能直接覆盖自身，所以更新时会直接下载 GitHub Release 中的新版本文件名，例如 `proxy-load_26.8.3_x64-portable.exe`，然后退出当前应用并启动这个新版本文件。
 
 如果发布仓库是私有仓库，GitHub 未认证访问会返回 `404`。生产环境需要在启动应用前设置环境变量：
 
@@ -288,6 +288,7 @@ workflow 会创建正式 GitHub Release，并上传 Tauri bundle 和 Windows 便
 | `periodic_test_interval` | `180000` | 活跃节点心跳测活间隔，单位毫秒 |
 | `probe_recovery_interval` | `180000` | 失败或未知节点重测间隔，单位毫秒 |
 | `probe_failure_threshold` | `2` | 定时测活连续失败多少次后标记离线 |
+| `startup_probe_enabled` | `true` | 应用启动时是否立即探测全部已启用代理；启动探测失败会直接标记离线 |
 | `log_retention_days` | `7` | 流量日志及其派生统计保留天数 |
 | `circuit_failure_threshold` | `5` | 熔断失败阈值 |
 | `failfast_enabled` | `true` | 是否启用快速失败 |

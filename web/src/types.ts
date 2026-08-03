@@ -197,6 +197,7 @@ export interface AdvancedConfig {
   probe_recovery_interval: number
   probe_concurrency: number
   probe_failure_threshold: number
+  startup_probe_enabled: boolean
   dns_refresh_interval: number
   background_run: boolean
   start_minimized: boolean

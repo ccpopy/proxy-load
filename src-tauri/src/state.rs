@@ -293,6 +293,7 @@ impl AppState {
     async fn periodic_proxy_tests(self) {
         // 记录每个代理上一次“主动测活”的时间，配合真实流量的成功时间做自适应调度。
         let mut last_probe: HashMap<i64, i64> = HashMap::new();
+        let mut first_cycle = true;
         loop {
             let schedule = match self.probe_schedule() {
                 Ok(schedule) => schedule,
@@ -302,7 +303,14 @@ impl AppState {
                     continue;
                 }
             };
-            if let Err(error) = self.run_probe_cycle(&schedule, &mut last_probe).await {
+            if first_cycle {
+                first_cycle = false;
+                if schedule.startup_probe_enabled {
+                    if let Err(error) = self.run_startup_probe(&schedule, &mut last_probe).await {
+                        eprintln!("启动代理测试失败: {error:#}");
+                    }
+                }
+            } else if let Err(error) = self.run_probe_cycle(&schedule, &mut last_probe).await {
                 eprintln!("定期代理测试失败: {error:#}");
             }
             tokio::select! {
@@ -310,6 +318,21 @@ impl AppState {
                 _ = self.probe_notify.notified() => {}
             }
         }
+    }
+
+    /// 启动探测不沿用上次保存的健康状态，也不等待连续失败阈值。
+    async fn run_startup_probe(
+        &self,
+        schedule: &ProbeSchedule,
+        last_probe: &mut HashMap<i64, i64>,
+    ) -> Result<()> {
+        let proxies = self.db.list_enabled_proxies()?;
+        let now = now_millis();
+        for proxy in &proxies {
+            last_probe.insert(proxy.id, now);
+        }
+        self.run_probe_batch(proxies, schedule.concurrency, ProbeOrigin::Startup)
+            .await
     }
 
     /// 一轮自适应测活：
@@ -370,23 +393,33 @@ impl AppState {
             last_probe.insert(proxy.id, now);
         }
 
-        let semaphore = Arc::new(Semaphore::new(schedule.concurrency));
+        self.run_probe_batch(due, schedule.concurrency, ProbeOrigin::Periodic)
+            .await
+    }
+
+    async fn run_probe_batch(
+        &self,
+        proxies: Vec<ProxyRecord>,
+        concurrency: usize,
+        origin: ProbeOrigin,
+    ) -> Result<()> {
+        let semaphore = Arc::new(Semaphore::new(concurrency));
         let mut tasks = JoinSet::new();
-        for proxy in due {
+        for proxy in proxies {
             let Ok(permit) = semaphore.clone().acquire_owned().await else {
                 break;
             };
             let state = self.clone();
             tasks.spawn(async move {
                 let _permit = permit;
-                if let Err(error) = state.test_proxy_record(proxy, ProbeOrigin::Periodic).await {
-                    eprintln!("代理定期测试失败: {error:#}");
+                if let Err(error) = state.test_proxy_record(proxy, origin).await {
+                    eprintln!("代理{}测试失败: {error:#}", origin.label());
                 }
             });
         }
         while let Some(result) = tasks.join_next().await {
             if let Err(error) = result {
-                eprintln!("代理定期测试任务异常退出: {error}");
+                eprintln!("代理{}测试任务异常退出: {error}", origin.label());
             }
         }
         Ok(())
@@ -408,7 +441,7 @@ impl AppState {
         let Some(proxy) = self.db.get_proxy(scheduled_proxy.id)? else {
             return Ok(None);
         };
-        if origin == ProbeOrigin::Periodic && proxy.enabled != 1 {
+        if origin.requires_enabled_proxy() && proxy.enabled != 1 {
             return Ok(None);
         }
 
@@ -470,7 +503,9 @@ impl AppState {
                 *value
             };
             let threshold = self.probe_failure_threshold()?;
-            (origin == ProbeOrigin::Manual || failures >= threshold).then_some("inactive")
+            origin
+                .should_mark_inactive(failures, threshold)
+                .then_some("inactive")
         };
 
         let record_result = self
@@ -545,6 +580,10 @@ impl AppState {
         if !(1..=64).contains(&concurrency) {
             return Err(anyhow!("probe_concurrency 必须在 1 到 64 之间"));
         }
+        let startup_probe_enabled = config
+            .get("startup_probe_enabled")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| anyhow!("startup_probe_enabled 必须是布尔值"))?;
         Ok(ProbeSchedule {
             base_interval: Duration::from_millis(base_ms),
             recovery_interval: Duration::from_millis(recovery_ms),
@@ -552,6 +591,7 @@ impl AppState {
             active_window: Duration::from_millis(base_ms),
             concurrency: concurrency as usize,
             tick: Duration::from_millis(base_ms.min(recovery_ms)),
+            startup_probe_enabled,
         })
     }
 }
@@ -576,7 +616,26 @@ fn spawn_proxy_server(runtime: Arc<ProxyRuntime>, proxy_host: String, proxy_port
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ProbeOrigin {
     Manual,
+    Startup,
     Periodic,
+}
+
+impl ProbeOrigin {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Manual => "手动",
+            Self::Startup => "启动",
+            Self::Periodic => "定期",
+        }
+    }
+
+    fn requires_enabled_proxy(self) -> bool {
+        self != Self::Manual
+    }
+
+    fn should_mark_inactive(self, failures: u32, threshold: u32) -> bool {
+        self != Self::Periodic || failures >= threshold
+    }
 }
 
 fn same_probe_configuration(left: &ProxyRecord, right: &ProxyRecord) -> bool {
@@ -597,6 +656,7 @@ struct ProbeSchedule {
     active_window: Duration,
     concurrency: usize,
     tick: Duration,
+    startup_probe_enabled: bool,
 }
 
 pub fn now_millis() -> i64 {
@@ -625,4 +685,17 @@ pub async fn resolve_ipv4(domain: &str) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ProbeOrigin;
+
+    #[test]
+    fn startup_probe_failure_is_authoritative() {
+        assert!(ProbeOrigin::Startup.should_mark_inactive(1, 2));
+        assert!(ProbeOrigin::Manual.should_mark_inactive(1, 2));
+        assert!(!ProbeOrigin::Periodic.should_mark_inactive(1, 2));
+        assert!(ProbeOrigin::Periodic.should_mark_inactive(2, 2));
+    }
 }

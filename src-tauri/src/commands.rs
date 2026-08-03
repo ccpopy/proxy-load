@@ -426,6 +426,7 @@ fn normalize_advanced_config(
     for (key, label) in [
         ("allow_lan", "允许局域网连接"),
         ("inbound_auth_enabled", "入站认证"),
+        ("startup_probe_enabled", "启动时全量测活"),
         ("background_run", "后台运行"),
         ("start_minimized", "启动时最小化"),
         ("failfast_enabled", "快速失败"),
@@ -1739,6 +1740,17 @@ mod tests {
         ]);
         let normalized = normalize_advanced_config(&current, valid).unwrap();
         assert_eq!(normalized["inbound_auth_enabled"], json!(true));
+    }
+
+    #[test]
+    fn advanced_config_validates_startup_probe_toggle() {
+        let current = Value::Object(default_advanced_config());
+        let disabled = Map::from_iter([("startup_probe_enabled".to_string(), json!(false))]);
+        let normalized = normalize_advanced_config(&current, disabled).unwrap();
+        assert_eq!(normalized["startup_probe_enabled"], json!(false));
+
+        let invalid = Map::from_iter([("startup_probe_enabled".to_string(), json!("true"))]);
+        assert!(normalize_advanced_config(&current, invalid).is_err());
     }
 
     #[test]

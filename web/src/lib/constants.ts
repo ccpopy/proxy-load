@@ -47,6 +47,7 @@ export const defaultAdvanced: AdvancedConfig = {
   probe_recovery_interval: 180000,
   probe_concurrency: 8,
   probe_failure_threshold: 2,
+  startup_probe_enabled: true,
   dns_refresh_interval: 300000,
   background_run: false,
   start_minimized: false,

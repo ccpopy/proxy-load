@@ -9,7 +9,7 @@ on:
       release_tag:
         description: "Release tag to upload assets to"
         required: true
-        default: "v26.7.10"
+        default: "v26.8.3"
       target:
         description: "Build target"
         required: true
@@ -121,22 +121,10 @@ jobs:
           releaseBody: |
             ## Changes
 
-            ### 调整
+            ### 新增
 
-            - 代理后台默认每 3 分钟执行一次心跳测活，并通过连续失败阈值降低瞬时网络波动造成的误下线。
-            - 本地混合代理默认仅监听回环地址，可在高级设置中显式允许局域网访问。
-            - 高级设置新增可选入站认证，SOCKS5、HTTP 和 HTTPS CONNECT 共用同一组持久化用户名密码。
-            - 优化运行时配置缓存、事件合并和托盘状态刷新，降低高并发和频繁测活时的额外开销。
-
-            ### 修复
-
-            - 修复 HTTP 转发、CONNECT、预读请求体和 WebSocket Upgrade 场景下的连接处理问题。
-            - 修复代理配置变更、代理分组路由、熔断状态和测活结果之间可能出现的状态竞争与显示偏差。
-            - 修复上游返回 407 时可能被错误判定为代理可用的问题。
-
-            ### 文档
-
-            - 更新 26.7.10 下载文件名示例和本地代理设置说明。
+            - 高级设置新增“启动时全量测活”开关，默认开启。
+            - 开启后，应用每次启动都会立即探测全部已启用代理，并直接刷新在线或离线状态，避免沿用上次保存的健康状态。
           releaseDraft: false
           prerelease: ${{ contains(env.RELEASE_TAG, '-') }}
           assetNamePattern: proxy-load_${{ steps.package-version.outputs.version }}_[platform]_[arch][setup][ext]

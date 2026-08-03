@@ -198,6 +198,20 @@ export function AdvancedDialog({
               </ConfigGroup>
 
               <ConfigGroup title="测活与数据" icon={Activity}>
+                <Field orientation="horizontal">
+                  <FieldContent>
+                    <FieldTitle>启动时全量测活</FieldTitle>
+                    <FieldDescription>
+                      每次启动立即测试全部已启用代理；失败会直接标记为离线
+                    </FieldDescription>
+                  </FieldContent>
+                  <Switch
+                    checked={config.startup_probe_enabled}
+                    onCheckedChange={(value) =>
+                      update("startup_probe_enabled", value)
+                    }
+                  />
+                </Field>
                 <FieldGroup className="grid gap-4 sm:grid-cols-2">
                   <NumberField
                     label="活跃节点心跳（分钟）"
