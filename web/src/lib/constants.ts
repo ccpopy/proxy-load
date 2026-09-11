@@ -56,8 +56,8 @@ export const defaultAdvanced: AdvancedConfig = {
   circuit_timeout: 60000,
   failfast_enabled: true,
   failfast_max_attempts: 3,
-  failfast_attempt_timeout: 10000,
-  failfast_total_timeout: 30000,
+  failfast_attempt_timeout: 5000,
+  failfast_total_timeout: 15000,
 }
 
 export const trafficChartConfig = {

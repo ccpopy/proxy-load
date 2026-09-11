@@ -11,7 +11,7 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card"
-import { Field, FieldGroup, FieldLabel } from "@/components/ui/field"
+import { Field, FieldDescription, FieldGroup, FieldLabel } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
 import {
   Select,
@@ -90,6 +90,10 @@ export function LoadSettingsSection({
                   </SelectGroup>
                 </SelectContent>
               </Select>
+              <FieldDescription>
+                自适应算法综合近期建连成功率、延迟和当前连接数选路。新连接失败时，
+                会在当前分组的可用代理中重试；已建立的连接不会迁移。
+              </FieldDescription>
             </Field>
 
             <div className={microLabel}>测试参数</div>
@@ -103,6 +107,9 @@ export function LoadSettingsSection({
                   setForm({ ...form, test_url: event.target.value })
                 }
               />
+              <FieldDescription>
+                仅用于代理测活，不限制实际访问目标；未命中域名规则的流量会使用默认分组。
+              </FieldDescription>
             </Field>
             <Field>
               <FieldLabel>默认超时（秒）</FieldLabel>

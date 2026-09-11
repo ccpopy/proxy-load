@@ -40,6 +40,16 @@ pub struct RequestLogEntry<'a> {
 }
 
 impl Database {
+    #[cfg(test)]
+    pub(crate) fn open_in_memory() -> Result<Self> {
+        let db = Self {
+            conn: Arc::new(Mutex::new(Connection::open_in_memory()?)),
+            db_path: PathBuf::from(":memory:"),
+        };
+        db.migrate()?;
+        Ok(db)
+    }
+
     pub fn open() -> Result<Self> {
         let data_dir = env::var("DATA_DIR")
             .map(PathBuf::from)
@@ -1485,8 +1495,8 @@ pub fn default_advanced_config() -> Map<String, Value> {
         ("circuit_timeout".to_string(), json!(60000)),
         ("failfast_enabled".to_string(), json!(true)),
         ("failfast_max_attempts".to_string(), json!(3)),
-        ("failfast_attempt_timeout".to_string(), json!(10000)),
-        ("failfast_total_timeout".to_string(), json!(30000)),
+        ("failfast_attempt_timeout".to_string(), json!(5000)),
+        ("failfast_total_timeout".to_string(), json!(15000)),
     ])
 }
 

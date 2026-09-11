@@ -286,6 +286,10 @@ export function AdvancedDialog({
               </ConfigGroup>
 
               <ConfigGroup title="熔断器" icon={Shield}>
+                <FieldDescription>
+                  代理连接或认证故障会触发全局熔断；目标连接失败仅冷却该代理到该目标的链路，
+                  不影响其他网站。两者分别累计失败次数，使用下方阈值和时长。
+                </FieldDescription>
                 <NumberField
                   label="连续连接失败阈值"
                   value={config.circuit_failure_threshold}
@@ -301,6 +305,10 @@ export function AdvancedDialog({
               </ConfigGroup>
 
               <ConfigGroup title="快速失败" icon={Zap}>
+                <FieldDescription>
+                  推荐单次超时 5 秒、总超时 15 秒，最多尝试 3 个代理。
+                  失败后立即切换候选，不额外等待；仅在转发业务数据前重试。
+                </FieldDescription>
                 <Field orientation="horizontal">
                   <FieldContent>
                     <FieldTitle>限制代理尝试次数</FieldTitle>

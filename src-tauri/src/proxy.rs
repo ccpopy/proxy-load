@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     net::{Ipv4Addr, SocketAddr},
     sync::Arc,
     time::Instant,
@@ -13,7 +13,7 @@ use tokio::{
     io::{self, AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::{broadcast, Mutex, RwLock},
-    time::{sleep, timeout, Duration},
+    time::{timeout, Duration},
 };
 
 use crate::{
@@ -29,6 +29,8 @@ const ADDR_DOMAIN: u8 = 0x03;
 const SOCKS_AUTH_NONE: u8 = 0x00;
 const SOCKS_AUTH_USERNAME_PASSWORD: u8 = 0x02;
 const SOCKS_AUTH_REJECTED: u8 = 0xff;
+const METRICS_WINDOW_MS: i64 = 5 * 60 * 1000;
+const MAX_TARGET_CIRCUITS: usize = 4096;
 
 #[derive(Clone)]
 pub struct ProxyRuntime {
@@ -37,9 +39,11 @@ pub struct ProxyRuntime {
     service_status: Arc<RwLock<ProxyServiceStatus>>,
     metrics: Arc<RwLock<HashMap<i64, ProxyMetrics>>>,
     circuit_breakers: Arc<RwLock<HashMap<i64, CircuitBreaker>>>,
+    target_circuits: Arc<RwLock<HashMap<TargetRouteKey, TargetCircuit>>>,
     active_connections: Arc<RwLock<HashMap<i64, i64>>>,
     dns_cache: Arc<RwLock<HashMap<String, String>>>,
     round_robin_index: Arc<Mutex<usize>>,
+    selection_lock: Arc<Mutex<()>>,
     runtime_settings: Arc<RwLock<RuntimeSettings>>,
     status_locks: Arc<Mutex<HashMap<i64, Arc<Mutex<()>>>>>,
 }
@@ -62,6 +66,45 @@ struct TargetRequest {
     original_host: String,
     inbound: InboundProtocol,
     initial_payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct TargetRouteKey {
+    proxy_id: i64,
+    original_host: String,
+    resolved_host: String,
+    port: u16,
+}
+
+impl TargetRouteKey {
+    fn new(proxy_id: i64, request: &TargetRequest) -> Self {
+        Self {
+            proxy_id,
+            original_host: request.original_host.to_ascii_lowercase(),
+            resolved_host: request.host.to_ascii_lowercase(),
+            port: request.port,
+        }
+    }
+}
+
+struct TargetCircuit {
+    breaker: CircuitBreaker,
+    last_failure: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailureScope {
+    Proxy,
+    Target,
+}
+
+impl FailureScope {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Proxy => "代理连接/认证",
+            Self::Target => "目标链路",
+        }
+    }
 }
 
 struct ConnectedUpstream {
@@ -237,9 +280,11 @@ impl ProxyRuntime {
             })),
             metrics: Arc::new(RwLock::new(HashMap::new())),
             circuit_breakers: Arc::new(RwLock::new(HashMap::new())),
+            target_circuits: Arc::new(RwLock::new(HashMap::new())),
             active_connections: Arc::new(RwLock::new(HashMap::new())),
             dns_cache: Arc::new(RwLock::new(HashMap::new())),
             round_robin_index: Arc::new(Mutex::new(0)),
+            selection_lock: Arc::new(Mutex::new(())),
             runtime_settings: Arc::new(RwLock::new(runtime_settings)),
             status_locks: Arc::new(Mutex::new(HashMap::new())),
         })
@@ -274,6 +319,9 @@ impl ProxyRuntime {
         for breaker in self.circuit_breakers.write().await.values_mut() {
             breaker.apply_config(circuit);
         }
+        for target in self.target_circuits.write().await.values_mut() {
+            target.breaker.apply_config(circuit);
+        }
         Ok(())
     }
 
@@ -290,6 +338,10 @@ impl ProxyRuntime {
     pub async fn reset_proxy_state(&self, proxy_id: i64) {
         self.metrics.write().await.remove(&proxy_id);
         self.circuit_breakers.write().await.remove(&proxy_id);
+        self.target_circuits
+            .write()
+            .await
+            .retain(|key, _| key.proxy_id != proxy_id);
     }
 
     fn proxy_configuration_is_current(&self, proxy: &ProxyRecord) -> Result<bool> {
@@ -356,37 +408,26 @@ impl ProxyRuntime {
         }
     }
 
-    async fn record_request(
-        &self,
-        entry: RequestLogEntry<'_>,
-        expected_proxy: Option<&ProxyRecord>,
-    ) {
-        if let Some(expected_proxy) = expected_proxy {
-            let proxy_id = expected_proxy.id;
-            let _guard = self.lock_proxy_status(proxy_id).await;
-            match self.proxy_configuration_is_current(expected_proxy) {
-                Ok(true) => {
-                    let mark_active = {
-                        let mut metrics = self.metrics.write().await;
-                        let metric = metrics.entry(proxy_id).or_insert_with(ProxyMetrics::new);
-                        metric.push(entry.success, entry.response_time);
-                        entry.success && metric.pushed_status.as_deref() != Some("active")
-                    };
-                    if mark_active
-                        && self.apply_passive_status_locked(proxy_id, "active", entry.response_time)
-                    {
-                        let mut metrics = self.metrics.write().await;
-                        let metric = metrics.entry(proxy_id).or_insert_with(ProxyMetrics::new);
-                        metric.pushed_status = Some("active".to_string());
-                    }
-                }
-                Ok(false) => {}
-                Err(error) => {
-                    eprintln!("记录真实流量状态前校验代理配置失败: {error:#}");
-                }
-            }
+    // 调用方持有代理状态锁，并已校验配置仍然有效。
+    async fn record_connection_success_locked(&self, proxy_id: i64, response_time: i64) {
+        let mark_active = {
+            let mut metrics = self.metrics.write().await;
+            let metric = metrics.entry(proxy_id).or_insert_with(ProxyMetrics::new);
+            metric.push(true, Some(response_time));
+            metric.pushed_status.as_deref() != Some("active")
+        };
+        if mark_active && self.apply_passive_status_locked(proxy_id, "active", Some(response_time))
+        {
+            self.metrics
+                .write()
+                .await
+                .entry(proxy_id)
+                .or_insert_with(ProxyMetrics::new)
+                .pushed_status = Some("active".to_string());
         }
+    }
 
+    async fn record_request(&self, entry: RequestLogEntry<'_>) {
         if let Err(db_error) = self.db.log_request(&entry) {
             eprintln!("写入请求日志失败: {db_error:#}");
         }
@@ -399,7 +440,11 @@ impl ProxyRuntime {
         let _ = self.events.send(event);
     }
 
-    async fn select_proxies(&self, request: &TargetRequest) -> Result<Vec<ProxyRecord>> {
+    async fn select_proxies(
+        &self,
+        request: &TargetRequest,
+        excluded: &HashSet<i64>,
+    ) -> Result<Vec<ProxyRecord>> {
         let mut proxies = self.db.list_enabled_proxies()?;
         if proxies.is_empty() {
             return Err(anyhow!("没有可用的代理"));
@@ -429,17 +474,30 @@ impl ProxyRuntime {
 
         let mut eligible = Vec::new();
         for proxy in proxies {
-            if !self.is_candidate_available(proxy.id).await {
+            if excluded.contains(&proxy.id) || !self.is_candidate_available(proxy.id, request).await
+            {
                 continue;
             }
             eligible.push(proxy);
         }
 
-        if eligible.is_empty() {
-            return Err(anyhow!("没有可尝试的代理"));
-        }
-
         self.order_proxies(eligible, &algorithm, &group_key).await
+    }
+
+    async fn reserve_proxy(
+        &self,
+        request: &TargetRequest,
+        excluded: &HashSet<i64>,
+    ) -> Result<Option<ProxyRecord>> {
+        // 只串行化选路和计数预占，不锁网络 I/O，避免并发请求都读到同一份空闲快照。
+        let _selection = self.selection_lock.lock().await;
+        for proxy in self.select_proxies(request, excluded).await? {
+            if self.try_begin_attempt(proxy.id, request).await {
+                self.increment_active(proxy.id).await;
+                return Ok(Some(proxy));
+            }
+        }
+        Ok(None)
     }
 
     async fn order_proxies(
@@ -475,40 +533,63 @@ impl ProxyRuntime {
                 }
             }
             _ => {
-                let metrics = self.metrics.read().await;
-                proxies.sort_by(|a, b| {
-                    let a_score = metrics
-                        .get(&a.id)
+                let mut metrics = self.metrics.write().await;
+                let now = now_millis();
+                for proxy in &proxies {
+                    if let Some(metric) = metrics.get_mut(&proxy.id) {
+                        metric.prune(now);
+                    }
+                }
+                let active = self.active_connections.read().await;
+                let effective_score = |proxy: &ProxyRecord| {
+                    let quality = metrics
+                        .get(&proxy.id)
                         .filter(|metric| !metric.requests.is_empty())
                         .map(|metric| metric.score)
-                        .unwrap_or_else(|| score_of(a));
-                    let b_score = metrics
-                        .get(&b.id)
-                        .filter(|metric| !metric.requests.is_empty())
-                        .map(|metric| metric.score)
-                        .unwrap_or_else(|| score_of(b));
-                    b_score.total_cmp(&a_score)
-                });
+                        .unwrap_or_else(|| score_of(proxy));
+                    quality / (1 + active.get(&proxy.id).copied().unwrap_or(0).max(0)) as f64
+                };
+                proxies.sort_by(|a, b| effective_score(b).total_cmp(&effective_score(a)));
             }
         }
         Ok(prioritize_route_status(proxies))
     }
 
-    async fn is_candidate_available(&self, proxy_id: i64) -> bool {
-        self.circuit_breakers
+    async fn is_candidate_available(&self, proxy_id: i64, request: &TargetRequest) -> bool {
+        let proxy_available = self
+            .circuit_breakers
             .read()
             .await
             .get(&proxy_id)
-            .is_none_or(CircuitBreaker::can_attempt_snapshot)
+            .is_none_or(CircuitBreaker::can_attempt_snapshot);
+        proxy_available
+            && self
+                .target_circuits
+                .read()
+                .await
+                .get(&TargetRouteKey::new(proxy_id, request))
+                .is_none_or(|target| target.breaker.can_attempt_snapshot())
     }
 
-    async fn try_begin_attempt(&self, proxy_id: i64) -> bool {
+    async fn try_begin_attempt(&self, proxy_id: i64, request: &TargetRequest) -> bool {
         let config = self.runtime_settings.read().await.circuit;
         let mut breakers = self.circuit_breakers.write().await;
         let breaker = breakers
             .entry(proxy_id)
             .or_insert_with(|| CircuitBreaker::new(config));
         breaker.apply_config(config);
+        let mut targets = self.target_circuits.write().await;
+        let target = targets.get_mut(&TargetRouteKey::new(proxy_id, request));
+        if !breaker.can_attempt_snapshot()
+            || target
+                .as_ref()
+                .is_some_and(|target| !target.breaker.can_attempt_snapshot())
+        {
+            return false;
+        }
+        if let Some(target) = target {
+            target.breaker.try_begin_attempt();
+        }
         breaker.try_begin_attempt()
     }
 
@@ -522,10 +603,69 @@ impl ProxyRuntime {
         breaker.record_success();
     }
 
-    async fn cancel_half_open_attempt(&self, proxy_id: i64) {
+    async fn cancel_half_open_attempt(&self, proxy_id: i64, request: &TargetRequest) {
         if let Some(breaker) = self.circuit_breakers.write().await.get_mut(&proxy_id) {
             breaker.cancel_half_open_attempt();
         }
+        self.cancel_target_half_open_attempt(proxy_id, request)
+            .await;
+    }
+
+    async fn cancel_target_half_open_attempt(&self, proxy_id: i64, request: &TargetRequest) {
+        if let Some(target) = self
+            .target_circuits
+            .write()
+            .await
+            .get_mut(&TargetRouteKey::new(proxy_id, request))
+        {
+            target.breaker.cancel_half_open_attempt();
+        }
+    }
+
+    async fn record_route_failure_locked(
+        &self,
+        proxy_id: i64,
+        request: &TargetRequest,
+        scope: FailureScope,
+    ) {
+        if scope == FailureScope::Proxy {
+            self.record_breaker_failure_locked(proxy_id).await;
+            self.cancel_target_half_open_attempt(proxy_id, request)
+                .await;
+            return;
+        }
+        // 已连上代理，失败属于此目标链路；不影响其他网站的评分、状态或全局熔断。
+        self.record_breaker_success(proxy_id).await;
+        let config = self.runtime_settings.read().await.circuit;
+        let key = TargetRouteKey::new(proxy_id, request);
+        let now = now_millis();
+        let mut targets = self.target_circuits.write().await;
+        if !targets.contains_key(&key) {
+            targets.retain(|_, target| {
+                target.breaker.state == "HALF_OPEN"
+                    || now.saturating_sub(target.last_failure)
+                        < METRICS_WINDOW_MS.max(target.breaker.timeout_ms)
+            });
+            if targets.len() >= MAX_TARGET_CIRCUITS {
+                let oldest = targets
+                    .iter()
+                    .filter(|(_, target)| target.breaker.state != "HALF_OPEN")
+                    .min_by_key(|(_, target)| target.last_failure)
+                    .map(|(key, _)| key.clone());
+                if let Some(oldest) = oldest {
+                    targets.remove(&oldest);
+                } else {
+                    return;
+                }
+            }
+        }
+        let target = targets.entry(key).or_insert_with(|| TargetCircuit {
+            breaker: CircuitBreaker::new(config),
+            last_failure: now,
+        });
+        target.last_failure = now;
+        target.breaker.apply_config(config);
+        target.breaker.record_failure();
     }
 
     async fn record_breaker_failure_locked(&self, proxy_id: i64) {
@@ -767,39 +907,33 @@ async fn handle_client(
                 runtime.decrement_active(proxy_id).await;
                 let error_message = error.to_string();
                 runtime
-                    .record_request(
-                        RequestLogEntry {
-                            proxy_id: Some(proxy_id),
-                            target_host: &original_host,
-                            target_port: i64::from(original_port),
-                            success: false,
-                            response_time: Some(start.elapsed().as_millis() as i64),
-                            error_message: Some(&error_message),
-                            result_type: "tunnel_setup_error",
-                        },
-                        None,
-                    )
+                    .record_request(RequestLogEntry {
+                        proxy_id: Some(proxy_id),
+                        target_host: &original_host,
+                        target_port: i64::from(original_port),
+                        success: false,
+                        response_time: Some(start.elapsed().as_millis() as i64),
+                        error_message: Some(&error_message),
+                        result_type: "tunnel_setup_error",
+                    })
                     .await;
                 return Err(error);
             }
             let response_time = start.elapsed().as_millis() as i64;
             runtime
-                .record_request(
-                    RequestLogEntry {
-                        proxy_id: Some(proxy_id),
-                        target_host: &original_host,
-                        target_port: i64::from(original_port),
-                        success: true,
-                        response_time: Some(response_time),
-                        error_message: None,
-                        result_type: if upstream.target_verified {
-                            "proxy_connected"
-                        } else {
-                            "request_forwarded"
-                        },
+                .record_request(RequestLogEntry {
+                    proxy_id: Some(proxy_id),
+                    target_host: &original_host,
+                    target_port: i64::from(original_port),
+                    success: true,
+                    response_time: Some(response_time),
+                    error_message: None,
+                    result_type: if upstream.target_verified {
+                        "proxy_connected"
+                    } else {
+                        "request_forwarded"
                     },
-                    upstream.target_verified.then_some(&selected_proxy),
-                )
+                })
                 .await;
             let copy_result = io::copy_bidirectional(&mut client, &mut upstream.stream).await;
             runtime.decrement_active(proxy_id).await;
@@ -814,18 +948,15 @@ async fn handle_client(
             let error_message = error.to_string();
             send_inbound_error(&mut client, &request, &error_message).await?;
             runtime
-                .record_request(
-                    RequestLogEntry {
-                        proxy_id: None,
-                        target_host: &original_host,
-                        target_port: i64::from(original_port),
-                        success: false,
-                        response_time: Some(start.elapsed().as_millis() as i64),
-                        error_message: Some(&error_message),
-                        result_type: "proxy_exhausted",
-                    },
-                    None,
-                )
+                .record_request(RequestLogEntry {
+                    proxy_id: None,
+                    target_host: &original_host,
+                    target_port: i64::from(original_port),
+                    success: false,
+                    response_time: Some(start.elapsed().as_millis() as i64),
+                    error_message: Some(&error_message),
+                    result_type: "proxy_exhausted",
+                })
                 .await;
             Err(error)
         }
@@ -839,49 +970,69 @@ async fn connect_with_fail_fast(
 ) -> Result<(ProxyRecord, ConnectedUpstream)> {
     let config = runtime.runtime_settings.read().await.fail_fast;
 
-    let proxies = runtime.select_proxies(request).await?;
-
     let total_timeout = Duration::from_millis(config.total_timeout_ms);
-    let proxy_count = proxies.len();
     let mut attempted = 0usize;
+    let mut excluded = HashSet::new();
     let mut errors = Vec::new();
-    for (index, proxy) in proxies.into_iter().enumerate() {
-        if config.enabled && attempted >= config.max_attempts {
-            break;
-        }
-        let remaining = total_timeout.saturating_sub(start.elapsed());
-        if remaining.is_zero() {
+    while !config.enabled || attempted < config.max_attempts {
+        if start.elapsed() >= total_timeout {
             return Err(anyhow!("总超时: {}", errors.join("; ")));
         }
-        if !runtime.try_begin_attempt(proxy.id).await {
-            continue;
+        let Some(proxy) = runtime.reserve_proxy(request, &excluded).await? else {
+            break;
+        };
+        excluded.insert(proxy.id);
+        let remaining = total_timeout.saturating_sub(start.elapsed());
+        if remaining.is_zero() {
+            runtime.decrement_active(proxy.id).await;
+            runtime.cancel_half_open_attempt(proxy.id, request).await;
+            return Err(anyhow!("总超时: {}", errors.join("; ")));
         }
         attempted += 1;
-        runtime.increment_active(proxy.id).await;
+        let attempt_started = Instant::now();
+        let mut scope = FailureScope::Proxy;
         let attempt = timeout(
             Duration::from_millis(config.attempt_timeout_ms).min(remaining),
-            connect_through_proxy(&proxy, request),
+            connect_through_proxy(&proxy, request, &mut scope),
         )
-        .await;
-        let status_guard = runtime.lock_proxy_status(proxy.id).await;
+        .await
+        .unwrap_or_else(|_| Err(anyhow!("{}超时", scope.label())));
+        let attempt_elapsed = attempt_started.elapsed().as_millis() as i64;
+        let _status_guard = runtime.lock_proxy_status(proxy.id).await;
         let configuration_current = match runtime.proxy_configuration_is_current(&proxy) {
             Ok(current) => current,
             Err(error) => {
                 runtime.decrement_active(proxy.id).await;
-                runtime.cancel_half_open_attempt(proxy.id).await;
+                runtime.cancel_half_open_attempt(proxy.id, request).await;
                 return Err(error.context("连接结束后校验代理配置失败"));
             }
         };
         if !configuration_current {
             runtime.decrement_active(proxy.id).await;
+            runtime.cancel_half_open_attempt(proxy.id, request).await;
             attempted = attempted.saturating_sub(1);
             errors.push(format!("{}: 连接期间代理配置已变化", proxy.name));
             continue;
         }
 
         match attempt {
-            Ok(Ok(stream)) => {
+            Ok(stream) => {
                 runtime.record_breaker_success(proxy.id).await;
+                if stream.target_verified {
+                    runtime
+                        .target_circuits
+                        .write()
+                        .await
+                        .remove(&TargetRouteKey::new(proxy.id, request));
+                    // 评分只计当前节点自身的建连耗时；请求日志仍记录用户等待的总耗时。
+                    runtime
+                        .record_connection_success_locked(proxy.id, attempt_elapsed)
+                        .await;
+                } else {
+                    runtime
+                        .cancel_target_half_open_attempt(proxy.id, request)
+                        .await;
+                }
                 #[cfg(debug_assertions)]
                 eprintln!(
                     "代理路由成功: target={}:{}, proxy_id={}, proxy_name={}, proxy_type={}",
@@ -889,31 +1040,16 @@ async fn connect_with_fail_fast(
                 );
                 return Ok((proxy, stream));
             }
-            Ok(Err(error)) => {
-                runtime.record_breaker_failure_locked(proxy.id).await;
+            Err(error) => {
+                runtime
+                    .record_route_failure_locked(proxy.id, request, scope)
+                    .await;
                 runtime.decrement_active(proxy.id).await;
                 eprintln!(
-                    "代理路由尝试失败: target={}:{}, proxy_id={}, proxy_name={}, error={error}",
-                    request.original_host, request.port, proxy.id, proxy.name
+                    "代理路由尝试失败: target={}:{}, proxy_id={}, proxy_name={}, scope={}, error={error:#}",
+                    request.original_host, request.port, proxy.id, proxy.name, scope.label()
                 );
-                errors.push(format!("{}: {error}", proxy.name));
-            }
-            Err(_) => {
-                runtime.record_breaker_failure_locked(proxy.id).await;
-                runtime.decrement_active(proxy.id).await;
-                eprintln!(
-                    "代理路由尝试超时: target={}:{}, proxy_id={}, proxy_name={}",
-                    request.original_host, request.port, proxy.id, proxy.name
-                );
-                errors.push(format!("{}: 连接超时", proxy.name));
-            }
-        }
-        drop(status_guard);
-        if index + 1 < proxy_count && (!config.enabled || attempted < config.max_attempts) {
-            let delay =
-                Duration::from_millis(300).min(total_timeout.saturating_sub(start.elapsed()));
-            if !delay.is_zero() {
-                sleep(delay).await;
+                errors.push(format!("{} [{}]: {error:#}", proxy.name, scope.label()));
             }
         }
     }
@@ -927,9 +1063,10 @@ async fn connect_with_fail_fast(
 async fn connect_through_proxy(
     proxy: &ProxyRecord,
     request: &TargetRequest,
+    scope: &mut FailureScope,
 ) -> Result<ConnectedUpstream> {
     match proxy.proxy_type.as_str() {
-        "socks5" => connect_socks5(proxy, request)
+        "socks5" => connect_socks5(proxy, request, scope)
             .await
             .map(|stream| ConnectedUpstream {
                 stream,
@@ -937,7 +1074,7 @@ async fn connect_through_proxy(
                 prefetched_response: Vec::new(),
                 target_verified: true,
             }),
-        "socks4" => connect_socks4(proxy, request)
+        "socks4" => connect_socks4(proxy, request, scope)
             .await
             .map(|stream| ConnectedUpstream {
                 stream,
@@ -945,12 +1082,16 @@ async fn connect_through_proxy(
                 prefetched_response: Vec::new(),
                 target_verified: true,
             }),
-        "http" | "https" => connect_http_proxy(proxy, request).await,
+        "http" | "https" => connect_http_proxy(proxy, request, scope).await,
         other => Err(anyhow!("不支持的代理类型: {other}")),
     }
 }
 
-async fn connect_socks5(proxy: &ProxyRecord, request: &TargetRequest) -> Result<TcpStream> {
+async fn connect_socks5(
+    proxy: &ProxyRecord,
+    request: &TargetRequest,
+    scope: &mut FailureScope,
+) -> Result<TcpStream> {
     let mut stream = TcpStream::connect((proxy.host.as_str(), proxy.port as u16)).await?;
     let use_auth = proxy
         .username
@@ -989,25 +1130,58 @@ async fn connect_socks5(proxy: &ProxyRecord, request: &TargetRequest) -> Result<
         return Err(anyhow!("SOCKS5服务器未接受认证方式"));
     }
 
+    *scope = FailureScope::Target;
     stream
         .write_all(&build_socks5_connect_request(request)?)
         .await?;
     let mut header = [0u8; 4];
     stream.read_exact(&mut header).await?;
-    if header[0] != 0x05 || header[1] != 0x00 {
+    if header[0] != 0x05 || header[2] != 0x00 {
+        *scope = FailureScope::Proxy;
+        return Err(anyhow!("无效的 SOCKS5 目标连接响应"));
+    }
+    if header[1] != 0x00 {
+        // RFC 1928: 0x01 是服务器故障；规则拒绝/目标不可达等只影响当前目标。
+        if header[1] == 0x01 || header[1] == 0x07 || header[1] > 0x08 {
+            *scope = FailureScope::Proxy;
+        }
         return Err(anyhow!("SOCKS5连接目标失败，响应码 {}", header[1]));
     }
+    *scope = FailureScope::Proxy;
     read_socks5_bind_address(&mut stream, header[3]).await?;
     Ok(stream)
 }
 
-async fn connect_socks4(proxy: &ProxyRecord, request: &TargetRequest) -> Result<TcpStream> {
+async fn connect_socks4(
+    proxy: &ProxyRecord,
+    request: &TargetRequest,
+    scope: &mut FailureScope,
+) -> Result<TcpStream> {
     let mut stream = TcpStream::connect((proxy.host.as_str(), proxy.port as u16)).await?;
     // SOCKS4 只有 USERID 字段，没有密码认证；配置层会拒绝 SOCKS4 密码。
     let userid = proxy.username.as_deref().unwrap_or("");
     if userid.len() > 255 {
         return Err(anyhow!("SOCKS4 用户标识过长"));
     }
+    *scope = FailureScope::Target;
+    let packet = build_socks4_connect_request(request, userid)?;
+    stream.write_all(&packet).await?;
+    let mut response = [0u8; 8];
+    stream.read_exact(&mut response).await?;
+    if response[0] != 0x00 {
+        *scope = FailureScope::Proxy;
+        return Err(anyhow!("无效的 SOCKS4 目标连接响应"));
+    }
+    if response[1] != 0x5a {
+        if response[1] != 0x5b {
+            *scope = FailureScope::Proxy;
+        }
+        return Err(anyhow!("{}", socks4_reply_message(response[1])));
+    }
+    Ok(stream)
+}
+
+fn build_socks4_connect_request(request: &TargetRequest, userid: &str) -> Result<Vec<u8>> {
     let mut packet = vec![
         0x04,
         SOCKS_CMD_CONNECT,
@@ -1031,13 +1205,7 @@ async fn connect_socks4(proxy: &ProxyRecord, request: &TargetRequest) -> Result<
         packet.extend_from_slice(request.host.as_bytes());
         packet.push(0x00);
     }
-    stream.write_all(&packet).await?;
-    let mut response = [0u8; 8];
-    stream.read_exact(&mut response).await?;
-    if response[1] != 0x5a {
-        return Err(anyhow!("{}", socks4_reply_message(response[1])));
-    }
-    Ok(stream)
+    Ok(packet)
 }
 
 fn socks4_reply_message(code: u8) -> String {
@@ -1052,8 +1220,10 @@ fn socks4_reply_message(code: u8) -> String {
 async fn connect_http_proxy(
     proxy: &ProxyRecord,
     request: &TargetRequest,
+    scope: &mut FailureScope,
 ) -> Result<ConnectedUpstream> {
     let mut stream = TcpStream::connect((proxy.host.as_str(), proxy.port as u16)).await?;
+    *scope = FailureScope::Target;
     if request.inbound == InboundProtocol::HttpForward {
         let payload = build_http_forward_proxy_payload(proxy, request)?;
         return Ok(ConnectedUpstream {
@@ -1078,7 +1248,20 @@ async fn connect_http_proxy(
     let (header, prefetched_response) =
         read_http_request_header(&mut stream, Vec::new(), 5000).await?;
     let first = header.lines().next().unwrap_or_default();
-    if first.split_whitespace().nth(1) != Some("200") {
+    let mut parts = first.split_whitespace();
+    let version = parts.next().unwrap_or_default();
+    let code = parts.next().and_then(|value| value.parse::<u16>().ok());
+    if !matches!(version, "HTTP/1.0" | "HTTP/1.1")
+        || !code.is_some_and(|code| (100..=599).contains(&code))
+    {
+        *scope = FailureScope::Proxy;
+        return Err(anyhow!("无效的 HTTP 代理响应: {first}"));
+    }
+    if code == Some(407) {
+        *scope = FailureScope::Proxy;
+        return Err(anyhow!("HTTP代理认证失败: {first}"));
+    }
+    if !code.is_some_and(|code| (200..300).contains(&code)) {
         return Err(anyhow!("HTTP代理CONNECT失败: {first}"));
     }
     Ok(ConnectedUpstream {
@@ -1722,19 +1905,31 @@ impl ProxyMetrics {
             success,
             response_time,
         });
-        while self
-            .requests
-            .front()
-            .map(|metric| now - metric.timestamp > 5 * 60 * 1000)
-            .unwrap_or(false)
-        {
-            self.requests.pop_front();
-        }
+        self.prune(now);
         self.last_used = now;
         if success {
             self.last_success = now;
         }
         self.score = self.calculate_score();
+    }
+
+    fn prune(&mut self, now: i64) {
+        let old_len = self.requests.len();
+        while self
+            .requests
+            .front()
+            .map(|metric| now.saturating_sub(metric.timestamp) > METRICS_WINDOW_MS)
+            .unwrap_or(false)
+        {
+            self.requests.pop_front();
+        }
+        if self.requests.len() != old_len {
+            self.score = if self.requests.is_empty() {
+                50.0
+            } else {
+                self.calculate_score()
+            };
+        }
     }
 
     fn summary(&self) -> (i64, i64, i64) {
@@ -1820,6 +2015,9 @@ impl CircuitBreaker {
         }
     }
 }
+
+#[cfg(test)]
+mod routing_tests;
 
 #[cfg(test)]
 mod tests {
