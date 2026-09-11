@@ -96,7 +96,7 @@ export function AboutDialog({
             <FieldContent>
               <FieldTitle>国内加速</FieldTitle>
               <FieldDescription>
-                通过 gh.lessdo.top 镜像检查更新与下载，适用于无法直连 GitHub 的网络
+                通过 ghproxy.net 镜像检查更新与下载，适用于无法直连 GitHub 的网络
               </FieldDescription>
             </FieldContent>
             <Switch

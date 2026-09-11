@@ -32,8 +32,8 @@ use crate::{
 const GITHUB_LATEST_RELEASE_URL: &str =
     "https://api.github.com/repos/ccpopy/proxy-load/releases/latest";
 const GITHUB_RELEASES_URL: &str = "https://github.com/ccpopy/proxy-load/releases";
-// gh-proxy（hunshcn/gh-proxy）镜像，仅支持 github.com 页面与资产下载，不支持 api.github.com
-const GH_PROXY_BASE: &str = "https://gh.lessdo.top/";
+// ghproxy.net 支持 GitHub 发布页面与资产下载，不支持 api.github.com。
+const GH_PROXY_BASE: &str = "https://ghproxy.net/";
 const GITHUB_TOKEN_ENV: &str = "PROXY_LOAD_GITHUB_TOKEN";
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
