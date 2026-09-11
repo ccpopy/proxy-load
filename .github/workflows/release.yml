@@ -9,7 +9,7 @@ on:
       release_tag:
         description: "Release tag to upload assets to"
         required: true
-        default: "v26.8.3"
+        default: "v26.9.11"
       target:
         description: "Build target"
         required: true
@@ -121,10 +121,23 @@ jobs:
           releaseBody: |
             ## Changes
 
-            ### 新增
+            ### 调整
 
-            - 高级设置新增“启动时全量测活”开关，默认开启。
-            - 开启后，应用每次启动都会立即探测全部已启用代理，并直接刷新在线或离线状态，避免沿用上次保存的健康状态。
+            - 国内加速镜像更换为 https://ghproxy.net，用于检查 GitHub 发布版本和下载更新包。
+            - 自适应选路纳入实时连接数，正在建连的请求也参与计数，降低并发请求集中到同一代理的情况。
+            - 移除代理重试间固定的 300ms 等待，每次重试重新比较当前候选负载。
+            - 新配置默认单次连接超时 5 秒、总超时 15 秒，最多尝试 3 个代理；已有保存配置保持不变。
+
+            ### 修复
+
+            - 区分代理连接或认证故障与目标链路故障，目标失败不再混入代理全局熔断和评分。
+            - 按代理、目标域名、实际连接地址和端口独立管理目标链路冷却，避免一个网站不可达影响其他目标。
+            - 修正成功代理的评分耗时，仅计算该节点自身建连时间，并清理过期的运行时评分样本。
+
+            ### 文档与测试
+
+            - 补充分组路由、默认分组、自动切换边界及高级配置说明。
+            - 新增 22 项回归测试，覆盖并发选路、故障隔离、重试边界、超时分类和业务请求不重放。
           releaseDraft: false
           prerelease: ${{ contains(env.RELEASE_TAG, '-') }}
           assetNamePattern: proxy-load_${{ steps.package-version.outputs.version }}_[platform]_[arch][setup][ext]
