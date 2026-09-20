@@ -9,7 +9,7 @@ on:
       release_tag:
         description: "Release tag to upload assets to"
         required: true
-        default: "v26.9.20"
+        default: "v26.9.2001"
       target:
         description: "Build target"
         required: true
