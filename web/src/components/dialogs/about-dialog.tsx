@@ -2,6 +2,7 @@ import { type ReactNode } from "react"
 import { Download, Loader2, Network, RefreshCw } from "lucide-react"
 
 import { type ServiceInfo } from "@/lib/api"
+import { useUpdateMirrorSettings } from "@/lib/use-update-mirror-settings"
 import type { UpdateInfo, VersionInfo } from "@/types"
 import { Button } from "@/components/ui/button"
 import {
@@ -19,6 +20,7 @@ import {
   FieldTitle,
 } from "@/components/ui/field"
 import { Switch } from "@/components/ui/switch"
+import { UpdateMirrorAddressField } from "@/components/dialogs/update-mirror-address-field"
 
 export function AboutDialog({
   open,
@@ -31,6 +33,7 @@ export function AboutDialog({
   useMirror,
   autoCheckUpdates,
   onUseMirrorChange,
+  onMirrorUrlSaved,
   onAutoCheckUpdatesChange,
   onCheckUpdates,
   onInstallUpdate,
@@ -45,13 +48,15 @@ export function AboutDialog({
   useMirror: boolean
   autoCheckUpdates: boolean
   onUseMirrorChange: (value: boolean) => void
+  onMirrorUrlSaved: () => void
   onAutoCheckUpdatesChange: (value: boolean) => void
   onCheckUpdates: () => void
   onInstallUpdate: () => void
 }) {
+  const mirror = useUpdateMirrorSettings(open, onMirrorUrlSaved)
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-xl">
+      <DialogContent className="max-h-[calc(100dvh-2rem)] overflow-y-auto sm:max-w-xl">
         <DialogHeader>
           <DialogTitle>关于与更新</DialogTitle>
           <DialogDescription>应用版本与运行信息</DialogDescription>
@@ -92,19 +97,23 @@ export function AboutDialog({
             )}
           </div>
 
-          <Field orientation="horizontal" className="rounded-md border bg-card/40 p-4">
-            <FieldContent>
-              <FieldTitle>国内加速</FieldTitle>
-              <FieldDescription>
-                通过 ghproxy.net 镜像检查更新与下载，适用于无法直连 GitHub 的网络
-              </FieldDescription>
-            </FieldContent>
-            <Switch
-              aria-label="启用国内加速"
-              checked={useMirror}
-              onCheckedChange={onUseMirrorChange}
-            />
-          </Field>
+          <div className="grid gap-4 rounded-md border bg-card/40 p-4">
+            <Field orientation="horizontal">
+              <FieldContent>
+                <FieldTitle>国内加速</FieldTitle>
+                <FieldDescription>
+                  开启后通过下方已保存的地址检查更新与下载，关闭时直连 GitHub
+                </FieldDescription>
+              </FieldContent>
+              <Switch
+                aria-label="启用国内加速"
+                checked={useMirror}
+                onCheckedChange={onUseMirrorChange}
+                disabled={mirror.saving || installing}
+              />
+            </Field>
+            <UpdateMirrorAddressField state={mirror} busy={checking || installing} />
+          </div>
 
           <Field orientation="horizontal" className="rounded-md border bg-card/40 p-4">
             <FieldContent>
@@ -122,7 +131,7 @@ export function AboutDialog({
         </div>
 
         <DialogFooter>
-          <Button variant="outline" onClick={onCheckUpdates} disabled={checking}>
+          <Button variant="outline" onClick={onCheckUpdates} disabled={checking || installing || mirror.saving}>
             {checking ? (
               <Loader2 data-icon="inline-start" className="animate-spin" />
             ) : (
@@ -132,7 +141,7 @@ export function AboutDialog({
           </Button>
           <Button
             onClick={onInstallUpdate}
-            disabled={!updateInfo?.latest || installing}
+            disabled={!updateInfo?.latest || installing || checking || mirror.saving}
           >
             {installing ? (
               <Loader2 data-icon="inline-start" className="animate-spin" />

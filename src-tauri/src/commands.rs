@@ -26,14 +26,12 @@ use crate::{
     models::{ConfigBundle, DnsInput, ProxyGroupInput, ProxyInput, CONFIG_BUNDLE_KIND},
     proxy::ProxyServiceStatus,
     state::AppState,
-    version,
+    update_mirror, version,
 };
 
 const GITHUB_LATEST_RELEASE_URL: &str =
     "https://api.github.com/repos/ccpopy/proxy-load/releases/latest";
 const GITHUB_RELEASES_URL: &str = "https://github.com/ccpopy/proxy-load/releases";
-// ghproxy.net 支持 GitHub 发布页面与资产下载，不支持 api.github.com。
-const GH_PROXY_BASE: &str = "https://ghproxy.net/";
 const GITHUB_TOKEN_ENV: &str = "PROXY_LOAD_GITHUB_TOKEN";
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -888,18 +886,39 @@ pub struct UpdateInfo {
 }
 
 #[tauri::command]
-pub async fn check_for_updates(use_mirror: Option<bool>) -> CommandResult<UpdateInfo> {
-    build_update_info(use_mirror.unwrap_or(false)).await
+pub fn get_update_mirror_settings(
+    state: tauri::State<'_, Arc<AppState>>,
+) -> CommandResult<update_mirror::MirrorSettings> {
+    Ok(update_mirror::settings(&state.db)?)
+}
+
+#[tauri::command]
+pub async fn save_update_mirror_url(
+    state: tauri::State<'_, Arc<AppState>>,
+    url: String,
+) -> CommandResult<update_mirror::MirrorSettings> {
+    Ok(update_mirror::save(&state.db, &url).await?)
+}
+
+#[tauri::command]
+pub async fn check_for_updates(
+    state: tauri::State<'_, Arc<AppState>>,
+    use_mirror: Option<bool>,
+) -> CommandResult<UpdateInfo> {
+    let mirror = update_mirror::selected_url(&state.db, use_mirror.unwrap_or(false))?;
+    build_update_info(mirror.as_deref()).await
 }
 
 #[tauri::command]
 pub async fn install_update(
     app: AppHandle,
+    state: tauri::State<'_, Arc<AppState>>,
     artifact_path: Option<String>,
     use_mirror: Option<bool>,
 ) -> CommandResult<Value> {
     let use_mirror = use_mirror.unwrap_or(false);
-    let info = build_update_info(use_mirror).await?;
+    let mirror = update_mirror::selected_url(&state.db, use_mirror)?;
+    let info = build_update_info(mirror.as_deref()).await?;
     let app_dir = PathBuf::from(&info.app_dir);
     let download_dir = PathBuf::from(&info.download_dir);
     let selected = artifact_path
@@ -1311,7 +1330,7 @@ fn ensure_positive(value: i64, field: &str) -> CommandResult<i64> {
     }
 }
 
-async fn build_update_info(use_mirror: bool) -> CommandResult<UpdateInfo> {
+async fn build_update_info(mirror_base: Option<&str>) -> CommandResult<UpdateInfo> {
     if cfg!(debug_assertions) {
         return Err(CommandError::new(
             "开发环境不允许检查更新；生产环境将从 GitHub Releases 获取更新包",
@@ -1326,8 +1345,8 @@ async fn build_update_info(use_mirror: bool) -> CommandResult<UpdateInfo> {
     let current_version = version::VERSION.to_string();
     let current = VersionParts::parse(version::VERSION)
         .ok_or_else(|| CommandError::new("当前版本号格式无效"))?;
-    let (release_tag, assets) = if use_mirror {
-        fetch_latest_release_via_mirror().await?
+    let (release_tag, assets) = if let Some(base) = mirror_base {
+        fetch_latest_release_via_mirror(base).await?
     } else {
         fetch_latest_release_via_api().await?
     };
@@ -1362,7 +1381,7 @@ async fn build_update_info(use_mirror: bool) -> CommandResult<UpdateInfo> {
         app_dir: app_dir.display().to_string(),
         download_dir: download_dir.display().to_string(),
         install_mode: install_mode.to_string(),
-        source: if use_mirror {
+        source: if mirror_base.is_some() {
             "gh-proxy-mirror".to_string()
         } else {
             "github-releases".to_string()
@@ -1431,14 +1450,16 @@ async fn fetch_latest_release_via_api() -> CommandResult<(String, Vec<ReleaseAss
 
 /// gh-proxy 镜像不代理 api.github.com，改用 releases/latest 的 302 重定向获取最新
 /// 标签，再从 expanded_assets 页面提取资产文件名。
-async fn fetch_latest_release_via_mirror() -> CommandResult<(String, Vec<ReleaseAssetRef>)> {
+async fn fetch_latest_release_via_mirror(
+    mirror_base: &str,
+) -> CommandResult<(String, Vec<ReleaseAssetRef>)> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(20))
         .user_agent(format!("proxy-load/{}", version::VERSION))
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
     let response = client
-        .get(format!("{GH_PROXY_BASE}{GITHUB_RELEASES_URL}/latest"))
+        .get(format!("{mirror_base}{GITHUB_RELEASES_URL}/latest"))
         .send()
         .await?;
     let status = response.status();
@@ -1452,7 +1473,7 @@ async fn fetch_latest_release_via_mirror() -> CommandResult<(String, Vec<Release
         extract_release_tag(&response.text().await?)
     } else {
         return Err(CommandError::new(format!(
-            "国内加速查询最新版本失败: HTTP {status}（镜像 {GH_PROXY_BASE}）"
+            "国内加速查询最新版本失败: HTTP {status}（镜像 {mirror_base}）"
         )));
     };
     let tag = tag
@@ -1461,14 +1482,14 @@ async fn fetch_latest_release_via_mirror() -> CommandResult<(String, Vec<Release
     let client = github_client(Duration::from_secs(20))?;
     let response = client
         .get(format!(
-            "{GH_PROXY_BASE}{GITHUB_RELEASES_URL}/expanded_assets/{tag}"
+            "{mirror_base}{GITHUB_RELEASES_URL}/expanded_assets/{tag}"
         ))
         .send()
         .await?;
     let status = response.status();
     if !status.is_success() {
         return Err(CommandError::new(format!(
-            "国内加速获取更新包列表失败: HTTP {status}（镜像 {GH_PROXY_BASE}）"
+            "国内加速获取更新包列表失败: HTTP {status}（镜像 {mirror_base}）"
         )));
     }
     let html = response.text().await?;
@@ -1482,7 +1503,7 @@ async fn fetch_latest_release_via_mirror() -> CommandResult<(String, Vec<Release
     let assets = names
         .into_iter()
         .map(|name| ReleaseAssetRef {
-            download_url: format!("{GH_PROXY_BASE}{GITHUB_RELEASES_URL}/download/{tag}/{name}"),
+            download_url: format!("{mirror_base}{GITHUB_RELEASES_URL}/download/{tag}/{name}"),
             name,
             size: None,
         })
@@ -1704,6 +1725,51 @@ mod tests {
     };
     use crate::database::default_advanced_config;
     use serde_json::{json, Map, Value};
+
+    #[tokio::test]
+    async fn custom_mirror_prefix_is_used_for_release_pages_and_asset_urls() {
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpListener,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/custom-prefix/", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            for endpoint in ["latest", "expanded_assets/v26.9.11"] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(stream.read_u8().await.unwrap());
+                }
+                let request = String::from_utf8(request).unwrap();
+                assert!(request.starts_with(&format!("GET /custom-prefix/https://github.com/ccpopy/proxy-load/releases/{endpoint} HTTP/1.1\r\n")), "{request}");
+                assert!(!request.to_lowercase().contains("authorization:"));
+                let response = if endpoint == "latest" {
+                    "HTTP/1.1 302 Found\r\nLocation: /https://github.com/ccpopy/proxy-load/releases/tag/v26.9.11\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                } else {
+                    let body = r#"<a href="/ccpopy/proxy-load/releases/download/v26.9.11/proxy-load_26.9.11_x64-portable.exe">download</a>"#;
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                };
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            super::fetch_latest_release_via_mirror(&base),
+        )
+        .await;
+        if result.is_err() || result.as_ref().is_ok_and(|result| result.is_err()) {
+            task.abort();
+        }
+        let (tag, assets) = result.unwrap().unwrap();
+        assert_eq!(tag, "v26.9.11");
+        assert_eq!(assets.len(), 1);
+        assert_eq!(assets[0].download_url, format!("{base}https://github.com/ccpopy/proxy-load/releases/download/v26.9.11/proxy-load_26.9.11_x64-portable.exe"));
+        task.await.unwrap();
+    }
 
     #[test]
     fn load_settings_reject_removed_manual_mode_and_normalizes_round_robin() {

@@ -6,6 +6,7 @@ mod models;
 mod proxy;
 mod proxy_tester;
 mod state;
+mod update_mirror;
 mod version;
 
 use std::sync::{
@@ -148,6 +149,8 @@ pub fn run() {
             commands::traffic_logs,
             commands::clear_traffic_logs,
             commands::version_info,
+            commands::get_update_mirror_settings,
+            commands::save_update_mirror_url,
             commands::check_for_updates,
             commands::install_update
         ])

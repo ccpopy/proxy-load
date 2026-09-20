@@ -100,6 +100,7 @@ export function App() {
   )
   const notifiedUpdateVersions = useRef(new Set<string>())
   const updateInstallingRef = useRef(false)
+  const updatePreferencesRevision = useRef(0)
   const [proxyDialog, setProxyDialog] = useState<ProxyRecord | "new" | null>(null)
   const [dnsDialog, setDnsDialog] = useState<DnsMapping | "new" | null>(null)
   const [groupDialog, setGroupDialog] = useState<ProxyGroup | "new" | null>(null)
@@ -269,9 +270,11 @@ export function App() {
     async ({ automatic = false }: { automatic?: boolean } = {}) => {
       if (!automatic) setUpdateChecking(true)
       const useMirror = useUpdateMirror
+      const revision = updatePreferencesRevision.current
 
       try {
         const info = await command<UpdateInfo>("check_for_updates", { useMirror })
+        if (revision !== updatePreferencesRevision.current) return
         setUpdateInfo(info)
         if (info.hasUpdate) {
           showUpdateAvailableToast(info, useMirror, automatic)
@@ -279,6 +282,7 @@ export function App() {
           toast.info("当前已是最新版本")
         }
       } catch (error) {
+        if (revision !== updatePreferencesRevision.current) return
         toast.error(
           commandErrorMessage(
             error,
@@ -293,8 +297,14 @@ export function App() {
   )
 
   const handleUseUpdateMirrorChange = useCallback((value: boolean) => {
+    updatePreferencesRevision.current += 1
     setUseUpdateMirror(value)
     writeBooleanPreference(UPDATE_MIRROR_STORAGE_KEY, value)
+    setUpdateInfo(null)
+  }, [])
+
+  const handleMirrorUrlSaved = useCallback(() => {
+    updatePreferencesRevision.current += 1
     setUpdateInfo(null)
   }, [])
 
@@ -628,6 +638,7 @@ export function App() {
         useMirror={useUpdateMirror}
         autoCheckUpdates={autoCheckUpdates}
         onUseMirrorChange={handleUseUpdateMirrorChange}
+        onMirrorUrlSaved={handleMirrorUrlSaved}
         onAutoCheckUpdatesChange={handleAutoCheckUpdatesChange}
         onCheckUpdates={() => checkForUpdates()}
         onInstallUpdate={() => installUpdate(updateInfo)}
