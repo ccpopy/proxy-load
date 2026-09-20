@@ -566,7 +566,7 @@ async fn probe_target_failure_and_local_network_failure_do_not_poison_global_hea
     assert_eq!(latest.status.as_deref(), Some("unknown"));
     assert_eq!(latest.fail_count, 0);
     runtime
-        .record_route_failure_locked(proxy.id, &request("target.test"), FailureScope::Network)
+        .record_route_failure_locked(proxy.id, &request("target.test"), FailureScope::LocalRoute)
         .await;
     assert!(
         runtime
@@ -606,6 +606,102 @@ fn million_metric_updates_remain_bounded_and_incremental() {
     metric.prune(last + METRICS_WINDOW_MS + 1);
     assert_eq!(metric.summary(), (0, 0, 0));
     assert_eq!(metric.score, 50.0);
+}
+
+#[tokio::test]
+async fn local_route_failure_retries_other_path_inside_pool_without_penalty() {
+    for host in ["192.0.2.1", "2001:db8::1"] {
+        let runtime = runtime();
+        runtime.runtime_settings.write().unwrap().algorithm = "round_robin".into();
+        let first = runtime
+            .db
+            .create_proxy(ProxyInput {
+                name: "unreachable path".into(),
+                proxy_type: "http".into(),
+                host: host.into(),
+                port: 19001,
+                enabled: Some(1),
+                username: None,
+                password: None,
+                test_url: None,
+                test_timeout: None,
+                skip_cert_verify: None,
+            })
+            .unwrap();
+        let (port, server) = http_proxy(vec!["HTTP/1.1 200 Connection Established\r\n\r\n"]).await;
+        let second = add_proxy(&runtime, port);
+        let outside = add_proxy(&runtime, 19003);
+        runtime
+            .db
+            .create_proxy_group(ProxyGroupInput {
+                name: Some("routes".into()),
+                domains: Some(vec!["example.com".into()]),
+                proxy_ids: Some(vec![first.id, second.id]),
+                algorithm_override: Some(Some("round_robin".into())),
+                ..Default::default()
+            })
+            .unwrap();
+        runtime
+            .injected_connect_errors
+            .lock()
+            .unwrap()
+            .insert(first.id, std::io::ErrorKind::NetworkUnreachable);
+        let (lease, _) =
+            connect_with_fail_fast(runtime.clone(), &request("example.com"), Instant::now())
+                .await
+                .unwrap();
+        assert_eq!(lease.id, second.id);
+        assert!(
+            runtime.injected_connect_errors.lock().unwrap().is_empty(),
+            "first route must actually be attempted"
+        );
+        assert_eq!(
+            runtime.circuit_breakers.read().unwrap()[&first.id].failures,
+            0
+        );
+        assert!(!runtime.metrics.read().unwrap().contains_key(&first.id));
+        assert!(!runtime
+            .circuit_breakers
+            .read()
+            .unwrap()
+            .contains_key(&outside.id));
+        server.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn local_route_failures_remain_bounded_when_all_paths_are_offline() {
+    let runtime = runtime();
+    {
+        let mut settings = runtime.runtime_settings.write().unwrap();
+        settings.algorithm = "round_robin".into();
+        settings.fail_fast.max_attempts = 2;
+        settings.fail_fast.total_timeout_ms = 100;
+    }
+    for port in [19001, 19002, 19003] {
+        let proxy = add_proxy(&runtime, port);
+        runtime
+            .injected_connect_errors
+            .lock()
+            .unwrap()
+            .insert(proxy.id, std::io::ErrorKind::NetworkDown);
+    }
+    let started = Instant::now();
+    let error = connect_with_fail_fast(runtime.clone(), &request("example.com"), started)
+        .await
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("本地路由不可达"));
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert_eq!(runtime.injected_connect_errors.lock().unwrap().len(), 1);
+    assert!(runtime.metrics.read().unwrap().is_empty());
+    assert!(runtime
+        .circuit_breakers
+        .read()
+        .unwrap()
+        .values()
+        .all(|breaker| breaker.failures == 0));
+    assert_eq!(runtime.global_dial_slots.available_permits(), 64);
 }
 
 #[tokio::test]

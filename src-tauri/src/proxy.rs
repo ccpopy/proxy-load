@@ -60,6 +60,8 @@ pub struct ProxyRuntime {
     runtime_settings: Arc<SyncRwLock<RuntimeSettings>>,
     status_locks: Arc<Mutex<HashMap<i64, Arc<Mutex<()>>>>>,
     shutdown: tokio::sync::watch::Sender<bool>,
+    #[cfg(test)]
+    injected_connect_errors: Arc<SyncMutex<HashMap<i64, std::io::ErrorKind>>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -110,7 +112,7 @@ struct TargetCircuit {
 enum FailureScope {
     Proxy,
     Target,
-    Network,
+    LocalRoute,
 }
 
 impl FailureScope {
@@ -118,7 +120,7 @@ impl FailureScope {
         match self {
             Self::Proxy => "代理连接/认证",
             Self::Target => "目标链路",
-            Self::Network => "本地网络不可用",
+            Self::LocalRoute => "本地路由不可达",
         }
     }
 }
@@ -355,6 +357,8 @@ impl ProxyRuntime {
             runtime_settings: Arc::new(SyncRwLock::new(runtime_settings)),
             status_locks: Arc::new(Mutex::new(HashMap::new())),
             shutdown: tokio::sync::watch::channel(false).0,
+            #[cfg(test)]
+            injected_connect_errors: Arc::new(SyncMutex::new(HashMap::new())),
         })
     }
 
@@ -1111,8 +1115,8 @@ impl ProxyRuntime {
         request: &TargetRequest,
         scope: FailureScope,
     ) {
-        if scope == FailureScope::Network {
-            // Network-down is not evidence against a particular proxy or destination.
+        if scope == FailureScope::LocalRoute {
+            // One local path failing is not evidence against any proxy/destination.
             return;
         }
         if scope == FailureScope::Proxy {
@@ -1669,13 +1673,24 @@ async fn connect_with_fail_fast(
         let mut scope = FailureScope::Proxy;
         let attempt = timeout(
             Duration::from_millis(config.attempt_timeout_ms).min(remaining),
-            connect_through_proxy(&proxy, request, &mut scope),
+            async {
+                #[cfg(test)]
+                if let Some(kind) = runtime
+                    .injected_connect_errors
+                    .lock()
+                    .unwrap()
+                    .remove(&proxy.id)
+                {
+                    return Err(std::io::Error::from(kind).into());
+                }
+                connect_through_proxy(&proxy, request, &mut scope).await
+            },
         )
         .await
         .unwrap_or_else(|_| Err(anyhow!("{}超时", scope.label())));
         let attempt_elapsed_us = attempt_started.elapsed().as_micros() as u64;
         if attempt.as_ref().err().is_some_and(is_local_network_error) {
-            scope = FailureScope::Network;
+            scope = FailureScope::LocalRoute;
         }
         runtime.telemetry.record(
             "attempt_total",
@@ -1730,11 +1745,14 @@ async fn connect_with_fail_fast(
             }
             Err(error) => {
                 failover_started.get_or_insert_with(Instant::now);
-                if scope == FailureScope::Network {
+                if scope == FailureScope::LocalRoute {
                     runtime
                         .telemetry
                         .record("local_network_failure", attempt_elapsed_us);
-                    return Err(error.context("本地网络不可用"));
+                    errors.push(format!("{} [{}]: {error:#}", proxy.name, scope.label()));
+                    // No independent evidence of global offline: keep the same pool,
+                    // total deadline and attempt cap, without penalizing node health.
+                    continue;
                 }
                 runtime.telemetry.record(
                     if scope == FailureScope::Proxy {
@@ -2767,7 +2785,10 @@ fn is_local_network_error(error: &anyhow::Error) -> bool {
         .chain()
         .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
         .any(|io| {
-            matches!(io.raw_os_error(), Some(10050 | 10051))
+            matches!(
+                io.kind(),
+                std::io::ErrorKind::NetworkDown | std::io::ErrorKind::NetworkUnreachable
+            ) || cfg!(windows) && matches!(io.raw_os_error(), Some(10050 | 10051))
                 || cfg!(target_os = "linux") && matches!(io.raw_os_error(), Some(100 | 101))
                 || cfg!(target_os = "macos") && matches!(io.raw_os_error(), Some(50 | 51))
         })
