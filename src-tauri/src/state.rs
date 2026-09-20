@@ -24,6 +24,8 @@ use crate::{
 const PROXY_LISTEN_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 #[cfg(test)]
 mod probe_tests;
+#[cfg(test)]
+mod readiness_tests;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -340,15 +342,14 @@ impl AppState {
             };
             if first_cycle {
                 first_cycle = false;
-                if schedule.startup_probe_enabled {
-                    if let Err(error) = self.run_startup_probe(&schedule, &mut last_probe).await {
-                        eprintln!("启动代理测试失败: {error:#}");
-                    }
+                if let Err(error) = self.run_startup_probe(&schedule, &mut last_probe).await {
+                    eprintln!("启动代理测试失败: {error:#}");
                 }
             } else if let Err(error) = self.run_probe_cycle(&schedule, &mut last_probe).await {
                 eprintln!("定期代理测试失败: {error:#}");
             }
             tokio::select! {
+                _ = self.proxy_runtime.cancelled() => break,
                 _ = time::sleep(schedule.tick) => {}
                 _ = self.probe_notify.notified() => {}
             }
@@ -361,7 +362,10 @@ impl AppState {
         schedule: &ProbeSchedule,
         last_probe: &mut HashMap<i64, i64>,
     ) -> Result<()> {
-        let proxies = self.db.list_enabled_proxies()?;
+        let mut proxies = self.db.list_enabled_proxies()?;
+        if !schedule.startup_probe_enabled {
+            proxies.retain(|proxy| proxy.health_policy.required());
+        }
         let now = proxy::monotonic_millis();
         for proxy in &proxies {
             last_probe.insert(proxy.id, now);
@@ -405,10 +409,16 @@ impl AppState {
                 continue;
             }
             let last_success = recent_success.get(&proxy.id).copied().unwrap_or(0);
-            if last_success > 0 && now.saturating_sub(last_success) < active_window {
+            if !proxy.health_policy.required()
+                && last_success > 0
+                && now.saturating_sub(last_success) < active_window
+            {
                 continue;
             }
-            let interval = if proxy.status.as_deref() == Some("active") {
+            let interval = if proxy.status.as_deref() == Some("active")
+                && (!proxy.health_policy.required()
+                    || proxy.probe_health.readiness_status == crate::probe_health::Readiness::Ready)
+            {
                 base_interval
             } else {
                 recovery_interval
@@ -420,13 +430,19 @@ impl AppState {
                 .get(&proxy.id)
                 .copied()
                 .unwrap_or(0);
+            let failures = if proxy.health_policy.required() {
+                proxy.probe_health.consecutive_failures
+            } else {
+                failures
+            };
             let interval = interval.saturating_mul(1i64 << failures.saturating_sub(1).min(3));
             let jitter = (crate::routing::affinity(proxy.id, "probe-schedule", 0) % 1000) as i64
                 * (interval / 10)
                 / 1000;
-            let due_now = last_probe
-                .get(&proxy.id)
-                .is_none_or(|last| now.saturating_sub(*last) >= interval.saturating_add(jitter));
+            let due_now = (proxy.health_policy.required() && !proxy.probe_health.fresh)
+                || last_probe.get(&proxy.id).is_none_or(|last| {
+                    now.saturating_sub(*last) >= interval.saturating_add(jitter)
+                });
             if due_now {
                 due.push(proxy);
             }
@@ -511,7 +527,7 @@ impl AppState {
             return Ok(None);
         }
 
-        let settings_revision = self.db.probe_settings_revision();
+        let (dns_mappings, settings_revision) = self.proxy_runtime.probe_dns_snapshot().await;
         let settings = self.db.settings_map()?;
         {
             let results = self.probe_results.lock().await;
@@ -570,14 +586,14 @@ impl AppState {
 
         let result = tokio::select! {
             _ = self.proxy_runtime.cancelled() => return Err(anyhow!("服务已停止，测活已取消")),
-            result = proxy_tester::test_proxy(&proxy, &test_url, timeout) => result,
+            result = proxy_tester::test_proxy_mapped(&proxy, &test_url, timeout, &dns_mappings) => result,
         };
         let _settings_guard = self.settings_update_guard().await;
         if self.proxy_runtime.is_stopping() {
             return Err(anyhow!("服务已停止，测活结果已丢弃"));
         }
         let Some(latest) = self.db.get_proxy(proxy.id)? else {
-            return Ok(Some(result));
+            return Err(anyhow!("代理已删除，测活结果已丢弃"));
         };
         let latest_settings = self.db.settings_map()?;
         if self.db.probe_settings_revision() != settings_revision
@@ -592,9 +608,14 @@ impl AppState {
         let traffic_was_alive_before_apply =
             recent_success.get(&proxy.id).copied().unwrap_or(0) > probe_started_at;
         let proxy_proven = result.diagnostics.proxy_proven();
-        let desired_status = if proxy_proven {
+        let desired_status = if result.success {
             self.probe_failures.lock().await.remove(&proxy.id);
             Some("active")
+        } else if proxy_proven {
+            // Entry evidence may clear a transport failure streak, but never promotes
+            // a failed complete probe or counts it as a success.
+            self.probe_failures.lock().await.remove(&proxy.id);
+            None
         } else if result.failure_scope.as_deref() != Some("proxy") {
             // A test destination failure is not evidence that this proxy is globally unhealthy.
             None
@@ -616,20 +637,12 @@ impl AppState {
 
         let record_result = self
             .proxy_runtime
-            .record_probe_result(
+            .record_probe_observation(
                 &proxy,
                 probe_generation,
                 probe_started_at,
                 desired_status,
-                proxy_proven.then(|| {
-                    let timings = &result.diagnostics.timings;
-                    (timings
-                        .proxy_tcp_us
-                        .unwrap_or(0)
-                        .saturating_add(timings.proxy_auth_us.unwrap_or(0))
-                        / 1000) as i64
-                }),
-                proxy_proven,
+                (&result, &test_url, settings_revision),
             )
             .await;
         let (applied_status, traffic_proved_alive) = match record_result {
@@ -773,15 +786,7 @@ impl ProbeOrigin {
 }
 
 fn same_probe_configuration(left: &ProxyRecord, right: &ProxyRecord) -> bool {
-    left.proxy_type == right.proxy_type
-        && left.host == right.host
-        && left.port == right.port
-        && left.username == right.username
-        && left.password == right.password
-        && left.enabled == right.enabled
-        && left.test_url == right.test_url
-        && left.test_timeout == right.test_timeout
-        && left.skip_cert_verify == right.skip_cert_verify
+    crate::routing::same_node(left, right)
 }
 
 struct ProbeSchedule {

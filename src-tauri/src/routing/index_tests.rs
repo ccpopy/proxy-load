@@ -16,6 +16,7 @@ fn nodes(count: usize) -> Vec<ProxyRecord> {
             enabled: Some(1),
             test_url: None,
             test_timeout: None,
+            health_policy: Default::default(),
             skip_cert_verify: None,
         })
         .unwrap();

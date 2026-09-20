@@ -20,6 +20,7 @@ use crate::models::{
 };
 
 const TRAFFIC_LOG_VISIBLE_AFTER_ID_KEY: &str = "traffic_log_visible_after_id";
+use crate::probe_health::{HealthEntry, ProbeHealth};
 use crate::routing::{RoutingPool, RoutingSnapshot};
 
 #[derive(Clone)]
@@ -30,6 +31,7 @@ pub struct Database {
     query_cache: Arc<Mutex<HashMap<String, (std::time::Instant, Value)>>>,
     status_revisions: Arc<Mutex<HashMap<i64, u64>>>,
     probe_settings_revision: Arc<AtomicU64>,
+    probe_health: Arc<RwLock<HashMap<i64, HealthEntry>>>,
 }
 
 #[cfg(test)]
@@ -58,6 +60,7 @@ impl Database {
             query_cache: Arc::new(Mutex::new(HashMap::new())),
             status_revisions: Arc::new(Mutex::new(HashMap::new())),
             probe_settings_revision: Default::default(),
+            probe_health: Default::default(),
         };
         db.migrate()?;
         let mut conn = db.connection()?;
@@ -87,6 +90,7 @@ impl Database {
             query_cache: Arc::new(Mutex::new(HashMap::new())),
             status_revisions: Arc::new(Mutex::new(HashMap::new())),
             probe_settings_revision: Default::default(),
+            probe_health: Default::default(),
         };
         db.migrate()?;
         db.publish_routing(&*db.connection()?)?;
@@ -114,6 +118,7 @@ impl Database {
             query_cache: Arc::new(Mutex::new(HashMap::new())),
             status_revisions: Arc::new(Mutex::new(HashMap::new())),
             probe_settings_revision: Default::default(),
+            probe_health: Default::default(),
         };
         db.migrate()?;
         db.publish_routing(&*db.connection()?)?;
@@ -145,6 +150,7 @@ impl Database {
             query_cache: self.query_cache.clone(),
             status_revisions: self.status_revisions.clone(),
             probe_settings_revision: self.probe_settings_revision.clone(),
+            probe_health: self.probe_health.clone(),
         })
     }
 
@@ -191,6 +197,121 @@ impl Database {
             .get(&id)
             .copied()
             .unwrap_or(0)
+    }
+
+    fn proxy_with_health(&self, row: &Row<'_>) -> rusqlite::Result<ProxyRecord> {
+        let mut proxy = proxy_from_row(row)?;
+        proxy.probe_health = self.current_probe_health(&proxy);
+        Ok(proxy)
+    }
+
+    /// Memory first: routing and IPC see the same decision even while SQLite is busy.
+    /// Persisted readiness is historical evidence, never authorization after restart.
+    pub fn current_probe_health(&self, proxy: &ProxyRecord) -> ProbeHealth {
+        let generation = self
+            .routing_snapshot()
+            .node_generations
+            .get(&proxy.id)
+            .copied();
+        let entries = self.probe_health.read().unwrap_or_else(|e| e.into_inner());
+        match entries.get(&proxy.id) {
+            Some(entry)
+                if entry.generation == generation
+                    && entry.settings_revision == self.probe_settings_revision() =>
+            {
+                entry
+                    .health
+                    .clone()
+                    .expire(&proxy.health_policy, crate::state::now_millis())
+            }
+            Some(entry) => entry.health.clone().invalidated(),
+            None => proxy.probe_health.clone().invalidated(),
+        }
+    }
+
+    pub fn probe_is_ready(&self, proxy: &ProxyRecord, generation: Option<u64>) -> bool {
+        self.probe_health
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&proxy.id)
+            .is_some_and(|entry| {
+                entry.generation == generation
+                    && entry.settings_revision == self.probe_settings_revision()
+                    && entry.health.eligible(&proxy.health_policy)
+            })
+    }
+
+    pub fn publish_probe_health(&self, id: i64, write: &crate::probe_health::ProbeWrite) -> u64 {
+        let mut entries = self.probe_health.write().unwrap_or_else(|e| e.into_inner());
+        let observation_revision = entries
+            .get(&id)
+            .map_or(1, |entry| entry.observation_revision.wrapping_add(1));
+        entries.insert(
+            id,
+            HealthEntry {
+                observation_revision,
+                generation: write.generation,
+                settings_revision: write.settings_revision,
+                health: write.health.clone(),
+            },
+        );
+        observation_revision
+    }
+
+    pub fn invalidate_probe_settings(&self) {
+        self.probe_settings_revision.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub fn persist_probe_observation(
+        &self,
+        proxy: &ProxyRecord,
+        write: &crate::probe_health::ProbeWrite,
+    ) -> Result<bool> {
+        let conn = self.connection()?;
+        if self
+            .routing_snapshot()
+            .node_generations
+            .get(&proxy.id)
+            .copied()
+            != write.generation
+            || self.probe_settings_revision() != write.settings_revision
+            || self
+                .probe_health
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&proxy.id)
+                .is_none_or(|entry| entry.observation_revision != write.observation_revision)
+        {
+            return Ok(false);
+        }
+        let current = conn
+            .query_row(
+                "SELECT * FROM proxies WHERE id = ?",
+                [proxy.id],
+                proxy_from_row,
+            )
+            .optional()?;
+        if current
+            .as_ref()
+            .is_none_or(|current| !crate::routing::same_node(proxy, current))
+        {
+            return Ok(false);
+        }
+        let status = write
+            .status
+            .as_deref()
+            .filter(|_| self.status_revision(proxy.id) == write.status_revision);
+        let updated = conn.execute(
+            "UPDATE proxies SET probe_health = ?, last_test = CURRENT_TIMESTAMP,
+             status = COALESCE(?, status), response_time = CASE WHEN ? IS NULL THEN response_time ELSE ? END
+             WHERE id = ? AND enabled = ?",
+            params![serde_json::to_string(&write.health)?, status, status, write.response_time,
+                proxy.id, proxy.enabled],
+        )?;
+        // Legacy mixed counters intentionally remain historical; only the new counters
+        // describe complete probes, independent of readiness thresholds.
+        self.publish_routing(&conn)?;
+        Ok(updated == 1)
     }
 
     #[cfg(test)]
@@ -407,6 +528,18 @@ impl Database {
 
         add_column_if_missing(&conn, "proxies", "test_url", "TEXT DEFAULT NULL")?;
         add_column_if_missing(&conn, "proxies", "test_timeout", "INTEGER DEFAULT NULL")?;
+        add_column_if_missing(
+            &conn,
+            "proxies",
+            "health_policy",
+            "TEXT NOT NULL DEFAULT '{}'",
+        )?;
+        add_column_if_missing(
+            &conn,
+            "proxies",
+            "probe_health",
+            "TEXT NOT NULL DEFAULT '{}'",
+        )?;
         add_column_if_missing(&conn, "proxies", "skip_cert_verify", "INTEGER DEFAULT 0")?;
         add_column_if_missing(&conn, "request_logs", "result_type", "TEXT")?;
         add_column_if_missing(
@@ -510,7 +643,7 @@ impl Database {
             ORDER BY priority ASC, id ASC
             "#,
         )?;
-        let rows = stmt.query_map([], proxy_from_row)?;
+        let rows = stmt.query_map([], |row| self.proxy_with_health(row))?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
@@ -525,7 +658,7 @@ impl Database {
             ORDER BY priority ASC, id ASC
             "#,
         )?;
-        let rows = stmt.query_map([], proxy_from_row)?;
+        let rows = stmt.query_map([], |row| self.proxy_with_health(row))?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
@@ -539,7 +672,7 @@ impl Database {
             WHERE p.id = ?
             "#,
             params![id],
-            proxy_from_row,
+            |row| self.proxy_with_health(row),
         )
         .optional()
         .map_err(Into::into)
@@ -567,8 +700,8 @@ impl Database {
         conn.execute(
             r#"
             INSERT INTO proxies
-              (name, type, host, port, username, password, enabled, test_url, test_timeout, skip_cert_verify)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              (name, type, host, port, username, password, enabled, test_url, test_timeout, skip_cert_verify, health_policy)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
             params![
                 input.name,
@@ -580,7 +713,8 @@ impl Database {
                 input.enabled.unwrap_or(1),
                 empty_to_none(input.test_url),
                 input.test_timeout,
-                flag_from_value(input.skip_cert_verify.as_ref())
+                flag_from_value(input.skip_cert_verify.as_ref()),
+                serde_json::to_string(&input.health_policy)?
             ],
         )?;
         let id = conn.last_insert_rowid();
@@ -614,12 +748,10 @@ impl Database {
             r#"
             UPDATE proxies
             SET name = ?, type = ?, host = ?, port = ?, username = ?, password = ?, enabled = ?,
-                test_url = ?, test_timeout = ?, skip_cert_verify = ?,
+                test_url = ?, test_timeout = ?, skip_cert_verify = ?, health_policy = ?,
                 status = CASE WHEN ? = 1 THEN 'unknown' ELSE status END,
                 last_test = CASE WHEN ? = 1 THEN NULL ELSE last_test END,
-                response_time = CASE WHEN ? = 1 THEN NULL ELSE response_time END,
-                success_count = CASE WHEN ? = 1 THEN 0 ELSE success_count END,
-                fail_count = CASE WHEN ? = 1 THEN 0 ELSE fail_count END
+                response_time = CASE WHEN ? = 1 THEN NULL ELSE response_time END
             WHERE id = ?
             "#,
             params![
@@ -633,8 +765,7 @@ impl Database {
                 empty_to_none(input.test_url),
                 input.test_timeout,
                 flag_from_value(input.skip_cert_verify.as_ref()),
-                i64::from(reset_status),
-                i64::from(reset_status),
+                serde_json::to_string(&input.health_policy)?,
                 i64::from(reset_status),
                 i64::from(reset_status),
                 i64::from(reset_status),
@@ -654,6 +785,10 @@ impl Database {
             .clear();
         let conn = self.connection()?;
         conn.execute("DELETE FROM proxies WHERE id = ?", params![id])?;
+        self.probe_health
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&id);
         self.publish_routing(&conn)?;
         self.status_revisions
             .lock()
@@ -733,6 +868,7 @@ impl Database {
         self.persist_probe_result(proxy, generation, revision, status, response_time, success)
     }
 
+    #[cfg(test)]
     pub fn persist_probe_result(
         &self,
         proxy: &ProxyRecord,
@@ -883,6 +1019,7 @@ impl Database {
                 test_url: proxy.test_url,
                 test_timeout: proxy.test_timeout,
                 skip_cert_verify: proxy.skip_cert_verify,
+                health_policy: proxy.health_policy,
             })
             .collect();
 
@@ -957,6 +1094,7 @@ impl Database {
                 test_url: bundled_proxy.test_url.clone(),
                 test_timeout: bundled_proxy.test_timeout,
                 skip_cert_verify: Some(Value::from(bundled_proxy.skip_cert_verify)),
+                health_policy: bundled_proxy.health_policy.clone(),
             };
             let Ok(proxy) = normalize_proxy_input(input) else {
                 summary.proxies.skipped += 1;
@@ -976,8 +1114,8 @@ impl Database {
             tx.execute(
                 r#"
                 INSERT INTO proxies
-                  (name, type, host, port, username, password, enabled, priority, test_url, test_timeout, skip_cert_verify)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  (name, type, host, port, username, password, enabled, priority, test_url, test_timeout, skip_cert_verify, health_policy)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 "#,
                 params![
                     proxy.name,
@@ -990,7 +1128,8 @@ impl Database {
                     bundled_proxy.priority,
                     proxy.test_url,
                     proxy.test_timeout,
-                    flag_from_value(proxy.skip_cert_verify.as_ref())
+                    flag_from_value(proxy.skip_cert_verify.as_ref()),
+                    serde_json::to_string(&proxy.health_policy)?
                 ],
             )?;
             summary.proxies.added += 1;
@@ -1657,7 +1796,23 @@ impl Database {
             .routing_snapshot()
             .proxies
             .iter()
-            .filter(|p| p.status.as_deref() == Some("active"))
+            .filter(|p| {
+                let health = self.current_probe_health(p);
+                if p.health_policy.required() {
+                    health.eligible(&p.health_policy)
+                        && health.readiness_status == crate::probe_health::Readiness::Ready
+                        && health
+                            .last_probe_result
+                            .as_ref()
+                            .is_some_and(|r| r.outcome == "success")
+                } else {
+                    p.status.as_deref() == Some("active")
+                        && health
+                            .last_probe_result
+                            .as_ref()
+                            .is_none_or(|r| health.fresh && r.outcome == "success")
+                }
+            })
             .count());
         Ok(value)
     }
@@ -1881,6 +2036,24 @@ fn proxy_from_row(row: &Row<'_>) -> rusqlite::Result<ProxyRecord> {
         skip_cert_verify: row.get::<_, Option<i64>>("skip_cert_verify")?.unwrap_or(0),
         test_url: row.get("test_url")?,
         test_timeout: row.get("test_timeout")?,
+        health_policy: serde_json::from_str(&row.get::<_, String>("health_policy")?).map_err(
+            |e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            },
+        )?,
+        probe_health: serde_json::from_str(&row.get::<_, String>("probe_health")?).map_err(
+            |e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            },
+        )?,
         score: None,
         active_connections: None,
     })
@@ -2008,10 +2181,12 @@ fn proxy_connection_config_changed(existing: &ProxyRecord, input: &ProxyInput) -
         || existing.enabled != input.enabled.unwrap_or(1)
         || existing.test_url != input.test_url
         || existing.test_timeout != input.test_timeout
+        || existing.health_policy != input.health_policy
         || existing.skip_cert_verify != flag_from_value(input.skip_cert_verify.as_ref())
 }
 
 fn normalize_proxy_input(mut input: ProxyInput) -> Result<ProxyInput> {
+    input.health_policy.validate()?;
     input.name = input.name.trim().to_string();
     input.host = input.host.trim().to_lowercase();
     input.proxy_type = normalize_proxy_type(&input.proxy_type)?;
@@ -2069,7 +2244,11 @@ fn normalize_proxy_input(mut input: ProxyInput) -> Result<ProxyInput> {
     }
     if let Some(test_url) = input.test_url.as_deref() {
         let parsed = url::Url::parse(test_url).with_context(|| "测试地址格式无效")?;
-        if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        if !matches!(parsed.scheme(), "http" | "https")
+            || parsed.host_str().is_none()
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+        {
             return Err(anyhow!("测试地址必须是包含主机名的 HTTP 或 HTTPS URL"));
         }
     }
@@ -2352,6 +2531,7 @@ mod tests {
             enabled: Some(1),
             test_url: None,
             test_timeout: None,
+            health_policy: Default::default(),
             skip_cert_verify: None,
         }
     }
@@ -2362,6 +2542,86 @@ mod tests {
         assert_eq!(config["periodic_test_interval"].as_i64(), Some(180_000));
         assert_eq!(config["probe_recovery_interval"].as_i64(), Some(180_000));
         assert_eq!(config["startup_probe_enabled"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn readiness_migration_roundtrip_restart_expiry_and_stale_writes_are_safe() {
+        use crate::models::{ConfigBundle, CONFIG_BUNDLE_KIND};
+        use crate::probe_health::{HealthMode, ProbeHealth, ProbeWrite, Readiness};
+        use serde_json::json;
+        let path = std::env::temp_dir().join(format!(
+            "readiness-{}-{}.db",
+            std::process::id(),
+            crate::state::now_millis()
+        ));
+        let db = Database::open_test_file(path.clone(), 0).unwrap();
+        let mut input = proxy_input("dedicated", "127.0.0.1", 12345);
+        input.health_policy.mode = HealthMode::RequiredProbe;
+        input.test_url = Some("http://vpn.test/health".into());
+        let proxy = db.create_proxy(input).unwrap();
+        let mut write = ProbeWrite {
+            observation_revision: 0,
+            generation: db
+                .routing_snapshot()
+                .node_generations
+                .get(&proxy.id)
+                .copied(),
+            settings_revision: db.probe_settings_revision(),
+            status_revision: db.reserve_status_revision(proxy.id),
+            status: Some("active".into()),
+            response_time: Some(1),
+            health: ProbeHealth {
+                fresh: true,
+                readiness_status: Readiness::Ready,
+                probe_success_count: 9,
+                probe_failure_count: 4,
+                last_success_at: Some(crate::state::now_millis()),
+                statistics_started_at: Some(100),
+                ..Default::default()
+            },
+        };
+        write.observation_revision = db.publish_probe_health(proxy.id, &write);
+        assert!(db.probe_is_ready(&proxy, write.generation));
+        assert!(db.persist_probe_observation(&proxy, &write).unwrap());
+        let bundle = db.export_bundle(&[proxy.id], &[], &[]).unwrap();
+        let imported = Database::open_in_memory().unwrap();
+        imported.import_bundle(&bundle).unwrap();
+        assert_eq!(
+            imported.list_proxies().unwrap()[0].health_policy,
+            proxy.health_policy
+        );
+        assert!(!imported.list_proxies().unwrap()[0].probe_health.fresh);
+        let old_bundle: ConfigBundle = serde_json::from_value(json!({"kind": CONFIG_BUNDLE_KIND, "version":"old", "exportedAt":"old", "proxies":[{"name":"old", "type":"socks5", "host":"127.0.0.1", "port":12346}]})).unwrap();
+        imported.import_bundle(&old_bundle).unwrap();
+        assert_eq!(
+            imported.list_proxies().unwrap()[1].health_policy.mode,
+            HealthMode::TransportOnly
+        );
+
+        let mut expired = write;
+        expired.health.last_success_at = Some(crate::state::now_millis() - 601_000);
+        expired.observation_revision = db.publish_probe_health(proxy.id, &expired);
+        assert!(!db.probe_is_ready(&proxy, expired.generation));
+        assert!(!db.get_proxy(proxy.id).unwrap().unwrap().probe_health.fresh);
+        db.invalidate_probe_settings();
+        assert!(!db.persist_probe_observation(&proxy, &expired).unwrap());
+        drop(db);
+        let reopened = Database::open_test_file(path.clone(), 0).unwrap();
+        let historical = reopened.get_proxy(proxy.id).unwrap().unwrap();
+        assert_eq!(historical.probe_health.probe_success_count, 9);
+        assert_eq!(historical.probe_health.probe_failure_count, 4);
+        assert_eq!(historical.probe_health.readiness_status, Readiness::Unknown);
+        assert!(!historical.probe_health.fresh);
+        assert!(!reopened.probe_is_ready(
+            &historical,
+            reopened
+                .routing_snapshot()
+                .node_generations
+                .get(&proxy.id)
+                .copied()
+        ));
+        drop(reopened);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -2425,8 +2685,8 @@ mod tests {
         assert!(connection_changed);
         assert_eq!(updated.status.as_deref(), Some("unknown"));
         assert_eq!(updated.response_time, None);
-        assert_eq!(updated.success_count, 0);
-        assert_eq!(updated.fail_count, 0);
+        assert_eq!(updated.success_count, 3);
+        assert_eq!(updated.fail_count, 1);
         assert!(!db
             .record_proxy_probe_result(&proxy, Some("active"), Some(5), true)
             .unwrap());

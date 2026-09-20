@@ -6,6 +6,7 @@ mod database_worker;
 mod models;
 #[cfg(any(target_os = "windows", test))]
 mod portable_update;
+mod probe_health;
 mod proxy;
 mod proxy_tester;
 mod routing;

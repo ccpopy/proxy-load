@@ -79,7 +79,7 @@ async fn receive(bytes: Vec<u8>, chunk: usize, absolute: bool) -> Result<u16, Pr
     let url = Url::parse("http://probe.test/?secret=hidden").unwrap();
     let response = request_headers(
         io,
-        &url,
+        (&url, &url),
         absolute,
         None,
         Instant::now() + Duration::from_secs(5),

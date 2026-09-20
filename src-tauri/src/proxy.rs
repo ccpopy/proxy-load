@@ -38,6 +38,8 @@ pub(crate) mod limits;
 pub(crate) mod probe_http;
 pub(crate) mod probe_tls;
 pub(crate) mod probe_transport;
+#[cfg(test)]
+mod readiness_test_support;
 mod sticky_routes;
 pub(crate) mod target_quality;
 mod telemetry;
@@ -461,8 +463,17 @@ impl ProxyRuntime {
             .into_iter()
             .map(|(host, ip)| (crate::routing::normalize_host(&host), ip))
             .collect();
-        *self.dns_cache.write().await = mappings;
+        let mut current = self.dns_cache.write().await;
+        if *current != mappings {
+            self.db.invalidate_probe_settings();
+            *current = mappings;
+        }
         Ok(())
+    }
+
+    pub async fn probe_dns_snapshot(&self) -> (HashMap<String, String>, u64) {
+        let mappings = self.dns_cache.read().await;
+        (mappings.clone(), self.db.probe_settings_revision())
     }
 
     pub async fn update_advanced_config(&self, advanced: &Value) -> Result<()> {
@@ -719,6 +730,7 @@ impl ProxyRuntime {
         let algorithm = &context.algorithm;
 
         let mut eligible = Vec::new();
+        let mut readiness_blocked = false;
         {
             // Normalize the route once and acquire each read lock once per pool,
             // not three locks and two IDNA conversions per candidate.
@@ -733,6 +745,14 @@ impl ProxyRuntime {
                 .read()
                 .unwrap_or_else(|e| e.into_inner());
             for proxy in proxies {
+                if proxy.health_policy.required()
+                    && !self
+                        .db
+                        .probe_is_ready(proxy, snapshot.node_generations.get(&proxy.id).copied())
+                {
+                    readiness_blocked = true;
+                    continue;
+                }
                 if excluded.contains(&proxy.id) {
                     continue;
                 }
@@ -760,6 +780,13 @@ impl ProxyRuntime {
             }
         }
 
+        if eligible.is_empty() && readiness_blocked {
+            return Err(anyhow!(
+                "目标 {} 的候选代理业务未就绪或暂不可用（分组：{}），等待后台业务探测恢复",
+                group_key,
+                pool.map_or("全局", |p| p.name.as_str())
+            ));
+        }
         let mut ordered = self.order_proxies_in_pool(
             eligible,
             algorithm,
@@ -1471,15 +1498,24 @@ impl ProxyRuntime {
             .collect()
     }
 
-    pub async fn record_probe_result(
+    pub async fn record_probe_observation(
         &self,
         proxy: &ProxyRecord,
         generation: Option<u64>,
         probe_started_at: i64,
         desired_status: Option<&str>,
-        response_time: Option<i64>,
-        success: bool,
+        observation: (&crate::models::TestResult, &str, u64),
     ) -> Result<(Option<String>, bool)> {
+        let (result, test_url, settings_revision) = observation;
+        let success = result.success;
+        let response_time = result.diagnostics.proxy_proven().then(|| {
+            let timings = &result.diagnostics.timings;
+            (timings
+                .proxy_tcp_us
+                .unwrap_or(0)
+                .saturating_add(timings.proxy_auth_us.unwrap_or(0))
+                / 1000) as i64
+        });
         let proxy_id = proxy.id;
         let status_lock = self.status_lock(proxy_id).await;
         let _guard = status_lock.lock().await;
@@ -1490,6 +1526,7 @@ impl ProxyRuntime {
             .get(&proxy_id)
             .copied()
             != generation
+            || self.db.probe_settings_revision() != settings_revision
         {
             return Err(anyhow!("代理配置代号在测试期间已变化，已丢弃旧测试结果"));
         }
@@ -1499,7 +1536,10 @@ impl ProxyRuntime {
             .unwrap_or_else(|e| e.into_inner())
             .get(&proxy_id)
             .is_some_and(|metric| metric.last_success > probe_started_at);
-        let applied_status = if desired_status == Some("inactive") && traffic_proved_alive {
+        let applied_status = if desired_status == Some("inactive")
+            && traffic_proved_alive
+            && !proxy.health_policy.required()
+        {
             None
         } else {
             desired_status
@@ -1522,7 +1562,7 @@ impl ProxyRuntime {
                         .and_then(std::sync::Weak::upgrade)
                         .is_some()
             });
-        if success && !owned_half_open {
+        if result.diagnostics.proxy_proven() && !owned_half_open {
             self.record_breaker_success(proxy_id).await;
         }
         if let Some(status) = applied_status {
@@ -1533,24 +1573,43 @@ impl ProxyRuntime {
             }
             metric.pushed_status = Some(status.to_string());
         }
+        let mut write = crate::probe_health::ProbeWrite {
+            observation_revision: 0,
+            generation,
+            settings_revision,
+            status_revision: revision,
+            status: applied_status.map(str::to_string),
+            response_time,
+            health: self.db.current_probe_health(proxy).observe(
+                &proxy.health_policy,
+                result,
+                test_url,
+                if proxy.test_url.is_some() {
+                    "node"
+                } else {
+                    "global"
+                },
+                now_millis(),
+            ),
+        };
+        {
+            // Serialize publication with selection/reservation, not with existing tunnels.
+            let _selection = self
+                .selection_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            write.observation_revision = self.db.publish_probe_health(proxy_id, &write);
+        }
+        self.dial_ready.notify_waiters();
         // Publish runtime health under the short status guard, then persist off
         // the async executor. SQL must never keep a business connection waiting
         // for this guard. Generation + revision reject stale queued writes.
         drop(_guard);
         let db = self.db.clone();
         let observed = proxy.clone();
-        let stored_status = applied_status.map(str::to_string);
-        let updated = tokio::task::spawn_blocking(move || {
-            db.persist_probe_result(
-                &observed,
-                generation,
-                revision,
-                stored_status.as_deref(),
-                response_time,
-                success,
-            )
-        })
-        .await??;
+        let updated =
+            tokio::task::spawn_blocking(move || db.persist_probe_observation(&observed, &write))
+                .await??;
         if !updated {
             return Err(anyhow!(
                 "代理配置在测试结果写入前发生变化，已丢弃旧测试结果"
@@ -3458,6 +3517,8 @@ mod tests {
             skip_cert_verify: 0,
             test_url: None,
             test_timeout: None,
+            health_policy: Default::default(),
+            probe_health: Default::default(),
             score: None,
             active_connections: None,
         }

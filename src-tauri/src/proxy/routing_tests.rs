@@ -956,6 +956,7 @@ async fn local_route_failure_retries_other_path_inside_pool_without_penalty() {
                 password: None,
                 test_url: None,
                 test_timeout: None,
+                health_policy: Default::default(),
                 skip_cert_verify: None,
             })
             .unwrap();
@@ -1619,6 +1620,7 @@ pub(super) fn add_proxy(runtime: &ProxyRuntime, port: u16) -> ProxyRecord {
             enabled: Some(1),
             test_url: None,
             test_timeout: None,
+            health_policy: Default::default(),
             skip_cert_verify: None,
         })
         .unwrap()
@@ -1644,6 +1646,7 @@ fn change_proxy(
                 enabled: Some(enabled),
                 test_url: None,
                 test_timeout: None,
+                health_policy: Default::default(),
                 skip_cert_verify: None,
             },
         )
@@ -2040,6 +2043,7 @@ async fn connection_timeout_is_classified_by_the_stage_that_stalled() {
                     enabled: Some(1),
                     test_url: None,
                     test_timeout: None,
+                    health_policy: Default::default(),
                     skip_cert_verify: None,
                 },
             )
@@ -2419,4 +2423,44 @@ async fn forwarded_post_body_is_not_replayed_when_the_upstream_disconnects() {
         .iter()
         .any(|log| log.result_type.as_deref() == Some("transfer_finished")));
     assert_eq!(runtime.db.overview(0).unwrap()["successRequests"], json!(0));
+}
+impl ProxyRuntime {
+    async fn record_probe_result(
+        &self,
+        proxy: &ProxyRecord,
+        generation: Option<u64>,
+        started: i64,
+        status: Option<&str>,
+        response_time: Option<i64>,
+        success: bool,
+    ) -> Result<(Option<String>, bool)> {
+        let mut diagnostics = failure::ProbeDiagnostics::default();
+        if success {
+            diagnostics.evidence.proxy_tcp = failure::Evidence::Established;
+            diagnostics.evidence.proxy_auth = failure::Evidence::Accepted;
+            diagnostics.timings.proxy_tcp_us = response_time.map(|ms| ms as u64 * 1000);
+        } else {
+            diagnostics.scope = Some(failure::FailureScope::Proxy);
+        }
+        let result = crate::models::TestResult {
+            success,
+            response_time: response_time.unwrap_or(0),
+            status_code: success.then_some(200),
+            error: None,
+            failure_scope: (!success).then(|| "proxy".into()),
+            diagnostics,
+        };
+        self.record_probe_observation(
+            proxy,
+            generation,
+            started,
+            status,
+            (
+                &result,
+                "http://probe.test/",
+                self.db.probe_settings_revision(),
+            ),
+        )
+        .await
+    }
 }

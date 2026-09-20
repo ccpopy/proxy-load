@@ -21,6 +21,10 @@ pub struct ProxyRecord {
     pub skip_cert_verify: i64,
     pub test_url: Option<String>,
     pub test_timeout: Option<i64>,
+    #[serde(default)]
+    pub health_policy: crate::probe_health::HealthPolicy,
+    #[serde(default)]
+    pub probe_health: crate::probe_health::ProbeHealth,
     #[serde(rename = "_score", skip_serializing_if = "Option::is_none")]
     pub score: Option<f64>,
     #[serde(rename = "_activeConnections", skip_serializing_if = "Option::is_none")]
@@ -40,6 +44,8 @@ pub struct ProxyInput {
     pub test_url: Option<String>,
     pub test_timeout: Option<i64>,
     pub skip_cert_verify: Option<Value>,
+    #[serde(default)]
+    pub health_policy: crate::probe_health::HealthPolicy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -203,6 +209,8 @@ pub struct BundleProxy {
     pub test_timeout: Option<i64>,
     #[serde(default)]
     pub skip_cert_verify: i64,
+    #[serde(default)]
+    pub health_policy: crate::probe_health::HealthPolicy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

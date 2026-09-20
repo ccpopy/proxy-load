@@ -5,7 +5,7 @@ use tokio::{
     net::TcpListener,
 };
 
-fn state() -> AppState {
+pub(super) fn state() -> AppState {
     let db = Database::open_in_memory().unwrap();
     let (events, _) = broadcast::channel(32);
     let runtime = Arc::new(
@@ -36,7 +36,7 @@ fn state() -> AppState {
         probe_results: Default::default(),
     }
 }
-fn add(state: &AppState, port: u16) -> ProxyRecord {
+pub(super) fn add(state: &AppState, port: u16) -> ProxyRecord {
     state
         .db
         .create_proxy(ProxyInput {
@@ -49,6 +49,7 @@ fn add(state: &AppState, port: u16) -> ProxyRecord {
             enabled: Some(1),
             test_url: None,
             test_timeout: None,
+            health_policy: Default::default(),
             skip_cert_verify: None,
         })
         .unwrap()
@@ -58,6 +59,56 @@ async fn header(stream: &mut tokio::net::TcpStream) {
     while !data.ends_with(b"\r\n\r\n") {
         data.push(stream.read_u8().await.unwrap());
     }
+}
+
+#[tokio::test]
+async fn socks_connect_timeout_never_counts_as_full_probe_success() {
+    let state = state();
+    state
+        .db
+        .save_settings(
+            json!({"test_url":"http://vpn-only.test/health", "timeout":1})
+                .as_object()
+                .unwrap(),
+        )
+        .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut proxy = add(&state, listener.local_addr().unwrap().port());
+    let mut input: ProxyInput =
+        serde_json::from_value(serde_json::to_value(&proxy).unwrap()).unwrap();
+    input.proxy_type = "socks5".into();
+    proxy = state.db.update_proxy(proxy.id, input).unwrap().0;
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        assert_eq!(stream.read_u8().await.unwrap(), 5);
+        let count = stream.read_u8().await.unwrap();
+        let mut methods = vec![0; count as usize];
+        stream.read_exact(&mut methods).await.unwrap();
+        stream.write_all(&[5, 0]).await.unwrap();
+        let mut connect = [0; 4];
+        stream.read_exact(&mut connect).await.unwrap();
+        assert_eq!(&connect[..3], &[5, 1, 0]);
+        // Accept TCP and negotiate, then deliberately never answer CONNECT.
+        let mut rest = Vec::new();
+        let _ = stream.read_to_end(&mut rest).await;
+    });
+    let result = state
+        .test_proxy_record(proxy.clone(), ProbeOrigin::Manual)
+        .await
+        .unwrap()
+        .unwrap();
+    server.await.unwrap();
+    assert!(!result.success);
+    assert!(result.diagnostics.proxy_proven());
+    assert_eq!(
+        result.diagnostics.phase,
+        Some(crate::proxy::failure::ConnectPhase::TunnelConnect)
+    );
+    assert_eq!(result.failure_scope.as_deref(), Some("target"));
+    assert_eq!(
+        state.db.get_proxy(proxy.id).unwrap().unwrap().success_count,
+        0
+    );
 }
 
 #[tokio::test]
@@ -72,7 +123,10 @@ async fn concurrent_manual_and_periodic_probes_share_one_completed_observation()
         )
         .unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let proxy = add(&state, listener.local_addr().unwrap().port());
+    let mut proxy = add(&state, listener.local_addr().unwrap().port());
+    let mut input: ProxyInput = serde_json::from_value(json!(proxy)).unwrap();
+    input.health_policy.mode = crate::probe_health::HealthMode::RequiredProbe;
+    proxy = state.db.update_proxy(proxy.id, input).unwrap().0;
     let ready = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
     let server = tokio::spawn({
@@ -109,10 +163,20 @@ async fn concurrent_manual_and_periodic_probes_share_one_completed_observation()
     assert!(manual.await.unwrap().unwrap().unwrap().success);
     server.await.unwrap();
     assert_eq!(
-        state.db.get_proxy(proxy.id).unwrap().unwrap().success_count,
+        state
+            .db
+            .get_proxy(proxy.id)
+            .unwrap()
+            .unwrap()
+            .probe_health
+            .probe_success_count,
         1
     );
     assert_eq!(state.probe_slots.available_permits(), 64);
+    assert!(!state
+        .db
+        .current_probe_health(&proxy)
+        .eligible(&proxy.health_policy));
 }
 
 #[tokio::test]
@@ -151,7 +215,9 @@ async fn unknown_does_not_clear_auth_failures_but_target_503_preserves_proxy_evi
         assert_eq!(result.diagnostics.proxy_proven(), proven);
         let updated = state.db.get_proxy(proxy.id).unwrap().unwrap();
         assert_eq!(updated.fail_count, 0);
-        assert_eq!(updated.success_count, i64::from(proven));
+        assert_eq!(updated.success_count, 0);
+        assert_eq!(updated.probe_health.probe_success_count, 0);
+        assert_eq!(updated.probe_health.probe_failure_count, u64::from(proven));
         assert_eq!(
             state.probe_failures.lock().await.contains_key(&proxy.id),
             !proven
@@ -161,7 +227,9 @@ async fn unknown_does_not_clear_auth_failures_but_target_503_preserves_proxy_evi
 
 #[tokio::test]
 async fn changed_test_settings_or_shutdown_discard_inflight_probe_without_health_writes() {
-    for action in ["change", "aba", "stop"] {
+    for action in [
+        "change", "aba", "stop", "dns", "disable", "delete", "policy", "node_aba",
+    ] {
         let state = state();
         state
             .db
@@ -196,6 +264,36 @@ async fn changed_test_settings_or_shutdown_discard_inflight_probe_without_health
         ready.notified().await;
         if action == "stop" {
             state.proxy_runtime.request_stop();
+        } else if action == "dns" {
+            state
+                .db
+                .create_dns_mapping(crate::models::DnsInput {
+                    domain: "probe.test".into(),
+                    ip: "10.1.2.3".into(),
+                    description: None,
+                    enabled: Some(1),
+                    dynamic: Some(0),
+                })
+                .unwrap();
+            state.proxy_runtime.refresh_dns_cache().await.unwrap();
+        } else if action == "delete" {
+            state.db.delete_proxy(proxy.id).unwrap();
+        } else if matches!(action, "disable" | "policy" | "node_aba") {
+            let mut input: ProxyInput = serde_json::from_value(json!(proxy)).unwrap();
+            if action == "disable" {
+                input.enabled = Some(0);
+            } else if action == "policy" {
+                input.health_policy.mode = crate::probe_health::HealthMode::RequiredProbe;
+            } else {
+                input.test_url = Some("http://different.test/".into());
+            }
+            state.db.update_proxy(proxy.id, input).unwrap();
+            if action == "node_aba" {
+                state
+                    .db
+                    .update_proxy(proxy.id, serde_json::from_value(json!(proxy)).unwrap())
+                    .unwrap();
+            }
         } else {
             state
                 .db
@@ -219,9 +317,12 @@ async fn changed_test_settings_or_shutdown_discard_inflight_probe_without_health
         release.notify_one();
         assert!(task.await.unwrap().is_err());
         server.await.unwrap();
-        let updated = state.db.get_proxy(proxy.id).unwrap().unwrap();
-        assert_eq!(updated.success_count, 0);
-        assert_eq!(updated.fail_count, 0);
+        if let Some(updated) = state.db.get_proxy(proxy.id).unwrap() {
+            assert_eq!(updated.success_count, 0);
+            assert_eq!(updated.fail_count, 0);
+            assert_eq!(updated.probe_health.probe_success_count, 0);
+            assert_eq!(updated.probe_health.probe_failure_count, 0);
+        }
         assert_eq!(state.probe_slots.available_permits(), 64);
         assert!(state.probe_results.lock().await.is_empty());
     }

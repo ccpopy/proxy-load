@@ -258,6 +258,7 @@ pub fn same_node(left: &ProxyRecord, right: &ProxyRecord) -> bool {
         && left.enabled == right.enabled
         && left.test_url == right.test_url
         && left.test_timeout == right.test_timeout
+        && left.health_policy == right.health_policy
         && left.skip_cert_verify == right.skip_cert_verify
 }
 

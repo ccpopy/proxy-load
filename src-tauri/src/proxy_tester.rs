@@ -14,32 +14,63 @@ use crate::{
 use http_body_util::Empty;
 use hyper::{body::Bytes, client::conn::http1, header, Request};
 use hyper_util::rt::TokioIo;
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::time::{timeout_at, Instant};
 use tokio_rustls::{rustls, TlsConnector};
 use url::Url;
 
+#[cfg(test)]
 pub async fn test_proxy(proxy: &ProxyRecord, test_url: &str, timeout_ms: u64) -> TestResult {
-    test_with_tls(
+    test_proxy_mapped(proxy, test_url, timeout_ms, &HashMap::new()).await
+}
+
+pub async fn test_proxy_mapped(
+    proxy: &ProxyRecord,
+    test_url: &str,
+    timeout_ms: u64,
+    mappings: &HashMap<String, String>,
+) -> TestResult {
+    test_with_options(
         proxy,
         test_url,
         timeout_ms,
         probe_tls::config(proxy.skip_cert_verify == 1),
+        mappings,
     )
     .await
 }
 
+#[cfg(test)]
 async fn test_with_tls(
     proxy: &ProxyRecord,
     test_url: &str,
     timeout_ms: u64,
     tls: Arc<rustls::ClientConfig>,
 ) -> TestResult {
+    test_with_options(proxy, test_url, timeout_ms, tls, &HashMap::new()).await
+}
+
+async fn test_with_options(
+    proxy: &ProxyRecord,
+    test_url: &str,
+    timeout_ms: u64,
+    tls: Arc<rustls::ClientConfig>,
+    mappings: &HashMap<String, String>,
+) -> TestResult {
     let start = Instant::now();
     let deadline = start + Duration::from_millis(timeout_ms.min(300_000));
     let mut diagnostic = ProbeDiagnostics::default();
     let mut status = None;
-    let result = execute(proxy, test_url, deadline, tls, &mut diagnostic, &mut status).await;
+    let result = execute(
+        proxy,
+        test_url,
+        deadline,
+        tls,
+        mappings,
+        &mut diagnostic,
+        &mut status,
+    )
+    .await;
     diagnostic.timings.total_us = start.elapsed().as_micros().min(u64::MAX as u128) as u64;
     if let Err(error) = &result {
         diagnostic.phase = Some(error.phase);
@@ -84,6 +115,7 @@ async fn execute(
     url: &str,
     deadline: Instant,
     tls: Arc<rustls::ClientConfig>,
+    mappings: &HashMap<String, String>,
     d: &mut ProbeDiagnostics,
     status: &mut Option<u16>,
 ) -> Result<(), ProbeFailure> {
@@ -107,7 +139,20 @@ async fn execute(
         d.evidence = Default::default();
         d.timings = Default::default();
         *status = None;
-        let transport = probe_transport::open_probe_transport(proxy, &target, deadline, d).await?;
+        let mut connect_target = target.clone();
+        if let Some(ip) = mappings.get(&crate::routing::normalize_host(&probe_transport::host(
+            &target,
+        )?)) {
+            connect_target.set_host(Some(ip)).map_err(|_| {
+                ProbeFailure::new(
+                    Phase::Redirect,
+                    Scope::Configuration,
+                    Code::InvalidConfiguration,
+                )
+            })?;
+        }
+        let transport =
+            probe_transport::open_probe_transport(proxy, &connect_target, deadline, d).await?;
         let io = if target.scheme() == "https" {
             target_tls(transport.io, &target, deadline, tls.clone(), d).await?
         } else {
@@ -116,7 +161,7 @@ async fn execute(
         };
         let response = request_headers(
             io,
-            &target,
+            (&target, &connect_target),
             transport.absolute_form,
             transport.proxy_authorization.as_deref(),
             deadline,
@@ -137,6 +182,13 @@ async fn execute(
             d.evidence.proxy_auth = Evidence::Accepted;
         }
         if matches!(code, 301 | 302 | 303 | 307 | 308) {
+            if proxy.health_policy.required() {
+                return Err(ProbeFailure::new(
+                    Phase::Redirect,
+                    Scope::TargetRoute,
+                    Code::HttpStatus(code),
+                ));
+            }
             if let Some(location) = response.headers().get(header::LOCATION) {
                 if redirects == 5 {
                     return Err(ProbeFailure::new(
@@ -161,7 +213,10 @@ async fn execute(
                 continue;
             }
         }
-        if !(200..500).contains(&code) || code == 407 {
+        if (proxy.health_policy.required()
+            && !proxy.health_policy.expected_statuses.contains(&code))
+            || (!proxy.health_policy.required() && (!(200..500).contains(&code) || code == 407))
+        {
             return Err(ProbeFailure::new(
                 Phase::HttpResponse,
                 Scope::TargetRoute,
@@ -221,12 +276,13 @@ async fn target_tls(
 
 async fn request_headers(
     io: BoxIo,
-    target: &Url,
+    targets: (&Url, &Url),
     absolute: bool,
     authorization: Option<&str>,
     deadline: Instant,
     d: &mut ProbeDiagnostics,
 ) -> Result<hyper::Response<hyper::body::Incoming>, ProbeFailure> {
+    let (target, connect_target) = targets;
     if Instant::now() >= deadline {
         return Err(ProbeFailure::new(
             Phase::HttpWrite,
@@ -235,7 +291,7 @@ async fn request_headers(
         ));
     }
     let uri = if absolute {
-        target.as_str().to_string()
+        connect_target.as_str().to_string()
     } else {
         let mut uri = target.path().to_string();
         if let Some(query) = target.query() {
