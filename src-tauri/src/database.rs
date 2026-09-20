@@ -2291,6 +2291,13 @@ mod tests {
         }
         let (first, total, snapshot) = db.traffic_logs_snapshot(1, 10, None, None, None).unwrap();
         assert_eq!(total, 30);
+        for page_size in [10, 20, 30, 40, 50] {
+            let (items, total, _) = db
+                .traffic_logs_snapshot(1, page_size, None, None, None)
+                .unwrap();
+            assert_eq!(items.len(), page_size.min(30) as usize);
+            assert_eq!(total, 30);
+        }
         for _ in 0..10 {
             db.log_request(&entry).unwrap();
         }

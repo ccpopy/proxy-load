@@ -847,7 +847,7 @@ pub fn traffic_logs(
     before_id: Option<i64>,
 ) -> CommandResult<Value> {
     let page = ensure_positive(page.unwrap_or(1), "page")?;
-    let page_size = ensure_positive(page_size.unwrap_or(50), "pageSize")?;
+    let page_size = ensure_positive(page_size.unwrap_or(10), "pageSize")?;
     let (items, total, snapshot_id) = state.db.traffic_logs_snapshot(
         page,
         page_size,

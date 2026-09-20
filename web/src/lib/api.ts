@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core"
 import { listen } from "@tauri-apps/api/event"
+import { INITIAL_TRAFFIC_PAGE_SIZE } from "@/lib/constants"
 
 export interface ServiceInfo {
   proxy_host: string
@@ -169,7 +170,7 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   if (method === "GET" && route.pathname === "/api/traffic-logs") {
     const args: CommandArgs = {
       page: Number(route.searchParams.get("page") ?? "1"),
-      pageSize: Number(route.searchParams.get("page_size") ?? "50"),
+      pageSize: Number(route.searchParams.get("page_size") ?? INITIAL_TRAFFIC_PAGE_SIZE),
     }
     const proxySearch = route.searchParams.get("proxy")?.trim()
     if (proxySearch) args.proxySearch = proxySearch

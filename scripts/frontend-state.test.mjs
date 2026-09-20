@@ -1,6 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createLatestRequestGuard } from '../web/src/lib/latest-request.ts';
+import * as constants from '../web/src/lib/constants.ts';
+
+test('traffic logs default to ten rows and offer only the requested page sizes', () => {
+  assert.equal(constants.INITIAL_TRAFFIC_PAGE_SIZE, 10);
+  assert.deepEqual(constants.TRAFFIC_PAGE_SIZES, [10, 20, 30, 40, 50]);
+});
 
 test('old page/search IPC completion cannot replace the latest request', () => {
   const guard = createLatestRequestGuard();

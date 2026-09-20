@@ -17,6 +17,7 @@ import {
   barChartConfig,
   latencyChartConfig,
   trafficChartConfig,
+  TRAFFIC_PAGE_SIZES,
 } from "@/lib/constants"
 import {
   formatDate,
@@ -327,15 +328,15 @@ export function StatusSection({
                 </SelectTrigger>
                 <SelectContent>
                   <SelectGroup>
-                    <SelectItem value="25" className="font-mono tabular-nums">
-                      25
-                    </SelectItem>
-                    <SelectItem value="50" className="font-mono tabular-nums">
-                      50
-                    </SelectItem>
-                    <SelectItem value="100" className="font-mono tabular-nums">
-                      100
-                    </SelectItem>
+                    {TRAFFIC_PAGE_SIZES.map((pageSize) => (
+                      <SelectItem
+                        key={pageSize}
+                        value={String(pageSize)}
+                        className="font-mono tabular-nums"
+                      >
+                        {pageSize}
+                      </SelectItem>
+                    ))}
                   </SelectGroup>
                 </SelectContent>
               </Select>

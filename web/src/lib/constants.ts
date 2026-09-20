@@ -74,4 +74,5 @@ export const barChartConfig = {
   requests: { label: "请求数", color: "var(--chart-1)" },
 } satisfies ChartConfig
 
-export const INITIAL_TRAFFIC_PAGE_SIZE = 25
+export const TRAFFIC_PAGE_SIZES = [10, 20, 30, 40, 50] as const
+export const INITIAL_TRAFFIC_PAGE_SIZE: number = TRAFFIC_PAGE_SIZES[0]
