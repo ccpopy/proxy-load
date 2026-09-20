@@ -835,6 +835,140 @@ async fn cold_adaptive_member_receives_bounded_learning_without_bypassing_breake
 }
 
 #[tokio::test]
+async fn http_forward_auth_failures_accumulate_at_realistic_thresholds() {
+    for threshold in [3, 5] {
+        let runtime = runtime();
+        runtime
+            .runtime_settings
+            .write()
+            .unwrap()
+            .circuit
+            .failure_threshold = threshold;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = add_proxy(&runtime, listener.local_addr().unwrap().port());
+        let mut target = request("example.com");
+        target.inbound = InboundProtocol::HttpForward;
+        target.initial_payload = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n".to_vec();
+        for failure in 1..=threshold {
+            let (lease, upstream) =
+                connect_with_fail_fast(runtime.clone(), &target, Instant::now())
+                    .await
+                    .unwrap();
+            assert!(!upstream.target_verified);
+            assert!(runtime
+                .recent_success_map()
+                .await
+                .get(&proxy.id)
+                .is_none_or(|time| *time == 0));
+            assert!(
+                runtime
+                    .observe_forward_response(
+                        &lease,
+                        &target,
+                        407,
+                        false,
+                        upstream.proxy_latency_us
+                    )
+                    .await
+            );
+            assert_eq!(
+                runtime.circuit_breakers.read().unwrap()[&proxy.id].failures,
+                failure
+            );
+        }
+        assert!(!runtime.is_candidate_available(proxy.id, &target).await);
+        assert!(runtime.flush_logs(Duration::from_secs(2)));
+        assert_eq!(
+            runtime
+                .db
+                .get_proxy(proxy.id)
+                .unwrap()
+                .unwrap()
+                .status
+                .as_deref(),
+            Some("inactive")
+        );
+    }
+}
+
+#[tokio::test]
+async fn http_forward_half_open_waits_for_response_and_rejects_old_attempts() {
+    let runtime = runtime();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy = add_proxy(&runtime, listener.local_addr().unwrap().port());
+    let mut target = request("example.com");
+    target.inbound = InboundProtocol::HttpForward;
+    target.initial_payload = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n".to_vec();
+    runtime.record_breaker_failure_locked(proxy.id).await;
+    runtime
+        .circuit_breakers
+        .write()
+        .unwrap()
+        .get_mut(&proxy.id)
+        .unwrap()
+        .next_attempt = 0;
+    let (lease, upstream) = connect_with_fail_fast(runtime.clone(), &target, Instant::now())
+        .await
+        .unwrap();
+    assert_eq!(
+        runtime.circuit_breakers.read().unwrap()[&proxy.id].state,
+        "HALF_OPEN"
+    );
+    assert!(!runtime.is_candidate_available(proxy.id, &target).await);
+    assert!(runtime.recent_success_map().await[&proxy.id] == 0);
+    // Cancellation releases ownership even without any response.
+    drop((lease, upstream));
+    let (lease, upstream) = connect_with_fail_fast(runtime.clone(), &target, Instant::now())
+        .await
+        .unwrap();
+    let replacement = Arc::new(());
+    runtime
+        .circuit_breakers
+        .write()
+        .unwrap()
+        .get_mut(&proxy.id)
+        .unwrap()
+        .attempt = Some(Arc::downgrade(&replacement));
+    assert!(
+        !runtime
+            .observe_forward_response(&lease, &target, 200, false, upstream.proxy_latency_us)
+            .await
+    );
+    assert_eq!(
+        runtime.circuit_breakers.read().unwrap()[&proxy.id].state,
+        "HALF_OPEN"
+    );
+    runtime
+        .circuit_breakers
+        .write()
+        .unwrap()
+        .get_mut(&proxy.id)
+        .unwrap()
+        .attempt = Some(Arc::downgrade(&lease.attempt));
+    assert!(
+        runtime
+            .observe_forward_response(&lease, &target, 503, false, upstream.proxy_latency_us)
+            .await
+    );
+    assert_eq!(
+        runtime.circuit_breakers.read().unwrap()[&proxy.id].state,
+        "CLOSED"
+    );
+    assert!(runtime.recent_success_map().await[&proxy.id] > 0);
+    assert!(runtime.flush_logs(Duration::from_secs(2)));
+    assert_eq!(
+        runtime
+            .db
+            .get_proxy(proxy.id)
+            .unwrap()
+            .unwrap()
+            .status
+            .as_deref(),
+        Some("active")
+    );
+}
+
+#[tokio::test]
 async fn http_forward_observes_407_and_5xx_without_replay_or_global_target_penalty() {
     for status in [407, 503] {
         let runtime = runtime();
@@ -880,6 +1014,10 @@ async fn http_forward_observes_407_and_5xx_without_replay_or_global_target_penal
         );
         assert!(runtime.flush_logs(Duration::from_secs(2)));
         let (logs, _) = runtime.db.traffic_logs(1, 25, None).unwrap();
+        assert!(logs
+            .iter()
+            .filter(|log| log.result_type.as_deref() == Some("upstream_response_observed"))
+            .all(|log| log.success == 0));
         assert_eq!(
             logs.iter()
                 .filter(|log| log.result_type.as_deref() == Some("upstream_response_observed"))

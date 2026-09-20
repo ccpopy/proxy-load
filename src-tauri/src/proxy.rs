@@ -1008,6 +1008,78 @@ impl ProxyRuntime {
         breaker.record_success();
     }
 
+    // A delayed HTTP response must still belong to this configuration and probe.
+    fn owns_current_attempt(&self, proxy: &ConnectionLease, request: &TargetRequest) -> bool {
+        let owns = |breaker: &CircuitBreaker| {
+            breaker
+                .attempt
+                .as_ref()
+                .is_none_or(|token| token.ptr_eq(&Arc::downgrade(&proxy.attempt)))
+        };
+        self.db.routing_snapshot().node_generations.get(&proxy.id) == Some(&proxy.generation)
+            && self
+                .circuit_breakers
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&proxy.id)
+                .is_none_or(owns)
+            && self
+                .target_circuits
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&TargetRouteKey::new(proxy.id, request))
+                .is_none_or(|target| owns(&target.breaker))
+    }
+
+    async fn record_verified_connection_locked(
+        &self,
+        proxy: &ConnectionLease,
+        request: &TargetRequest,
+        proxy_latency_us: u64,
+    ) {
+        self.record_breaker_success(proxy.id).await;
+        self.target_circuits
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&TargetRouteKey::new(proxy.id, request));
+        if let Some(policy) = &proxy.failover_policy {
+            self.sticky_routes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remember(
+                    policy,
+                    &self.db.routing_snapshot(),
+                    proxy.id,
+                    proxy.generation,
+                );
+        }
+        self.record_connection_success_locked(proxy.id, (proxy_latency_us / 1000) as i64)
+            .await;
+    }
+
+    async fn observe_forward_response(
+        &self,
+        proxy: &ConnectionLease,
+        request: &TargetRequest,
+        status: u16,
+        already_verified: bool,
+        proxy_latency_us: u64,
+    ) -> bool {
+        let _guard = self.lock_proxy_status(proxy.id).await;
+        if !self.owns_current_attempt(proxy, request) {
+            return false;
+        }
+        if status == 407 {
+            self.record_route_failure_locked(proxy.id, request, FailureScope::Proxy)
+                .await;
+        } else if !already_verified {
+            // A final HTTP response proves forwarding/auth works, not business success.
+            self.record_verified_connection_locked(proxy, request, proxy_latency_us)
+                .await;
+        }
+        true
+    }
+
     async fn cancel_target_half_open_attempt(&self, proxy_id: i64, request: &TargetRequest) {
         if let Some(target) = self
             .target_circuits
@@ -1481,24 +1553,23 @@ async fn handle_client(
                 };
                 let observe = async {
                     if let Ok(status) = receiver.await {
-                        let _guard = runtime.lock_proxy_status(proxy_id).await;
                         if runtime
-                            .db
-                            .routing_snapshot()
-                            .node_generations
-                            .get(&proxy_id)
-                            == Some(&selected_proxy.generation)
+                            .observe_forward_response(
+                                &selected_proxy,
+                                &request,
+                                status,
+                                upstream.target_verified,
+                                upstream.proxy_latency_us,
+                            )
+                            .await
                         {
-                            if status == 407 {
-                                runtime.record_breaker_failure_locked(proxy_id).await;
-                            }
                             let detail = format!("HTTP {status}");
                             runtime
                                 .record_request(RequestLogEntry {
                                     proxy_id: Some(proxy_id),
                                     target_host: &original_host,
                                     target_port: i64::from(original_port),
-                                    success: status != 407,
+                                    success: status == 101 || (200..400).contains(&status),
                                     response_time: Some(start.elapsed().as_millis() as i64),
                                     error_message: Some(&detail),
                                     result_type: "upstream_response_observed",
@@ -1617,34 +1688,7 @@ async fn connect_with_fail_fast(
                 return Err(error.context("连接结束后校验代理配置失败"));
             }
         };
-        let owns = |breaker: &CircuitBreaker| {
-            breaker
-                .attempt
-                .as_ref()
-                .is_none_or(|token| token.ptr_eq(&Arc::downgrade(&proxy.attempt)))
-        };
-        let owns_global = runtime
-            .circuit_breakers
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&proxy.id)
-            .is_none_or(owns);
-        let owns_target = runtime
-            .target_circuits
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&TargetRouteKey::new(proxy.id, request))
-            .is_none_or(|target| owns(&target.breaker));
-        if !configuration_current
-            || !owns_global
-            || !owns_target
-            || runtime
-                .db
-                .routing_snapshot()
-                .node_generations
-                .get(&proxy.id)
-                != Some(&proxy.generation)
-        {
+        if !configuration_current || !runtime.owns_current_attempt(&proxy, request) {
             attempted = attempted.saturating_sub(1);
             errors.push(format!("{}: 连接期间代理配置已变化", proxy.name));
             continue;
@@ -1671,35 +1715,10 @@ async fn connect_with_fail_fast(
                 proxy.dial_permit = None;
                 proxy.global_dial_permit = None;
                 runtime.dial_ready.notify_waiters();
-                runtime.record_breaker_success(proxy.id).await;
-                if let Some(policy) = &proxy.failover_policy {
-                    runtime
-                        .sticky_routes
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .remember(
-                            policy,
-                            &runtime.db.routing_snapshot(),
-                            proxy.id,
-                            proxy.generation,
-                        );
-                }
                 if stream.target_verified {
-                    runtime
-                        .target_circuits
-                        .write()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .remove(&TargetRouteKey::new(proxy.id, request));
                     // 评分只计当前节点自身的建连耗时；请求日志仍记录用户等待的总耗时。
                     runtime
-                        .record_connection_success_locked(
-                            proxy.id,
-                            (stream.proxy_latency_us / 1000) as i64,
-                        )
-                        .await;
-                } else {
-                    runtime
-                        .cancel_target_half_open_attempt(proxy.id, request)
+                        .record_verified_connection_locked(&proxy, request, stream.proxy_latency_us)
                         .await;
                 }
                 #[cfg(all(debug_assertions, not(test)))]
