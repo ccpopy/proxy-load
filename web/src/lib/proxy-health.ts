@@ -31,7 +31,7 @@ export function readinessAllowsNewConnections(proxy: ProxyRecord): boolean {
   return !!proxy.probe_health?.fresh && ["ready", "degraded"].includes(proxy.probe_health.readiness_status)
 }
 
-export function probeHealthDescription(proxy: ProxyRecord, now = Date.now()): string {
+export function probeHealthDetails(proxy: ProxyRecord, now = Date.now()): string[] {
   const health = proxy.probe_health
   const last = health?.last_probe_result
   const policy = proxy.health_policy
@@ -50,7 +50,11 @@ export function probeHealthDescription(proxy: ProxyRecord, now = Date.now()): st
   }
   lines.push(`新测活统计起始：${health?.statistics_started_at ? new Date(health.statistics_started_at).toLocaleString() : "尚未开始"}；未计入失败的探测：${health?.probe_excluded_count ?? 0}`)
   lines.push(`旧版混合历史：成功 ${proxy.success_count} / 失败 ${proxy.fail_count}（不并入新统计）`)
-  return lines.join("\n")
+  return lines
+}
+
+export function probeHealthDescription(proxy: ProxyRecord, now = Date.now()): string {
+  return probeHealthDetails(proxy, now).join("\n")
 }
 
 export function entryHandshakeMillis(proxy: ProxyRecord): number | null {

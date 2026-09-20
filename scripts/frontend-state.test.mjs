@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { createLatestRequestGuard } from '../web/src/lib/latest-request.ts';
 import * as constants from '../web/src/lib/constants.ts';
 import { advancedSettingsPayload, businessLimitError } from '../web/src/lib/advanced-settings.ts';
-import { proxyHealthView, readinessAllowsNewConnections, probeHealthDescription } from '../web/src/lib/proxy-health.ts';
+import { proxyHealthView, readinessAllowsNewConnections, probeHealthDescription, probeHealthDetails } from '../web/src/lib/proxy-health.ts';
 
 test('readiness badges, filters and admission distinguish failed probe from reachable entry', () => {
   const proxy = { enabled: 1, status: 'active', success_count: 99, fail_count: 7,
@@ -24,6 +24,28 @@ test('readiness badges, filters and admission distinguish failed probe from reac
   assert.equal(proxyHealthView(general).label, '最近测活失败');
   assert.equal(readinessAllowsNewConnections(general), true);
   assert.equal(readinessAllowsNewConnections({ ...general, enabled: 0 }), false);
+});
+
+test('probe details stay independent for wrapping while preserving the tooltip content', () => {
+  const general = { enabled: 1, status: 'active', success_count: 91, fail_count: 4 };
+  assert.deepEqual(probeHealthDetails(general, 2000), [
+    '通用代理：目标失败不作节点级隔离',
+    '最近完整成功：尚无',
+    '新测活统计起始：尚未开始；未计入失败的探测：0',
+    '旧版混合历史：成功 91 / 失败 4（不并入新统计）',
+  ]);
+  const url = 'http://vpn-only.test/' + 'long-health-resource/'.repeat(12);
+  const dedicated = { ...general,
+    health_policy: { mode: 'required_probe', failure_threshold: 2, recovery_threshold: 2, max_age_seconds: 600 },
+    probe_health: { fresh: false, readiness_status: 'unknown', consecutive_failures: 1, consecutive_successes: 0,
+      last_probe_result: { observed_at: 1000, probe_url: url, url_source: 'global', diagnostics: { phase: 'tunnel_connect', scope: 'target_route' } } } };
+  for (const proxy of [general, dedicated]) {
+    const items = probeHealthDetails(proxy, 2000);
+    assert.ok(items.every(item => typeof item === 'string' && !item.includes('\n')));
+    assert.equal(items.join('\n'), probeHealthDescription(proxy, 2000));
+  }
+  assert.ok(probeHealthDetails(dedicated, 2000).includes(`探测地址（继承全局）：${url}`));
+  assert.ok(probeHealthDetails(dedicated, 2000).includes('已阻止该节点全部新业务连接；后台继续探测'));
 });
 
 test('concurrency settings retain defaults, validate bounds and never save runtime diagnostics', () => {

@@ -1,10 +1,11 @@
 import { useMemo, useState, type ReactNode } from "react"
-import { Edit, Loader2, Plus, Server, Trash2, Zap } from "lucide-react"
+import { ChevronRight, Edit, Loader2, Plus, Server, Trash2, Zap } from "lucide-react"
+import { Collapsible } from "radix-ui"
 import { toast } from "sonner"
 
 import { api } from "@/lib/api"
 import { cn } from "@/lib/utils"
-import { proxyHealthView, probeHealthDescription, entryHandshakeMillis } from "@/lib/proxy-health"
+import { proxyHealthView, probeHealthDetails, entryHandshakeMillis } from "@/lib/proxy-health"
 import type { ProxyRecord, TestResult } from "@/types"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -120,7 +121,7 @@ export function ProxiesSection({
               {filtered.map((proxy) => {
                 const isTesting = testingIds.has(proxy.id)
                 return (
-                  <div
+                  <Collapsible.Root
                     key={proxy.id}
                     className="group relative grid gap-3 rounded-md border bg-card/40 p-4 transition-colors hover:border-primary/40 hover:bg-card lg:grid-cols-[1fr_auto] lg:items-center"
                   >
@@ -149,10 +150,13 @@ export function ProxiesSection({
                       <Stat label="测活成功" value={proxy.probe_health?.probe_success_count ?? 0} tone="success" />
                       <Stat label="测活失败" value={proxy.probe_health?.probe_failure_count ?? 0} tone="danger" />
                     </div>
-                    <details className="mt-2 text-xs text-muted-foreground">
-                      <summary className="cursor-pointer">测活详情</summary>
-                      <p className="mt-2 whitespace-pre-line break-all leading-relaxed">{probeHealthDescription(proxy)}</p>
-                    </details>
+                    <Collapsible.Trigger className="group/probe-details mt-2 flex w-fit cursor-pointer items-center gap-1 rounded-sm text-xs text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background">
+                      <ChevronRight
+                        aria-hidden="true"
+                        className="size-3.5 shrink-0 transition-transform duration-150 group-data-[state=open]/probe-details:rotate-90 motion-reduce:transition-none"
+                      />
+                      测活详情
+                    </Collapsible.Trigger>
                   </div>
                   <div className="flex items-center gap-2">
                     <Button
@@ -183,7 +187,16 @@ export function ProxiesSection({
                       删除
                     </Button>
                   </div>
-                </div>
+                  <Collapsible.Content className="min-w-0 border-t pt-3 text-xs text-muted-foreground lg:col-span-2">
+                    <ul aria-label="测活详情" className="flex flex-wrap gap-x-8 gap-y-1.5 leading-relaxed">
+                      {probeHealthDetails(proxy).map((detail, index) => (
+                        <li key={index} className="min-w-fit max-w-full grow basis-[calc(50%_-_1rem)] [overflow-wrap:anywhere]">
+                          {detail}
+                        </li>
+                      ))}
+                    </ul>
+                  </Collapsible.Content>
+                </Collapsible.Root>
                 )
               })}
               {filtered.length === 0 && (
