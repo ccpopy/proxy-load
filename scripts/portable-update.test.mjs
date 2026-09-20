@@ -3,10 +3,15 @@ import { test } from "node:test"
 import assert from "node:assert/strict"
 import { execFileSync, spawn } from "node:child_process"
 import { createHash } from "node:crypto"
-import { mkdtemp, mkdir, copyFile, readFile, writeFile, readdir, unlink, rmdir } from "node:fs/promises"
+import { mkdtemp, mkdir, copyFile, readFile, writeFile, readdir, unlink, rmdir, realpath } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
+
+async function assertSameDirectory(actual, expected) {
+  // Windows TEMP may use an 8.3 alias, while current_exe returns the long path.
+  assert.equal(await realpath(actual), await realpath(expected))
+}
 
 test("release helper: two portable upgrades preserve stable entry/data; invalid executable rolls back", { skip: process.platform !== "win32" || !process.env.PORTABLE_UPDATE_HELPER }, async () => {
   const root = await mkdtemp(join(tmpdir(), "proxy portable 中文 "))
@@ -35,13 +40,13 @@ test("release helper: two portable upgrades preserve stable entry/data; invalid 
     for (const version of ["v2","v3"]) {
       assert(await run(version,bytes))
       const paths = (await readFile(join(root,"fixture-paths.txt"),"utf8")).split("\n")
-      assert.equal(paths[0],root); assert.equal(paths[1],join(root,"data"))
+      await assertSameDirectory(paths[0],root); await assertSameDirectory(paths[1],join(root,"data"))
       assert.deepEqual(await readFile(join(root,"data/proxy.db")),originalData)
       assert.deepEqual(await readFile(entry),bytes)
     }
     const external = join(root,"explicit DATA_DIR"); await mkdir(external); await writeFile(join(external,"proxy.db"),"external configuration")
     assert(await run("v4",bytes,external))
-    assert.equal((await readFile(join(root,"fixture-paths.txt"),"utf8")).split("\n")[1],external)
+    await assertSameDirectory((await readFile(join(root,"fixture-paths.txt"),"utf8")).split("\n")[1],external)
     assert.equal(await run("broken",Buffer.from("not an executable")),false)
     assert.deepEqual(await readFile(entry),bytes)
     assert.deepEqual(await readFile(join(root,"data/proxy.db")),originalData)
