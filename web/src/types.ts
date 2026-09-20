@@ -84,6 +84,10 @@ export interface Overview {
     queueLength: number
     capacity: number
     droppedLogs: number
+    statusQueueLength?: number
+    droppedStatus?: number
+    coalescedStatus?: number
+    retriedStatus?: number
     databaseErrors: number
     writtenLogs: number
     maxBatchDurationMs: number

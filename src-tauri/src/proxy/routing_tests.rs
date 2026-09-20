@@ -788,6 +788,67 @@ async fn local_route_failures_remain_bounded_when_all_paths_are_offline() {
 }
 
 #[tokio::test]
+async fn full_log_queue_cannot_block_immediate_health_or_latest_status_persistence() {
+    let runtime = runtime();
+    let proxy = add_proxy(&runtime, 19001);
+    let pause = runtime.database_worker.pause_for_test();
+    for _ in 0..4096 {
+        runtime.database_worker.log(RequestLogEntry {
+            proxy_id: None,
+            target_host: "busy",
+            target_port: 80,
+            success: false,
+            response_time: None,
+            error_message: None,
+            result_type: "proxy_exhausted",
+        });
+    }
+    assert_eq!(runtime.database_worker.stats()["queueLength"], 2048);
+    for _ in 0..3 {
+        runtime.record_breaker_failure_locked(proxy.id).await;
+        assert_eq!(
+            runtime.metrics.read().unwrap()[&proxy.id]
+                .pushed_status
+                .as_deref(),
+            Some("inactive")
+        );
+        runtime.record_breaker_success(proxy.id).await;
+        runtime.record_connection_success_locked(proxy.id, 1).await;
+        assert_eq!(
+            runtime.metrics.read().unwrap()[&proxy.id]
+                .pushed_status
+                .as_deref(),
+            Some("active")
+        );
+    }
+    assert_eq!(
+        runtime
+            .db
+            .get_proxy(proxy.id)
+            .unwrap()
+            .unwrap()
+            .status
+            .as_deref(),
+        Some("unknown")
+    );
+    assert_eq!(runtime.database_worker.stats()["statusQueueLength"], 1);
+    assert_eq!(runtime.database_worker.stats()["coalescedStatus"], 5);
+    assert_eq!(runtime.database_worker.stats()["droppedStatus"], 0);
+    drop(pause);
+    assert!(runtime.flush_logs(Duration::from_secs(3)));
+    assert_eq!(
+        runtime
+            .db
+            .get_proxy(proxy.id)
+            .unwrap()
+            .unwrap()
+            .status
+            .as_deref(),
+        Some("active")
+    );
+}
+
+#[tokio::test]
 async fn least_connections_serial_ties_rotate_and_leases_release() {
     let runtime = runtime();
     let a = add_proxy(&runtime, 19001);

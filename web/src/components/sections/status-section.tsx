@@ -144,6 +144,7 @@ export function StatusSection({
           {overview.databaseQueue && (
             <div className="col-span-full text-xs text-muted-foreground" role="status">
               日志队列 {overview.databaseQueue.queueLength}/{overview.databaseQueue.capacity} · 丢弃 {overview.databaseQueue.droppedLogs} · 数据库错误 {overview.databaseQueue.databaseErrors}
+              {" · "}状态待写 {overview.databaseQueue.statusQueueLength ?? 0} · 合并 {overview.databaseQueue.coalescedStatus ?? 0} · 重试 {overview.databaseQueue.retriedStatus ?? 0} · 丢弃状态 {overview.databaseQueue.droppedStatus ?? 0}
             </div>
           )}
         </CardContent>

@@ -6,7 +6,7 @@ use crate::{
 use anyhow::Result;
 use serde_json::{json, Value};
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     sync::{Arc, Condvar, Mutex},
     thread,
     time::Duration,
@@ -52,22 +52,38 @@ impl OwnedLog {
         }
     }
 }
-enum Job {
-    Log(OwnedLog),
-    Status(Box<ProxyRecord>, u64, u64, String, Option<i64>),
-}
-impl Job {
+impl OwnedLog {
     fn important(&self) -> bool {
-        !matches!(self, Self::Log(log) if log.success)
+        match self.kind.as_str() {
+            "forwarded_unverified" | "tunnel_established" | "transfer_finished" => false,
+            "proxy_exhausted" | "tunnel_setup_error" | "transfer_error" => true,
+            "upstream_response_observed" => !self.success,
+            _ => !self.success,
+        }
     }
+}
+struct StatusChange {
+    proxy: ProxyRecord,
+    generation: u64,
+    revision: u64,
+    status: String,
+    time: Option<i64>,
 }
 #[derive(Default)]
 struct Queue {
-    jobs: VecDeque<Job>,
+    jobs: VecDeque<OwnedLog>,
+    statuses: HashMap<i64, StatusChange>,
     enqueued: VecDeque<std::time::Instant>,
     stopped: bool,
     working: bool,
     dropped_logs: u64,
+    dropped_status: u64,
+    coalesced_status: u64,
+    retried_status: u64,
+    #[cfg(test)]
+    paused: bool,
+    #[cfg(test)]
+    fail_status_writes: usize,
     errors: u64,
     written: u64,
     max_wait_ms: u64,
@@ -120,10 +136,12 @@ impl DatabaseWorker {
                 let mut last_event = std::time::Instant::now() - Duration::from_secs(1);
                 loop {
                     let mut queue = state.queue.lock().unwrap_or_else(|e| e.into_inner());
-                    while queue.jobs.is_empty() && !queue.stopped {
+                    while (queue.jobs.is_empty() && queue.statuses.is_empty() && !queue.stopped)
+                        || queue.paused_for_test()
+                    {
                         queue = state.wake.wait(queue).unwrap_or_else(|e| e.into_inner());
                     }
-                    if queue.jobs.is_empty() && queue.stopped {
+                    if queue.jobs.is_empty() && queue.statuses.is_empty() && queue.stopped {
                         break;
                     }
                     // Coalesce bursts, bounded by 100 ms; exit flush skips the delay.
@@ -134,8 +152,29 @@ impl DatabaseWorker {
                             .unwrap_or_else(|e| e.into_inner())
                             .0;
                     }
+                    if queue.paused_for_test() {
+                        continue;
+                    }
                     let count = queue.jobs.len().min(BATCH_SIZE);
                     let batch = queue.jobs.drain(..count).collect::<Vec<_>>();
+                    let ids = queue
+                        .statuses
+                        .keys()
+                        .take(BATCH_SIZE)
+                        .copied()
+                        .collect::<Vec<_>>();
+                    let statuses = ids
+                        .into_iter()
+                        .filter_map(|id| queue.statuses.remove(&id))
+                        .collect::<Vec<_>>();
+                    #[cfg(test)]
+                    let fail_status_write = if !statuses.is_empty() && queue.fail_status_writes > 0
+                    {
+                        queue.fail_status_writes -= 1;
+                        true
+                    } else {
+                        false
+                    };
                     for enqueued in queue.enqueued.drain(..count).collect::<Vec<_>>() {
                         queue.max_queue_wait_ms = queue
                             .max_queue_wait_ms
@@ -144,19 +183,32 @@ impl DatabaseWorker {
                     queue.working = true;
                     drop(queue);
                     let start = std::time::Instant::now();
-                    let mut logs = Vec::new();
+                    let logs = batch;
                     let mut errors = 0;
-                    for job in batch {
-                        match job {
-                            Job::Log(log) => logs.push(log),
-                            Job::Status(proxy, generation, revision, status, time) => {
-                                if let Err(error) = db.update_passive_status(
-                                    &proxy, generation, revision, &status, time,
-                                ) {
-                                    eprintln!("后台状态持久化失败: {error:#}");
-                                    errors += 1;
-                                }
-                            }
+                    let had_statuses = !statuses.is_empty();
+                    let mut retry = Vec::new();
+                    for change in statuses {
+                        let persist = || {
+                            writer.update_passive_status(
+                                &change.proxy,
+                                change.generation,
+                                change.revision,
+                                &change.status,
+                                change.time,
+                            )
+                        };
+                        #[cfg(not(test))]
+                        let result = persist();
+                        #[cfg(test)]
+                        let result = if fail_status_write {
+                            Err(anyhow::anyhow!("injected database busy"))
+                        } else {
+                            persist()
+                        };
+                        if let Err(error) = result {
+                            eprintln!("后台状态持久化失败: {error:#}");
+                            errors += 1;
+                            retry.push(change);
                         }
                     }
                     let written = match writer.log_requests(&logs) {
@@ -168,6 +220,18 @@ impl DatabaseWorker {
                         }
                     };
                     let mut queue = state.queue.lock().unwrap_or_else(|e| e.into_inner());
+                    for change in retry {
+                        if queue.stopped {
+                            queue.dropped_status += 1;
+                        } else if db.routing_snapshot().node_generations.get(&change.proxy.id)
+                            == Some(&change.generation)
+                            && db.status_revision(change.proxy.id) == change.revision
+                            && !queue.statuses.contains_key(&change.proxy.id)
+                        {
+                            queue.statuses.insert(change.proxy.id, change);
+                            queue.retried_status += 1;
+                        }
+                    }
                     queue.errors += errors;
                     queue.dropped_logs += logs.len() as u64 - written;
                     queue.written += written;
@@ -175,7 +239,8 @@ impl DatabaseWorker {
                     queue.working = false;
                     state.drained.notify_all();
                     drop(queue);
-                    if (written != 0 && last_event.elapsed() >= Duration::from_millis(250))
+                    if ((written != 0 || had_statuses)
+                        && last_event.elapsed() >= Duration::from_millis(250))
                         || errors != 0
                     {
                         last_event = std::time::Instant::now();
@@ -185,6 +250,10 @@ impl DatabaseWorker {
                             timestamp: now_millis(),
                         });
                     }
+                    if errors != 0 {
+                        // Retry latest state without spinning when SQLite remains unavailable.
+                        thread::sleep(Duration::from_millis(100));
+                    }
                 }
             })?;
         Ok(Self(Arc::new(Worker {
@@ -193,7 +262,7 @@ impl DatabaseWorker {
             join: Mutex::new(Some(join)),
         })))
     }
-    fn enqueue(&self, job: Job) -> bool {
+    fn enqueue(&self, job: OwnedLog) -> bool {
         let mut queue = self
             .0
             .shared
@@ -229,7 +298,7 @@ impl DatabaseWorker {
         true
     }
     pub fn log(&self, entry: RequestLogEntry<'_>) {
-        self.enqueue(Job::Log(entry.into()));
+        self.enqueue(entry.into());
     }
     pub fn status(
         &self,
@@ -238,14 +307,38 @@ impl DatabaseWorker {
         status: &str,
         time: Option<i64>,
     ) -> bool {
+        let mut queue = self
+            .0
+            .shared
+            .queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let snapshot = self.0.db.routing_snapshot();
+        if queue.stopped || snapshot.node_generations.get(&proxy.id) != Some(&generation) {
+            queue.dropped_status += 1;
+            return false;
+        }
+        // Bounded by configured nodes, independent of log pressure; never reserve
+        // a new revision for a state that cannot be retained.
+        queue
+            .statuses
+            .retain(|id, change| snapshot.node_generations.get(id) == Some(&change.generation));
         let revision = self.0.db.reserve_status_revision(proxy.id);
-        self.enqueue(Job::Status(
-            Box::new(proxy),
-            generation,
-            revision,
-            status.into(),
-            time,
-        ))
+        let previous = queue.statuses.insert(
+            proxy.id,
+            StatusChange {
+                proxy,
+                generation,
+                revision,
+                status: status.into(),
+                time,
+            },
+        );
+        if previous.is_some() {
+            queue.coalesced_status += 1;
+        }
+        self.0.shared.wake.notify_one();
+        true
     }
     pub fn flush(&self, budget: Duration) -> bool {
         self.0.shared.wake.notify_one();
@@ -259,9 +352,11 @@ impl DatabaseWorker {
             .0
             .shared
             .drained
-            .wait_timeout_while(queue, budget, |q| !q.jobs.is_empty() || q.working)
+            .wait_timeout_while(queue, budget, |q| {
+                !q.jobs.is_empty() || !q.statuses.is_empty() || q.working
+            })
             .unwrap_or_else(|e| e.into_inner());
-        queue.jobs.is_empty() && !queue.working
+        queue.jobs.is_empty() && queue.statuses.is_empty() && !queue.working
     }
     pub fn seal_and_flush(&self, budget: Duration) -> bool {
         self.0
@@ -279,13 +374,118 @@ impl DatabaseWorker {
             .queue
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        json!({"queueLength": queue.jobs.len(), "peakQueueLength": queue.peak_queue_length, "maxQueueWaitMs": queue.max_queue_wait_ms, "capacity": CAPACITY, "droppedLogs": queue.dropped_logs, "databaseErrors": queue.errors, "writtenLogs": queue.written, "maxBatchDurationMs": queue.max_wait_ms})
+        json!({"queueLength": queue.jobs.len(), "statusQueueLength": queue.statuses.len(), "droppedStatus": queue.dropped_status, "coalescedStatus": queue.coalesced_status, "retriedStatus": queue.retried_status, "peakQueueLength": queue.peak_queue_length, "maxQueueWaitMs": queue.max_queue_wait_ms, "capacity": CAPACITY, "droppedLogs": queue.dropped_logs, "databaseErrors": queue.errors, "writtenLogs": queue.written, "maxBatchDurationMs": queue.max_wait_ms})
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_for_test(&self) -> TestPause<'_> {
+        let mut queue = self.0.shared.queue.lock().unwrap();
+        assert!(!queue.working);
+        queue.paused = true;
+        TestPause(self)
+    }
+}
+
+impl Queue {
+    fn paused_for_test(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.paused
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct TestPause<'a>(&'a DatabaseWorker);
+#[cfg(test)]
+impl Drop for TestPause<'_> {
+    fn drop(&mut self) {
+        self.0 .0.shared.queue.lock().unwrap().paused = false;
+        self.0 .0.shared.wake.notify_one();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn test_proxy(db: &Database) -> ProxyRecord {
+        db.create_proxy(crate::models::ProxyInput {
+            name: "state".into(),
+            proxy_type: "http".into(),
+            host: "127.0.0.1".into(),
+            port: 9001,
+            username: None,
+            password: None,
+            enabled: Some(1),
+            test_url: None,
+            test_timeout: None,
+            skip_cert_verify: None,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn latest_state_retries_database_errors_and_rejects_old_revisions() {
+        let db = Database::open_in_memory().unwrap();
+        let proxy = test_proxy(&db);
+        let generation = db.routing_snapshot().node_generations[&proxy.id];
+        let (events, _) = broadcast::channel(16);
+        let worker = DatabaseWorker::new(db.clone(), events).unwrap();
+        let pause = worker.pause_for_test();
+        worker.0.shared.queue.lock().unwrap().fail_status_writes = 1;
+        assert!(worker.status(proxy.clone(), generation, "inactive", None));
+        let old_revision = db.status_revision(proxy.id);
+        assert!(worker.status(proxy.clone(), generation, "active", Some(5)));
+        drop(pause);
+        assert!(worker.flush(Duration::from_secs(3)));
+        assert_eq!(worker.stats()["retriedStatus"], 1);
+        assert_eq!(worker.stats()["databaseErrors"], 1);
+        db.update_passive_status(&proxy, generation, old_revision, "inactive", None)
+            .unwrap();
+        assert_eq!(
+            db.get_proxy(proxy.id).unwrap().unwrap().status.as_deref(),
+            Some("active")
+        );
+        let revision = db.status_revision(proxy.id);
+        assert!(worker.seal_and_flush(Duration::from_secs(1)));
+        assert!(!worker.status(proxy.clone(), generation, "inactive", None));
+        assert_eq!(
+            db.status_revision(proxy.id),
+            revision,
+            "rejected status must not invalidate accepted state"
+        );
+        assert_eq!(worker.stats()["droppedStatus"], 1);
+        assert_eq!(worker.stats()["droppedLogs"], 0);
+    }
+
+    #[test]
+    fn unverified_forwarding_does_not_use_failure_reserve() {
+        let worker = DatabaseWorker(Arc::new(Worker {
+            db: Database::open_in_memory().unwrap(),
+            shared: Arc::new(Shared {
+                queue: Mutex::new(Queue::default()),
+                wake: Condvar::new(),
+                drained: Condvar::new(),
+            }),
+            join: Mutex::new(None),
+        }));
+        for _ in 0..CAPACITY {
+            worker.log(RequestLogEntry {
+                proxy_id: None,
+                target_host: "forward",
+                target_port: 80,
+                success: false,
+                response_time: None,
+                error_message: None,
+                result_type: "forwarded_unverified",
+            });
+        }
+        assert_eq!(worker.stats()["queueLength"], CAPACITY - FAILURE_RESERVE);
+    }
     #[test]
     fn full_queue_reserves_space_and_evicts_regular_logs_for_failures() {
         let shared = Arc::new(Shared {

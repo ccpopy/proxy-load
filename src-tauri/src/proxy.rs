@@ -560,17 +560,16 @@ impl ProxyRuntime {
         let mark_active = {
             let mut metrics = self.metrics.write().unwrap_or_else(|e| e.into_inner());
             let metric = metrics.entry(proxy_id).or_insert_with(ProxyMetrics::new);
+            let changed = metric.pushed_status.as_deref() != Some("active");
+            if metric.pushed_status.as_deref() == Some("inactive") {
+                metric.learning_remaining = 3;
+            }
             metric.push(true, Some(response_time));
-            metric.pushed_status.as_deref() != Some("active")
+            metric.pushed_status = Some("active".to_string());
+            changed
         };
-        if mark_active && self.apply_passive_status_locked(proxy_id, "active", Some(response_time))
-        {
-            self.metrics
-                .write()
-                .unwrap_or_else(|e| e.into_inner())
-                .entry(proxy_id)
-                .or_insert_with(ProxyMetrics::new)
-                .pushed_status = Some("active".to_string());
+        if mark_active {
+            self.apply_passive_status_locked(proxy_id, "active", Some(response_time));
         }
     }
 
@@ -1256,11 +1255,12 @@ impl ProxyRuntime {
         if just_opened {
             // 熔断器刚打开，说明真实流量已连续失败，立即把状态刷成 inactive，
             // 让主动测活以更短的“恢复间隔”盯住它。
-            if self.apply_passive_status_locked(proxy_id, "inactive", None) {
+            {
                 let mut metrics = self.metrics.write().unwrap_or_else(|e| e.into_inner());
                 let metric = metrics.entry(proxy_id).or_insert_with(ProxyMetrics::new);
                 metric.pushed_status = Some("inactive".to_string());
             }
+            self.apply_passive_status_locked(proxy_id, "inactive", None);
         }
     }
 
