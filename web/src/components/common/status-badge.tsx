@@ -1,6 +1,7 @@
 import type { CSSProperties } from "react"
 
 import { cn } from "@/lib/utils"
+import { proxyHealthView, probeHealthDescription } from "@/lib/proxy-health"
 import type { ProxyRecord, ProxyStatus } from "@/types"
 
 const PROXY_STATUS: Record<
@@ -22,6 +23,11 @@ const PROXY_STATUS: Record<
     className: "border-warning/30 bg-warning/10 text-warning",
     dot: "var(--warning)",
   },
+  degraded: {
+    label: "测活异常",
+    className: "border-warning/30 bg-warning/10 text-warning",
+    dot: "var(--warning)",
+  },
   unknown: {
     label: "未知",
     className: "border-border bg-muted/50 text-muted-foreground",
@@ -30,17 +36,18 @@ const PROXY_STATUS: Record<
 }
 
 export function StatusBadge({ proxy }: { proxy: ProxyRecord }) {
-  const key = (proxy.status ?? "unknown") as ProxyStatus
+  const { key, label } = proxyHealthView(proxy)
   const tone = PROXY_STATUS[key] ?? PROXY_STATUS.unknown
   return (
     <span
+      title={probeHealthDescription(proxy)}
       className={cn(
         "inline-flex items-center gap-1.5 rounded-sm border px-1.5 py-0.5 text-xs font-medium",
         tone.className
       )}
     >
       <span className="size-1.5 rounded-full" style={{ background: tone.dot }} />
-      {tone.label}
+      {label}
     </span>
   )
 }

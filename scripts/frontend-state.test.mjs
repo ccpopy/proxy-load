@@ -3,6 +3,28 @@ import assert from 'node:assert/strict';
 import { createLatestRequestGuard } from '../web/src/lib/latest-request.ts';
 import * as constants from '../web/src/lib/constants.ts';
 import { advancedSettingsPayload, businessLimitError } from '../web/src/lib/advanced-settings.ts';
+import { proxyHealthView, readinessAllowsNewConnections, probeHealthDescription } from '../web/src/lib/proxy-health.ts';
+
+test('readiness badges, filters and admission distinguish failed probe from reachable entry', () => {
+  const proxy = { enabled: 1, status: 'active', success_count: 99, fail_count: 7,
+    health_policy: { mode: 'required_probe', failure_threshold: 2, recovery_threshold: 2, max_age_seconds: 600 },
+    probe_health: { fresh: true, transport_status: 'reachable', readiness_status: 'not_ready',
+      consecutive_failures: 2, consecutive_successes: 0, probe_success_count: 0, probe_failure_count: 2,
+      last_probe_result: { outcome: 'failure', observed_at: 1000, probe_url: 'http://vpn.test/health', url_source: 'node',
+        diagnostics: { phase: 'tunnel_connect', scope: 'target_route', code: { kind: 'timeout' } } } } };
+  assert.deepEqual(proxyHealthView(proxy), { key: 'inactive', label: '业务不可用', entry: '代理入口可达' });
+  assert.equal(readinessAllowsNewConnections(proxy), false);
+  assert.match(probeHealthDescription(proxy, 2000), /tunnel_connect/);
+  assert.match(probeHealthDescription(proxy, 2000), /旧版混合历史：成功 99/);
+  const degraded = { ...proxy, probe_health: { ...proxy.probe_health, readiness_status: 'degraded', consecutive_failures: 1 } };
+  assert.equal(proxyHealthView(degraded).key, 'degraded');
+  assert.equal(readinessAllowsNewConnections(degraded), true);
+  assert.equal(proxyHealthView({ ...proxy, probe_health: { ...proxy.probe_health, fresh: false } }).label, '业务待验证');
+  const general = { ...proxy, health_policy: { ...proxy.health_policy, mode: 'transport_only' } };
+  assert.equal(proxyHealthView(general).label, '最近测活失败');
+  assert.equal(readinessAllowsNewConnections(general), true);
+  assert.equal(readinessAllowsNewConnections({ ...general, enabled: 0 }), false);
+});
 
 test('concurrency settings retain defaults, validate bounds and never save runtime diagnostics', () => {
   const config = { ...constants.defaultAdvanced, effective_concurrency: { max_connections: 2 } };

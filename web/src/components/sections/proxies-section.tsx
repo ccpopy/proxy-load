@@ -4,6 +4,7 @@ import { toast } from "sonner"
 
 import { api } from "@/lib/api"
 import { cn } from "@/lib/utils"
+import { proxyHealthView, probeHealthDescription, entryHandshakeMillis } from "@/lib/proxy-health"
 import type { ProxyRecord, TestResult } from "@/types"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -23,6 +24,8 @@ const FILTERS = [
   ["enabled", "已启用"],
   ["active", "在线"],
   ["inactive", "离线"],
+  ["degraded", "测活异常"],
+  ["unknown", "待验证"],
   ["testing", "测试中"],
   ["disabled", "未启用"],
 ] as const
@@ -46,7 +49,7 @@ export function ProxiesSection({
         if (filter === "all") return true
         if (filter === "enabled") return proxy.enabled === 1
         if (filter === "disabled") return proxy.enabled !== 1
-        return proxy.status === filter
+        return proxy.enabled === 1 && proxyHealthView(proxy).key === filter
       })
       .sort(compareProxyHealth)
   }, [filter, proxies])
@@ -125,6 +128,7 @@ export function ProxiesSection({
                     <div className="flex flex-wrap items-center gap-2">
                       <span className="truncate font-medium">{proxy.name}</span>
                       <StatusBadge proxy={proxy} />
+                      <span className="text-xs text-muted-foreground">{proxyHealthView(proxy).entry}</span>
                       <span className="rounded-sm border border-border bg-muted/50 px-1.5 py-0.5 font-mono text-[0.7rem] uppercase tracking-wider text-muted-foreground">
                         {proxy.type}
                       </span>
@@ -135,16 +139,20 @@ export function ProxiesSection({
                     <div className="mt-2.5 grid gap-x-6 gap-y-1.5 md:grid-cols-2 xl:grid-cols-[minmax(16rem,1.8fr)_minmax(6rem,0.7fr)_minmax(6rem,0.7fr)_minmax(6rem,0.7fr)]">
                       <Stat label="地址" value={`${proxy.host}:${proxy.port}`} />
                       <Stat
-                        label="代理建连"
+                        label="入口握手"
                         value={
-                          proxy.response_time != null
-                            ? `${proxy.response_time} ms`
+                          entryHandshakeMillis(proxy) != null
+                            ? `${entryHandshakeMillis(proxy)} ms`
                             : "—"
                         }
                       />
-                      <Stat label="测活成功" value={proxy.success_count} tone="success" />
-                      <Stat label="测活失败" value={proxy.fail_count} tone="danger" />
+                      <Stat label="测活成功" value={proxy.probe_health?.probe_success_count ?? 0} tone="success" />
+                      <Stat label="测活失败" value={proxy.probe_health?.probe_failure_count ?? 0} tone="danger" />
                     </div>
+                    <details className="mt-2 text-xs text-muted-foreground">
+                      <summary className="cursor-pointer">测活详情</summary>
+                      <p className="mt-2 whitespace-pre-line break-all leading-relaxed">{probeHealthDescription(proxy)}</p>
+                    </details>
                   </div>
                   <div className="flex items-center gap-2">
                     <Button
@@ -229,10 +237,11 @@ function compareProxyHealth(left: ProxyRecord, right: ProxyRecord) {
 
 function proxyHealthRank(proxy: ProxyRecord) {
   if (proxy.enabled !== 1) return 5
-  if (proxy.status === "active") return 0
-  if (proxy.status === "testing") return 1
-  if (proxy.status === "unknown" || !proxy.status) return 2
-  if (proxy.status === "inactive") return 4
+  const { key } = proxyHealthView(proxy)
+  if (key === "active") return 0
+  if (key === "testing") return 1
+  if (key === "unknown") return 2
+  if (key === "inactive") return 4
   return 3
 }
 

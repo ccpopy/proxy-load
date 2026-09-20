@@ -58,6 +58,7 @@ export function ProxyDialog({
 }) {
   const proxy = value && value !== "new" ? value : null
   const [testUrls, setTestUrls] = useState<string[]>([])
+  const [globalTestUrl, setGlobalTestUrl] = useState("")
   const [form, setForm] = useState({
     name: "",
     type: "http",
@@ -69,6 +70,11 @@ export function ProxyDialog({
     test_url: "",
     test_timeout: "",
     skip_cert_verify: false,
+    health_mode: "transport_only",
+    failure_threshold: 2,
+    recovery_threshold: 2,
+    expected_statuses: "200, 204",
+    max_age_seconds: 600,
   })
 
   useEffect(() => {
@@ -83,6 +89,11 @@ export function ProxyDialog({
       test_url: proxy?.test_url ?? "",
       test_timeout: proxy?.test_timeout ? String(proxy.test_timeout) : "",
       skip_cert_verify: proxy ? proxy.skip_cert_verify === 1 : false,
+      health_mode: proxy?.health_policy?.mode ?? "transport_only",
+      failure_threshold: proxy?.health_policy?.failure_threshold ?? 2,
+      recovery_threshold: proxy?.health_policy?.recovery_threshold ?? 2,
+      expected_statuses: (proxy?.health_policy?.expected_statuses ?? [200, 204]).join(", "),
+      max_age_seconds: proxy?.health_policy?.max_age_seconds ?? 600,
     })
   }, [proxy, value])
 
@@ -90,6 +101,9 @@ export function ProxyDialog({
     if (value === null) return undefined
 
     let closed = false
+    api<Record<string, string>>("/api/settings").then((settings) => {
+      if (!closed) setGlobalTestUrl(settings.test_url ?? "")
+    }).catch(() => { if (!closed) setGlobalTestUrl("") })
     api<string[]>("/api/test-urls")
       .then((urls) => {
         if (!closed) {
@@ -114,6 +128,13 @@ export function ProxyDialog({
       enabled: form.enabled ? 1 : 0,
       test_timeout: form.test_timeout ? Number(form.test_timeout) : null,
       skip_cert_verify: form.skip_cert_verify ? 1 : 0,
+      health_policy: {
+        mode: form.health_mode,
+        failure_threshold: form.failure_threshold,
+        recovery_threshold: form.recovery_threshold,
+        expected_statuses: form.expected_statuses.split(/[,，\s]+/).filter(Boolean).map(Number),
+        max_age_seconds: form.max_age_seconds,
+      },
     }
     try {
       await api(proxy ? `/api/proxies/${proxy.id}` : "/api/proxies", {
@@ -229,12 +250,55 @@ export function ProxyDialog({
               </Field>
             </div>
             <Field>
-              <FieldLabel>测试地址</FieldLabel>
+              <FieldLabel>健康策略</FieldLabel>
+              <Select value={form.health_mode} onValueChange={(health_mode) => setForm({ ...form, health_mode })}>
+                <SelectTrigger className="w-full" aria-label="健康策略"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="transport_only">通用代理</SelectItem>
+                  <SelectItem value="required_probe">专用节点 · 必须通过业务测活</SelectItem>
+                </SelectContent>
+              </Select>
+              <FieldDescription>
+                {form.health_mode === "required_probe"
+                  ? "失败达到阈值后，隔离此节点的全部新连接；后台连续探测成功后恢复。已有连接不受影响。"
+                  : "目标网站测试失败只提示异常，不隔离节点。VPN / 专用业务节点请切换为业务测活。"}
+              </FieldDescription>
+            </Field>
+            {form.health_mode === "required_probe" && <>
+              <div className="grid grid-cols-2 gap-4">
+                <Field><FieldLabel htmlFor="probe-failures">连续失败阈值</FieldLabel>
+                  <Input id="probe-failures" type="number" min={1} max={10} value={form.failure_threshold}
+                    onChange={(e) => setForm({ ...form, failure_threshold: Number(e.target.value) })} />
+                </Field>
+                <Field><FieldLabel htmlFor="probe-recovery">连续恢复阈值</FieldLabel>
+                  <Input id="probe-recovery" type="number" min={1} max={10} value={form.recovery_threshold}
+                    onChange={(e) => setForm({ ...form, recovery_threshold: Number(e.target.value) })} />
+                </Field>
+              </div>
+              <Field><FieldLabel htmlFor="probe-statuses">预期 HTTP 状态码</FieldLabel>
+                <Input id="probe-statuses" value={form.expected_statuses}
+                  onChange={(e) => setForm({ ...form, expected_statuses: e.target.value })} />
+                <FieldDescription>逗号分隔，默认 200、204。不跟随重定向，登录页跳转不计成功。</FieldDescription>
+              </Field>
+              <Field><FieldLabel htmlFor="probe-max-age">业务就绪有效期（秒）</FieldLabel>
+                <Input id="probe-max-age" type="number" min={30} max={86400} value={form.max_age_seconds}
+                  onChange={(e) => setForm({ ...form, max_age_seconds: Number(e.target.value) })} />
+                <FieldDescription>超过此时间未完整测活成功，将等待重新验证。应大于后台测活间隔。</FieldDescription>
+              </Field>
+            </>}
+            <Field>
+              <FieldLabel htmlFor="proxy-test-url">测试地址</FieldLabel>
               <TestUrlCombobox
                 value={form.test_url}
                 options={testUrls}
                 onChange={(test_url) => setForm({ ...form, test_url })}
               />
+              <FieldDescription className="break-all">
+                生效地址（{form.test_url.trim() ? "节点独立" : "继承全局"}）：{form.test_url.trim() || globalTestUrl || "未读取"}
+              </FieldDescription>
+              {form.health_mode === "required_probe" && <FieldDescription className="text-amber-600 dark:text-amber-500">
+                请填写仅在 VPN / 业务链路就绪时可访问的只读健康接口。公共网站、代理监听端口、VPN 登录页和 VNC 端口不代表业务就绪；不要在 URL 中填写凭据。
+              </FieldDescription>}
             </Field>
             <Field>
               <FieldLabel>超时时间（秒）</FieldLabel>
@@ -307,6 +371,7 @@ function TestUrlCombobox({
       <PopoverAnchor asChild>
         <div className="relative w-full">
           <Input
+            id="proxy-test-url"
             role="combobox"
             aria-expanded={open}
             value={value}
@@ -332,6 +397,7 @@ function TestUrlCombobox({
         </div>
       </PopoverAnchor>
       <PopoverContent
+        onOpenAutoFocus={(event) => event.preventDefault()}
         align="start"
         side="bottom"
         className="w-[var(--radix-popover-trigger-width)] max-w-[calc(100vw-3rem)] p-0"

@@ -1,4 +1,34 @@
-export type ProxyStatus = "active" | "inactive" | "testing" | "unknown"
+export type ProxyStatus = "active" | "inactive" | "testing" | "unknown" | "degraded"
+
+export interface HealthPolicy {
+  mode: "transport_only" | "required_probe"
+  failure_threshold: number
+  recovery_threshold: number
+  expected_statuses: number[]
+  max_age_seconds: number
+}
+
+export interface ProbeHealth {
+  transport_status: "unknown" | "reachable" | "unreachable"
+  readiness_status: "unknown" | "ready" | "degraded" | "not_ready"
+  fresh: boolean
+  probe_success_count: number
+  probe_failure_count: number
+  probe_excluded_count: number
+  statistics_started_at?: number | null
+  consecutive_failures: number
+  consecutive_successes: number
+  last_success_at?: number | null
+  last_probe_result?: {
+    outcome: "success" | "failure" | "unknown"
+    observed_at: number
+    probe_url: string
+    url_source: "node" | "global"
+    response_time: number
+    status_code?: number | null
+    diagnostics: NonNullable<TestResult["diagnostics"]>
+  } | null
+}
 
 export type ProxyServiceState = "starting" | "running" | "failed"
 
@@ -47,6 +77,8 @@ export interface ProxyRecord {
   skip_cert_verify: number
   test_url?: string | null
   test_timeout?: number | null
+  health_policy?: HealthPolicy
+  probe_health?: ProbeHealth
   _score?: number
   _activeConnections?: number
 }
