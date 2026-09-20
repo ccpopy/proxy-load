@@ -2,7 +2,10 @@ use std::{
     collections::{HashMap, HashSet},
     env, fs,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock, RwLock},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, OnceLock, RwLock,
+    },
     time::Duration,
 };
 
@@ -26,6 +29,7 @@ pub struct Database {
     routing: Arc<RwLock<Arc<RoutingSnapshot>>>,
     query_cache: Arc<Mutex<HashMap<String, (std::time::Instant, Value)>>>,
     status_revisions: Arc<Mutex<HashMap<i64, u64>>>,
+    probe_settings_revision: Arc<AtomicU64>,
 }
 
 #[cfg(test)]
@@ -53,6 +57,7 @@ impl Database {
             routing: Arc::new(RwLock::new(Arc::new(RoutingSnapshot::default()))),
             query_cache: Arc::new(Mutex::new(HashMap::new())),
             status_revisions: Arc::new(Mutex::new(HashMap::new())),
+            probe_settings_revision: Default::default(),
         };
         db.migrate()?;
         let mut conn = db.connection()?;
@@ -81,6 +86,7 @@ impl Database {
             routing: Arc::new(RwLock::new(Arc::new(RoutingSnapshot::default()))),
             query_cache: Arc::new(Mutex::new(HashMap::new())),
             status_revisions: Arc::new(Mutex::new(HashMap::new())),
+            probe_settings_revision: Default::default(),
         };
         db.migrate()?;
         db.publish_routing(&*db.connection()?)?;
@@ -107,6 +113,7 @@ impl Database {
             routing: Arc::new(RwLock::new(Arc::new(RoutingSnapshot::default()))),
             query_cache: Arc::new(Mutex::new(HashMap::new())),
             status_revisions: Arc::new(Mutex::new(HashMap::new())),
+            probe_settings_revision: Default::default(),
         };
         db.migrate()?;
         db.publish_routing(&*db.connection()?)?;
@@ -137,6 +144,7 @@ impl Database {
             routing: self.routing.clone(),
             query_cache: self.query_cache.clone(),
             status_revisions: self.status_revisions.clone(),
+            probe_settings_revision: self.probe_settings_revision.clone(),
         })
     }
 
@@ -233,9 +241,8 @@ impl Database {
             .iter()
             .map(|proxy| {
                 let unchanged = previous
-                    .proxies
-                    .iter()
-                    .any(|old| old.id == proxy.id && crate::routing::same_node(old, proxy));
+                    .proxy(proxy.id)
+                    .is_some_and(|old| crate::routing::same_node(old, proxy));
                 (
                     proxy.id,
                     if unchanged {
@@ -292,12 +299,13 @@ impl Database {
             }
             pools.push(pool);
         }
-        *self.routing.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(RoutingSnapshot {
+        *self.routing.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(RoutingSnapshot::new(
             generation,
             proxies,
             node_generations,
             pools,
-        });
+            &previous,
+        ));
         Ok(())
     }
 
@@ -796,6 +804,10 @@ impl Database {
             .map_err(Into::into)
     }
 
+    pub fn probe_settings_revision(&self) -> u64 {
+        self.probe_settings_revision.load(Ordering::Acquire)
+    }
+
     pub fn save_settings(&self, settings: &Map<String, Value>) -> Result<()> {
         let mut conn = self.connection()?;
         let tx = conn.transaction()?;
@@ -807,6 +819,9 @@ impl Database {
             )?;
         }
         tx.commit()?;
+        if settings.contains_key("test_url") || settings.contains_key("timeout") {
+            self.probe_settings_revision.fetch_add(1, Ordering::Release);
+        }
         Ok(())
     }
 
@@ -1813,6 +1828,11 @@ pub fn default_advanced_config() -> Map<String, Value> {
         ("periodic_test_interval".to_string(), json!(3 * 60 * 1000)),
         ("probe_recovery_interval".to_string(), json!(3 * 60 * 1000)),
         ("probe_concurrency".to_string(), json!(8)),
+        ("max_connections".to_string(), json!(1024)),
+        ("max_handshakes".to_string(), json!(128)),
+        ("max_global_dials".to_string(), json!(64)),
+        ("max_proxy_dials".to_string(), json!(32)),
+        ("target_quality_mode".to_string(), json!("off")),
         ("probe_failure_threshold".to_string(), json!(2)),
         ("startup_probe_enabled".to_string(), json!(true)),
         ("dns_refresh_interval".to_string(), json!(5 * 60 * 1000)),

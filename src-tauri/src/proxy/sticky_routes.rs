@@ -1,8 +1,5 @@
-use super::{monotonic_millis, TargetRequest};
-use crate::{
-    models::ProxyRecord,
-    routing::{self, RoutingSnapshot},
-};
+use super::{monotonic_millis, Candidate, TargetRequest};
+use crate::routing::{self, RouteContext, RoutingSnapshot};
 use std::collections::HashMap;
 
 const MAX_BINDINGS: usize = 4096;
@@ -34,26 +31,27 @@ struct Binding {
 pub(super) struct StickyRoutes(HashMap<Key, Binding>);
 
 impl Policy {
+    #[cfg(test)]
     pub(super) fn for_request(
         snapshot: &RoutingSnapshot,
         request: &TargetRequest,
         global_algorithm: &str,
     ) -> Option<Self> {
-        let pool = snapshot.pool(&request.original_host)?;
-        if pool
-            .algorithm_override
-            .as_deref()
-            .unwrap_or(global_algorithm)
-            != "sticky_host"
-            || pool.sticky_failover_seconds <= 0
-        {
+        Self::for_context(
+            &RouteContext::new(snapshot, &request.original_host, global_algorithm),
+            request,
+        )
+    }
+    pub(super) fn for_context(context: &RouteContext<'_>, request: &TargetRequest) -> Option<Self> {
+        let pool = context.pool?;
+        if context.algorithm != "sticky_host" || pool.sticky_failover_seconds <= 0 {
             return None;
         }
-        let host = routing::normalize_host(&request.original_host);
-        let preferred = snapshot
-            .proxies
+        let host = context.host.clone();
+        let preferred = context
+            .members
             .iter()
-            .filter(|p| pool.members.contains(&p.id))
+            .map(|i| &context.snapshot.proxies[*i])
             .max_by_key(|p| (routing::affinity(pool.id, &host, p.id), p.id))?
             .id;
         Some(Self {
@@ -75,14 +73,14 @@ impl StickyRoutes {
         &mut self,
         policy: &Policy,
         snapshot: &RoutingSnapshot,
-        candidates: &mut [ProxyRecord],
+        candidates: &mut [Candidate<'_>],
     ) {
         let Some(binding) = self.0.get(&policy.key) else {
             return;
         };
         let position = candidates
             .iter()
-            .position(|p| p.id == binding.proxy && p.status.as_deref() != Some("inactive"));
+            .position(|p| p.id == binding.proxy && !p.inactive);
         if binding.expires <= monotonic_millis()
             || binding.revision != policy.revision
             || snapshot.node_generations.get(&binding.proxy) != Some(&binding.generation)

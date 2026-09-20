@@ -270,7 +270,9 @@ pub async fn save_settings(
 
 #[tauri::command]
 pub fn get_advanced_config(state: tauri::State<'_, Arc<AppState>>) -> CommandResult<Value> {
-    Ok(state.db.load_advanced_config()?)
+    let mut config = state.db.load_advanced_config()?;
+    config["effective_concurrency"] = json!(state.proxy_runtime.concurrency_limits());
+    Ok(config)
 }
 
 #[tauri::command]
@@ -282,7 +284,9 @@ pub async fn save_advanced_config(
     let current = state.db.load_advanced_config()?;
     let normalized = normalize_advanced_config(&current, config)?;
     let next = Value::Object(normalized.clone());
-    let requires_restart = restart_required(&current, &next);
+    let requires_restart = restart_required(&current, &next)
+        || crate::proxy::limits::ConcurrencyLimits::from_advanced(&next)?
+            != state.proxy_runtime.concurrency_limits();
 
     state.db.save_settings(&normalized)?;
     state.proxy_runtime.update_advanced_config(&next).await?;
@@ -290,7 +294,7 @@ pub async fn save_advanced_config(
     Ok(json!({
         "success": true,
         "requiresRestart": requires_restart,
-        "message": if requires_restart { "设置已保存；监听地址或端口将在重启应用后生效" } else { "配置已应用" }
+        "message": if requires_restart { "设置已保存；监听地址、端口或业务并发限制将在重启应用后生效" } else { "配置已应用" }
     }))
 }
 
@@ -302,11 +306,13 @@ pub async fn reset_advanced_config(state: tauri::State<'_, Arc<AppState>>) -> Co
     let next = state.db.load_advanced_config()?;
     state.proxy_runtime.update_advanced_config(&next).await?;
     state.notify_advanced_config_changed();
-    let requires_restart = restart_required(&current, &next);
+    let requires_restart = restart_required(&current, &next)
+        || crate::proxy::limits::ConcurrencyLimits::from_advanced(&next)?
+            != state.proxy_runtime.concurrency_limits();
     Ok(json!({
         "success": true,
         "requiresRestart": requires_restart,
-        "message": if requires_restart { "已恢复默认配置；监听地址或端口将在重启应用后生效" } else { "已恢复默认配置" }
+        "message": if requires_restart { "已恢复默认配置；监听地址、端口或业务并发限制将在重启应用后生效" } else { "已恢复默认配置" }
     }))
 }
 
@@ -393,6 +399,8 @@ fn normalize_advanced_config(
         None,
     )?;
     validate_integer_range(&merged, "probe_concurrency", "并发测活数", 1, Some(64))?;
+    crate::proxy::limits::ConcurrencyLimits::from_advanced(&Value::Object(merged.clone()))?;
+    crate::proxy::target_quality::Mode::from_advanced(&Value::Object(merged.clone()))?;
     validate_integer_range(&merged, "probe_failure_threshold", "连续失败阈值", 1, None)?;
     validate_integer_range(
         &merged,
@@ -510,9 +518,16 @@ fn validate_test_url(value: &str) -> CommandResult<()> {
 }
 
 fn restart_required(current: &Value, next: &Value) -> bool {
-    ["proxy_port", "allow_lan"]
-        .into_iter()
-        .any(|key| current.get(key) != next.get(key))
+    [
+        "proxy_port",
+        "allow_lan",
+        "max_connections",
+        "max_handshakes",
+        "max_global_dials",
+        "max_proxy_dials",
+    ]
+    .into_iter()
+    .any(|key| current.get(key) != next.get(key))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1985,6 +2000,24 @@ mod tests {
 
         let invalid = Map::from_iter([("startup_probe_enabled".to_string(), json!("true"))]);
         assert!(normalize_advanced_config(&current, invalid).is_err());
+    }
+
+    #[test]
+    fn advanced_concurrency_and_target_quality_validate_before_persistence() {
+        let current = Value::Object(default_advanced_config());
+        for invalid in [
+            json!({"max_connections": 0}),
+            json!({"max_proxy_dials":65}),
+            json!({"max_handshakes":1025}),
+            json!({"target_quality_mode":"unknown"}),
+        ] {
+            assert!(
+                normalize_advanced_config(&current, invalid.as_object().unwrap().clone()).is_err()
+            );
+        }
+        let normalized = normalize_advanced_config(&current, json!({"max_connections":2,"max_handshakes":1,"max_global_dials":1,"max_proxy_dials":1,"target_quality_mode":"observe"}).as_object().unwrap().clone()).unwrap();
+        assert!(restart_required(&current, &Value::Object(normalized)));
+        assert_eq!(current["max_connections"], 1024);
     }
 
     #[test]

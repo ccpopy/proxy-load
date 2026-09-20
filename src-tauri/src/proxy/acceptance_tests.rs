@@ -3,6 +3,58 @@ use super::routing_tests::{add_proxy, request, runtime};
 use super::*;
 
 #[tokio::test]
+async fn small_connection_handshake_limits_bound_bursts_and_shutdown_reclaims_permits() {
+    let db = Database::open_in_memory().unwrap();
+    let (events, _) = broadcast::channel(16);
+    let mut config = crate::database::default_advanced_config();
+    for (key, value) in [
+        ("max_connections", 2),
+        ("max_handshakes", 1),
+        ("max_global_dials", 1),
+        ("max_proxy_dials", 1),
+    ] {
+        config.insert(key.into(), json!(value));
+    }
+    let runtime = Arc::new(ProxyRuntime::new(db, events, "127.0.0.1", 0, &json!(config)).unwrap());
+    let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = probe.local_addr().unwrap();
+    drop(probe);
+    let server = tokio::spawn(serve(runtime.clone(), "127.0.0.1".into(), address.port()));
+    timeout(Duration::from_secs(2), async {
+        while !runtime.service_status().await.running {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let mut clients = Vec::new();
+    for _ in 0..8 {
+        let mut stream = TcpStream::connect(address).await.unwrap();
+        stream.write_all(b"G").await.unwrap();
+        clients.push(stream);
+    }
+    timeout(Duration::from_secs(2), async {
+        while runtime.connection_slots.available_permits() > 0
+            || runtime.handshake_slots.available_permits() > 0
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(runtime.global_dial_slots.available_permits(), 1);
+    runtime.request_stop();
+    timeout(Duration::from_secs(2), server)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(runtime.connection_slots.available_permits(), 2);
+    assert_eq!(runtime.handshake_slots.available_permits(), 1);
+    drop(clients);
+}
+
+#[tokio::test]
 async fn shutdown_stops_admission_cancels_clients_and_releases_the_listener() {
     let runtime = runtime();
     let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();

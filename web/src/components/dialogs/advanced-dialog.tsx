@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from "react"
+import { useEffect, useId, useRef, useState, type ReactNode } from "react"
 import {
   Activity,
   AppWindow,
@@ -15,6 +15,7 @@ import {
 import { toast } from "sonner"
 
 import { api, commandErrorMessage, jsonBody } from "@/lib/api"
+import { advancedSettingsPayload, businessLimitError, businessLimits } from "@/lib/advanced-settings"
 import type { AdvancedConfig } from "@/types"
 import { Button } from "@/components/ui/button"
 import {
@@ -36,6 +37,7 @@ import {
 import { Input } from "@/components/ui/input"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { Switch } from "@/components/ui/switch"
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 
 interface SaveResult {
   message?: string
@@ -54,11 +56,15 @@ export function AdvancedDialog({
   onChanged: () => Promise<void>
 }) {
   const [config, setConfig] = useState(persistedConfig)
+  const [savedConfig, setSavedConfig] = useState(persistedConfig)
   const [showInboundPassword, setShowInboundPassword] = useState(false)
   const wasOpenRef = useRef(false)
 
   useEffect(() => {
-    if (open && !wasOpenRef.current) setConfig(persistedConfig)
+    if (open && !wasOpenRef.current) {
+      setConfig(persistedConfig)
+      setSavedConfig(persistedConfig)
+    }
     wasOpenRef.current = open
   }, [open, persistedConfig])
 
@@ -82,13 +88,17 @@ export function AdvancedDialog({
 
   async function save() {
     try {
+      const limitError = businessLimitError(config)
+      if (limitError) { toast.error(limitError); return }
       const result = await api<SaveResult>(
         "/api/advanced-config",
-        jsonBody(config)
+        jsonBody(advancedSettingsPayload(config))
       )
       toast.success(result.message ?? "高级配置已保存")
       await onChanged()
-      setConfig(await api<AdvancedConfig>("/api/advanced-config"))
+      const saved = await api<AdvancedConfig>("/api/advanced-config")
+      setConfig(saved)
+      setSavedConfig(saved)
     } catch (error) {
       toast.error(commandErrorMessage(error, "高级配置保存失败"))
     }
@@ -101,7 +111,9 @@ export function AdvancedDialog({
       })
       toast.success(result.message ?? "已恢复默认配置")
       await onChanged()
-      setConfig(await api<AdvancedConfig>("/api/advanced-config"))
+      const saved = await api<AdvancedConfig>("/api/advanced-config")
+      setConfig(saved)
+      setSavedConfig(saved)
     } catch (error) {
       toast.error(commandErrorMessage(error, "恢复默认配置失败"))
     }
@@ -115,8 +127,7 @@ export function AdvancedDialog({
           <DialogDescription>监听、认证、测活、熔断和应用行为参数</DialogDescription>
         </DialogHeader>
         <ScrollArea className="h-[calc(100vh-14rem)] max-h-[650px] pr-4">
-          <div className="grid gap-6 pb-1 lg:grid-cols-2 lg:items-start">
-            <div className="grid gap-6">
+          <div className="columns-1 gap-6 pb-1 lg:columns-2 [column-fill:balance]">
               <ConfigGroup title="监听与认证" icon={Network}>
                 <NumberField
                   label="代理服务端口"
@@ -202,7 +213,7 @@ export function AdvancedDialog({
                   <FieldContent>
                     <FieldTitle>启动时全量测活</FieldTitle>
                     <FieldDescription>
-                      每次启动立即测试全部已启用代理；失败会直接标记为离线
+                      每次启动立即测试全部已启用代理；代理连接或认证失败会标记为离线
                     </FieldDescription>
                   </FieldContent>
                   <Switch
@@ -257,9 +268,56 @@ export function AdvancedDialog({
                   />
                 </FieldGroup>
               </ConfigGroup>
-            </div>
+              <ConfigGroup title="熔断器" icon={Shield}>
+                <FieldDescription>
+                  代理连接或认证故障会触发全局熔断；目标连接失败仅冷却该代理到该目标的链路，
+                  不影响其他网站。两者分别累计失败次数，使用下方阈值和时长。
+                </FieldDescription>
+                <NumberField
+                  label="连续连接失败阈值"
+                  value={config.circuit_failure_threshold}
+                  onChange={(value) => update("circuit_failure_threshold", value)}
+                />
+                <NumberField
+                  label="熔断时长（秒）"
+                  value={Math.round(config.circuit_timeout / 1000)}
+                  onChange={(value) => update("circuit_timeout", value * 1000)}
+                />
+              </ConfigGroup>
 
-            <div className="grid gap-6">
+              <ConfigGroup title="业务并发限制" icon={Network}>
+                <FieldDescription>
+                  保存后重启应用生效，不中断已有连接。业务拨号不包含独立测活，测活并发在“测活与数据”中配置。
+                </FieldDescription>
+                <FieldGroup className="grid gap-4 sm:grid-cols-2">
+                  {businessLimits.map(({ key, label, max }) => (
+                    <div key={key} className="grid gap-1.5">
+                      <NumberField label={label} value={config[key]} max={max}
+                        onChange={(value) => update(key, value)} />
+                      <p className="text-xs text-muted-foreground">
+                        已保存 <span className="font-mono">{savedConfig[key]}</span>
+                        {config.effective_concurrency && <> · 当前生效 <span className="font-mono">{config.effective_concurrency[key]}</span></>}
+                      </p>
+                    </div>
+                  ))}
+                </FieldGroup>
+                {businessLimitError(config) && <p role="alert" className="text-xs text-destructive">{businessLimitError(config)}</p>}
+              </ConfigGroup>
+
+              <ConfigGroup title="目标链路质量" icon={Activity}>
+                <FieldDescription>
+                  默认关闭；仅记录同一目标的可比建连样本。启用评分后仅调整自适应算法，不改变轮询、最小连接和主机粘滞策略。
+                </FieldDescription>
+                <Select value={config.target_quality_mode} onValueChange={(value) => update("target_quality_mode", value as AdvancedConfig["target_quality_mode"])}>
+                  <SelectTrigger aria-label="目标链路质量模式"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="off">关闭</SelectItem>
+                    <SelectItem value="observe">仅观测，不参与选路</SelectItem>
+                    <SelectItem value="adaptive">参与自适应评分</SelectItem>
+                  </SelectContent>
+                </Select>
+              </ConfigGroup>
+
               <ConfigGroup title="应用行为" icon={AppWindow}>
                 <Field orientation="horizontal">
                   <FieldContent>
@@ -283,25 +341,6 @@ export function AdvancedDialog({
                     onCheckedChange={(value) => update("start_minimized", value)}
                   />
                 </Field>
-              </ConfigGroup>
-
-              <ConfigGroup title="熔断器" icon={Shield}>
-                <FieldDescription>
-                  代理连接或认证故障会触发全局熔断；目标连接失败仅冷却该代理到该目标的链路，
-                  不影响其他网站。两者分别累计失败次数，使用下方阈值和时长。
-                </FieldDescription>
-                <NumberField
-                  label="连续连接失败阈值"
-                  value={config.circuit_failure_threshold}
-                  onChange={(value) =>
-                    update("circuit_failure_threshold", value)
-                  }
-                />
-                <NumberField
-                  label="熔断时长（秒）"
-                  value={Math.round(config.circuit_timeout / 1000)}
-                  onChange={(value) => update("circuit_timeout", value * 1000)}
-                />
               </ConfigGroup>
 
               <ConfigGroup title="快速失败" icon={Zap}>
@@ -345,7 +384,6 @@ export function AdvancedDialog({
                   />
                 </FieldGroup>
               </ConfigGroup>
-            </div>
           </div>
         </ScrollArea>
         <DialogFooter>
@@ -373,7 +411,7 @@ function ConfigGroup({
   children: ReactNode
 }) {
   return (
-    <div className="h-fit rounded-md border bg-card/40 p-4">
+    <div className="mb-6 break-inside-avoid rounded-md border bg-card/40 p-4">
       <div className="mb-4 flex items-center gap-2.5">
         <span className="flex size-7 items-center justify-center rounded-sm border border-border bg-muted/50 text-muted-foreground">
           <Icon className="size-3.5" />
@@ -389,19 +427,24 @@ function NumberField({
   label,
   value,
   onChange,
+  max,
 }: {
   label: string
   value: number
   onChange: (value: number) => void
+  max?: number
 }) {
+  const id = useId()
   return (
     <Field>
-      <FieldLabel className="text-[0.7rem] uppercase tracking-wider text-muted-foreground">
+      <FieldLabel htmlFor={id} className="text-[0.7rem] uppercase tracking-wider text-muted-foreground">
         {label}
       </FieldLabel>
       <Input
+        id={id}
         type="number"
         min={1}
+        max={max}
         className="font-mono tabular-nums"
         value={value}
         onChange={(event) => onChange(Number(event.target.value))}

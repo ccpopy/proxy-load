@@ -12,7 +12,18 @@ export interface ProxyServiceStatus {
 
 export interface TestResult {
   success: boolean
-  failureScope?: "proxy" | "target" | "network"
+  failureScope?: "proxy" | "target" | "network" | "local_resource" | "configuration" | "unknown"
+  diagnostics?: {
+    evidence: Record<"proxyTcp" | "proxyAuth" | "targetTunnel" | "targetTls",
+      "not_observed" | "not_applicable" | "established" | "accepted" | "rejected" | "failed">
+    phase?: string | null
+    code?: { kind: string; value?: string | number } | null
+    scope?: string | null
+    rawOsError?: number | null
+    timings: { totalUs: number; [phase: string]: number | null }
+    redirects: number
+    finalOrigin?: string | null
+  }
   responseTime: number
   statusCode?: number | null
   error?: string | null
@@ -207,6 +218,12 @@ export interface ExportResult {
 }
 
 export interface AdvancedConfig {
+  target_quality_mode: "off" | "observe" | "adaptive"
+  max_connections: number
+  max_handshakes: number
+  max_global_dials: number
+  max_proxy_dials: number
+  effective_concurrency?: Pick<AdvancedConfig, "max_connections" | "max_handshakes" | "max_global_dials" | "max_proxy_dials">
   proxy_port: number
   allow_lan: boolean
   inbound_auth_enabled: boolean

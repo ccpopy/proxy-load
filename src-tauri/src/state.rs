@@ -22,6 +22,8 @@ use crate::{
 };
 
 const PROXY_LISTEN_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+#[cfg(test)]
+mod probe_tests;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -39,6 +41,16 @@ pub struct AppState {
     probe_notify: Arc<Notify>,
     dns_notify: Arc<Notify>,
     probe_slots: Arc<Semaphore>,
+    probe_results: Arc<Mutex<HashMap<i64, CompletedProbe>>>,
+}
+
+struct CompletedProbe {
+    proxy: ProxyRecord,
+    generation: Option<u64>,
+    settings: HashMap<String, String>,
+    settings_revision: u64,
+    finished: time::Instant,
+    result: TestResult,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -95,6 +107,7 @@ impl AppState {
             probe_notify: Arc::new(Notify::new()),
             dns_notify: Arc::new(Notify::new()),
             probe_slots: Arc::new(Semaphore::new(64)),
+            probe_results: Default::default(),
         };
         state.spawn_periodic_proxy_tests();
         state.spawn_dynamic_dns_refresh();
@@ -142,6 +155,7 @@ impl AppState {
     }
 
     pub async fn proxy_configuration_changed(&self, proxy_id: i64) {
+        self.probe_results.lock().await.remove(&proxy_id);
         self.probe_failures.lock().await.remove(&proxy_id);
         self.forced_probes.lock().await.insert(proxy_id);
         self.proxy_runtime.reset_proxy_state(proxy_id).await;
@@ -149,6 +163,7 @@ impl AppState {
     }
 
     pub async fn proxy_deleted(&self, proxy_id: i64) {
+        self.probe_results.lock().await.remove(&proxy_id);
         self.probe_failures.lock().await.remove(&proxy_id);
         self.forced_probes.lock().await.remove(&proxy_id);
         let mut locks = self.probe_locks.lock().await;
@@ -461,23 +476,34 @@ impl AppState {
         scheduled_proxy: ProxyRecord,
         origin: ProbeOrigin,
     ) -> Result<Option<TestResult>> {
+        let queued_at = time::Instant::now();
+        let queue_deadline = queued_at + Duration::from_secs(5);
         let probe_lock = {
             let mut locks = self.probe_locks.lock().await;
+            let snapshot = self.db.routing_snapshot();
+            locks.retain(|id, lock| {
+                Arc::strong_count(lock) > 1 || snapshot.node_generations.contains_key(id)
+            });
             locks
                 .entry(scheduled_proxy.id)
                 .or_insert_with(|| Arc::new(Mutex::new(())))
                 .clone()
         };
-        let _probe_guard = probe_lock.lock().await;
+        let _probe_guard = tokio::select! {
+            _ = self.proxy_runtime.cancelled() => return Err(anyhow!("服务已停止，测活已取消")),
+            guard = time::timeout_at(queue_deadline, probe_lock.lock()) =>
+                guard.map_err(|_| anyhow!("同节点测活排队超时，请稍后重试"))?,
+        };
         // Includes manual probes; no separate unlimited manual concurrency path.
-        let _global_permit = time::timeout(
-            Duration::from_secs(5),
+        let _global_permit = tokio::select! {
+            _ = self.proxy_runtime.cancelled() => return Err(anyhow!("服务已停止，测活已取消")),
+            permit = time::timeout_at(
+            queue_deadline,
             self.probe_slots
                 .clone()
                 .acquire_many_owned(64u32.div_ceil(self.probe_schedule()?.concurrency as u32)),
-        )
-        .await
-        .map_err(|_| anyhow!("测活队列繁忙，请稍后重试"))??;
+        ) => permit.map_err(|_| anyhow!("测活队列繁忙，请稍后重试"))??,
+        };
         let Some(proxy) = self.db.get_proxy(scheduled_proxy.id)? else {
             return Ok(None);
         };
@@ -485,7 +511,27 @@ impl AppState {
             return Ok(None);
         }
 
+        let settings_revision = self.db.probe_settings_revision();
         let settings = self.db.settings_map()?;
+        {
+            let results = self.probe_results.lock().await;
+            if let Some(cached) = results.get(&proxy.id).filter(|cached| {
+                cached.finished >= queued_at
+                    && cached.settings_revision == settings_revision
+                    && same_probe_configuration(&cached.proxy, &proxy)
+                    && cached.generation
+                        == self
+                            .db
+                            .routing_snapshot()
+                            .node_generations
+                            .get(&proxy.id)
+                            .copied()
+                    && cached.settings.get("test_url") == settings.get("test_url")
+                    && cached.settings.get("timeout") == settings.get("timeout")
+            }) {
+                return Ok(Some(cached.result.clone()));
+            }
+        }
         let global_url = settings
             .get("test_url")
             .cloned()
@@ -506,7 +552,7 @@ impl AppState {
             .and_then(|value| u64::try_from(value).ok())
             .map(|value| value * 1000)
             .unwrap_or(global_timeout);
-        let target = Url::parse(&test_url).with_context(|| format!("测试地址无效: {test_url}"))?;
+        let target = Url::parse(&test_url).context("测试地址无效")?;
         if target.host_str().is_none() || !matches!(target.scheme(), "http" | "https") {
             return Err(anyhow!("测试地址必须是包含主机名的 HTTP 或 HTTPS URL"));
         }
@@ -522,23 +568,35 @@ impl AppState {
             self.emit("proxy_testing", json!({ "id": proxy.id }));
         }
 
-        let result = proxy_tester::test_proxy(&proxy, &test_url, timeout).await;
+        let result = tokio::select! {
+            _ = self.proxy_runtime.cancelled() => return Err(anyhow!("服务已停止，测活已取消")),
+            result = proxy_tester::test_proxy(&proxy, &test_url, timeout) => result,
+        };
+        let _settings_guard = self.settings_update_guard().await;
+        if self.proxy_runtime.is_stopping() {
+            return Err(anyhow!("服务已停止，测活结果已丢弃"));
+        }
         let Some(latest) = self.db.get_proxy(proxy.id)? else {
             return Ok(Some(result));
         };
-        if !same_probe_configuration(&proxy, &latest) {
+        let latest_settings = self.db.settings_map()?;
+        if self.db.probe_settings_revision() != settings_revision
+            || !same_probe_configuration(&proxy, &latest)
+            || latest_settings.get("test_url") != settings.get("test_url")
+            || latest_settings.get("timeout") != settings.get("timeout")
+        {
             return Err(anyhow!("代理配置在测试期间发生变化，已丢弃旧测试结果"));
         }
 
         let recent_success = self.proxy_runtime.recent_success_map().await;
         let traffic_was_alive_before_apply =
             recent_success.get(&proxy.id).copied().unwrap_or(0) > probe_started_at;
-        let desired_status = if result.success {
+        let proxy_proven = result.diagnostics.proxy_proven();
+        let desired_status = if proxy_proven {
             self.probe_failures.lock().await.remove(&proxy.id);
             Some("active")
         } else if result.failure_scope.as_deref() != Some("proxy") {
             // A test destination failure is not evidence that this proxy is globally unhealthy.
-            self.probe_failures.lock().await.remove(&proxy.id);
             None
         } else if traffic_was_alive_before_apply {
             self.probe_failures.lock().await.remove(&proxy.id);
@@ -563,8 +621,15 @@ impl AppState {
                 probe_generation,
                 probe_started_at,
                 desired_status,
-                result.success.then_some(result.response_time),
-                result.success,
+                proxy_proven.then(|| {
+                    let timings = &result.diagnostics.timings;
+                    (timings
+                        .proxy_tcp_us
+                        .unwrap_or(0)
+                        .saturating_add(timings.proxy_auth_us.unwrap_or(0))
+                        / 1000) as i64
+                }),
+                proxy_proven,
             )
             .await;
         let (applied_status, traffic_proved_alive) = match record_result {
@@ -576,6 +641,23 @@ impl AppState {
         };
         if traffic_proved_alive {
             self.probe_failures.lock().await.remove(&proxy.id);
+        }
+
+        {
+            let mut results = self.probe_results.lock().await;
+            let snapshot = self.db.routing_snapshot();
+            results.retain(|id, _| snapshot.node_generations.contains_key(id));
+            results.insert(
+                proxy.id,
+                CompletedProbe {
+                    proxy: proxy.clone(),
+                    generation: probe_generation,
+                    settings,
+                    settings_revision,
+                    finished: time::Instant::now(),
+                    result: result.clone(),
+                },
+            );
         }
 
         let updated = self.db.get_proxy(proxy.id)?;
@@ -774,6 +856,7 @@ mod tests {
             probe_notify: Default::default(),
             dns_notify: Default::default(),
             probe_slots: Arc::new(Semaphore::new(64)),
+            probe_results: Default::default(),
         };
         let mut ids = Vec::new();
         for domain in [

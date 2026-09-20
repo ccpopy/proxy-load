@@ -1,130 +1,287 @@
-use std::{
-    net::Ipv6Addr,
-    time::{Duration, Instant},
+//! Single-chain, fixed-node probes. Cancellation drops the HTTP driver and its socket inline.
+use crate::{
+    models::{ProxyRecord, TestResult},
+    proxy::{
+        failure::{
+            ConnectPhase as Phase, Evidence, FailureCode as Code, FailureScope as Scope,
+            ProbeDiagnostics, ProbeFailure,
+        },
+        probe_tls,
+        probe_transport::{self, BoxIo, MAX_HEADERS},
+    },
 };
-
-use anyhow::{anyhow, Context, Result};
-use reqwest::{Client, Proxy, StatusCode};
+use http_body_util::Empty;
+use hyper::{body::Bytes, client::conn::http1, header, Request};
+use hyper_util::rt::TokioIo;
+use std::{sync::Arc, time::Duration};
+use tokio::time::{timeout_at, Instant};
+use tokio_rustls::{rustls, TlsConnector};
 use url::Url;
 
-use crate::models::{ProxyRecord, TestResult};
-
 pub async fn test_proxy(proxy: &ProxyRecord, test_url: &str, timeout_ms: u64) -> TestResult {
-    let start = Instant::now();
-    let budget = Duration::from_millis(timeout_ms.max(1));
-    if let Ok(target) = Url::parse(test_url) {
-        if let Err((scope @ ("proxy" | "network"), error)) = crate::proxy::probe_connection_health(
-            proxy,
-            &target,
-            (budget / 2).min(Duration::from_secs(5)),
-        )
-        .await
-        {
-            return TestResult {
-                success: false,
-                response_time: elapsed_ms(start),
-                status_code: None,
-                error: Some(error),
-                failure_scope: Some(scope.into()),
-            };
-        }
-    }
-    match execute_proxy_test(
+    test_with_tls(
         proxy,
         test_url,
-        budget.saturating_sub(start.elapsed()).as_millis().max(1) as u64,
+        timeout_ms,
+        probe_tls::config(proxy.skip_cert_verify == 1),
     )
     .await
-    {
-        Ok(status) => TestResult {
-            success: true,
-            response_time: elapsed_ms(start),
-            status_code: Some(status),
-            error: None,
-            failure_scope: None,
-        },
-        Err(error) => TestResult {
-            success: false,
-            response_time: elapsed_ms(start),
-            status_code: None,
-            failure_scope: Some(
-                if error.to_string().contains("HTTP 407") {
-                    "proxy"
-                } else {
-                    "target"
-                }
-                .into(),
-            ),
-            error: Some(error.to_string()),
-        },
-    }
 }
 
-async fn execute_proxy_test(proxy: &ProxyRecord, test_url: &str, timeout_ms: u64) -> Result<u16> {
-    let target = Url::parse(test_url).with_context(|| format!("测试地址无效: {test_url}"))?;
-    if target.scheme() != "http" && target.scheme() != "https" {
-        return Err(anyhow!("不支持的测试地址协议: {}", target.scheme()));
-    }
-
-    let proxy_url = build_proxy_url(proxy)?;
-    let reqwest_proxy = Proxy::all(proxy_url.as_str()).context("代理 URL 无效")?;
-    let client = Client::builder()
-        .proxy(reqwest_proxy)
-        .timeout(Duration::from_millis(timeout_ms.max(1)))
-        .danger_accept_invalid_certs(proxy.skip_cert_verify == 1)
-        .redirect(reqwest::redirect::Policy::limited(5))
-        .build()?;
-
-    let response = client.get(target).send().await?;
-    validate_probe_status(response.status())
-}
-
-fn validate_probe_status(status: StatusCode) -> Result<u16> {
-    if status == StatusCode::PROXY_AUTHENTICATION_REQUIRED {
-        return Err(anyhow!("上游代理认证失败: HTTP 407"));
-    }
-    if status.as_u16() < 200 || status.as_u16() >= 500 {
-        return Err(anyhow!("HTTP状态码不符合连通性策略: {}", status.as_u16()));
-    }
-    Ok(status.as_u16())
-}
-
-fn build_proxy_url(proxy: &ProxyRecord) -> Result<Url> {
-    let scheme = match proxy.proxy_type.as_str() {
-        "http" | "https" => "http",
-        "socks4" => "socks4a",
-        "socks5" => "socks5h",
-        other => return Err(anyhow!("不支持的代理类型: {other}")),
-    };
-    let host = if proxy.host.parse::<Ipv6Addr>().is_ok() {
-        format!("[{}]", proxy.host)
-    } else {
-        proxy.host.clone()
-    };
-    let mut url = Url::parse(&format!("{scheme}://{host}:{}", proxy.port))?;
-    if let Some(username) = proxy.username.as_deref().filter(|value| !value.is_empty()) {
-        url.set_username(username)
-            .map_err(|_| anyhow!("代理用户名包含非法字符"))?;
-        if let Some(password) = proxy.password.as_deref() {
-            url.set_password(Some(password))
-                .map_err(|_| anyhow!("代理密码包含非法字符"))?;
+async fn test_with_tls(
+    proxy: &ProxyRecord,
+    test_url: &str,
+    timeout_ms: u64,
+    tls: Arc<rustls::ClientConfig>,
+) -> TestResult {
+    let start = Instant::now();
+    let deadline = start + Duration::from_millis(timeout_ms.min(300_000));
+    let mut diagnostic = ProbeDiagnostics::default();
+    let mut status = None;
+    let result = execute(proxy, test_url, deadline, tls, &mut diagnostic, &mut status).await;
+    diagnostic.timings.total_us = start.elapsed().as_micros().min(u64::MAX as u128) as u64;
+    if let Err(error) = &result {
+        diagnostic.phase = Some(error.phase);
+        diagnostic.scope = Some(error.scope);
+        diagnostic.code = Some(error.code.clone());
+        diagnostic.raw_os_error = error.raw_os_error;
+        match error.phase {
+            Phase::TargetTls => diagnostic.evidence.target_tls = Evidence::Failed,
+            Phase::TunnelConnect => diagnostic.evidence.target_tunnel = Evidence::Failed,
+            _ => {}
         }
     }
-    Ok(url)
+    TestResult {
+        success: result.is_ok(),
+        response_time: start.elapsed().as_millis().min(i64::MAX as u128) as i64,
+        status_code: status,
+        error: result.as_ref().err().map(ProbeFailure::message),
+        failure_scope: result.err().map(|e| e.scope.legacy().to_string()),
+        diagnostics: diagnostic,
+    }
 }
 
-fn elapsed_ms(start: Instant) -> i64 {
-    start.elapsed().as_millis() as i64
+fn validate_url(mut target: Url) -> Result<Url, ProbeFailure> {
+    if !matches!(target.scheme(), "http" | "https")
+        || target.host().is_none()
+        || !target.username().is_empty()
+        || target.password().is_some()
+        || target.as_str().len() > 8192
+    {
+        return Err(ProbeFailure::new(
+            Phase::Redirect,
+            Scope::Configuration,
+            Code::UnsupportedTarget,
+        ));
+    }
+    target.set_fragment(None);
+    Ok(target)
+}
+
+async fn execute(
+    proxy: &ProxyRecord,
+    url: &str,
+    deadline: Instant,
+    tls: Arc<rustls::ClientConfig>,
+    d: &mut ProbeDiagnostics,
+    status: &mut Option<u16>,
+) -> Result<(), ProbeFailure> {
+    let mut target = validate_url(Url::parse(url).map_err(|_| {
+        ProbeFailure::new(
+            Phase::Redirect,
+            Scope::Configuration,
+            Code::InvalidConfiguration,
+        )
+    })?)?;
+    for redirects in 0..=5 {
+        if Instant::now() >= deadline {
+            return Err(ProbeFailure::new(
+                Phase::Redirect,
+                Scope::Unknown,
+                Code::Timeout,
+            ));
+        }
+        d.redirects = redirects;
+        d.final_origin = Some(target.origin().ascii_serialization());
+        d.evidence = Default::default();
+        d.timings = Default::default();
+        *status = None;
+        let transport = probe_transport::open_probe_transport(proxy, &target, deadline, d).await?;
+        let io = if target.scheme() == "https" {
+            target_tls(transport.io, &target, deadline, tls.clone(), d).await?
+        } else {
+            d.evidence.target_tls = Evidence::NotApplicable;
+            transport.io
+        };
+        let response = request_headers(
+            io,
+            &target,
+            transport.absolute_form,
+            transport.proxy_authorization.as_deref(),
+            deadline,
+            d,
+        )
+        .await?;
+        let code = response.status().as_u16();
+        *status = Some(code);
+        if transport.absolute_form {
+            if code == 407 {
+                d.evidence.proxy_auth = Evidence::Rejected;
+                return Err(ProbeFailure::new(
+                    Phase::ProxyAuth,
+                    Scope::Proxy,
+                    Code::ProxyAuthRejected,
+                ));
+            }
+            d.evidence.proxy_auth = Evidence::Accepted;
+        }
+        if matches!(code, 301 | 302 | 303 | 307 | 308) {
+            if let Some(location) = response.headers().get(header::LOCATION) {
+                if redirects == 5 {
+                    return Err(ProbeFailure::new(
+                        Phase::Redirect,
+                        Scope::TargetRoute,
+                        Code::RedirectLimit,
+                    ));
+                }
+                target = validate_url(
+                    location
+                        .to_str()
+                        .ok()
+                        .and_then(|value| target.join(value).ok())
+                        .ok_or_else(|| {
+                            ProbeFailure::new(
+                                Phase::Redirect,
+                                Scope::TargetRoute,
+                                Code::InvalidProtocol,
+                            )
+                        })?,
+                )?;
+                continue;
+            }
+        }
+        if !(200..500).contains(&code) || code == 407 {
+            return Err(ProbeFailure::new(
+                Phase::HttpResponse,
+                Scope::TargetRoute,
+                Code::HttpStatus(code),
+            ));
+        }
+        return Ok(());
+    }
+    unreachable!("redirect loop has an explicit limit")
+}
+
+async fn target_tls(
+    io: BoxIo,
+    target: &Url,
+    deadline: Instant,
+    config: Arc<rustls::ClientConfig>,
+    d: &mut ProbeDiagnostics,
+) -> Result<BoxIo, ProbeFailure> {
+    if Instant::now() >= deadline {
+        return Err(ProbeFailure::new(
+            Phase::TargetTls,
+            Scope::TargetRoute,
+            Code::Timeout,
+        ));
+    }
+    let name =
+        rustls::pki_types::ServerName::try_from(probe_transport::host(target)?).map_err(|_| {
+            ProbeFailure::new(
+                Phase::TargetTls,
+                Scope::Configuration,
+                Code::UnsupportedTarget,
+            )
+        })?;
+    let start = Instant::now();
+    let result = timeout_at(deadline, TlsConnector::from(config).connect(name, io))
+        .await
+        .map_err(|_| ProbeFailure::new(Phase::TargetTls, Scope::TargetRoute, Code::Timeout))?;
+    let stream = result.map_err(|error| {
+        #[cfg(test)]
+        if std::env::var_os("PROXY_LOAD_PROBE_BENCH_OUTPUT").is_some() {
+            eprintln!("probe fixture TLS failure: {error:?}");
+        }
+        let certificate = error
+            .get_ref()
+            .and_then(|e| e.downcast_ref::<rustls::Error>())
+            .is_some_and(|e| matches!(e, rustls::Error::InvalidCertificate(_)));
+        let mut failure = ProbeFailure::io(Phase::TargetTls, Scope::TargetRoute, error);
+        if certificate {
+            failure.code = Code::InvalidCertificate;
+        }
+        failure
+    })?;
+    d.timings.target_tls_us = Some(start.elapsed().as_micros() as u64);
+    d.evidence.target_tls = Evidence::Established;
+    Ok(Box::new(stream))
+}
+
+async fn request_headers(
+    io: BoxIo,
+    target: &Url,
+    absolute: bool,
+    authorization: Option<&str>,
+    deadline: Instant,
+    d: &mut ProbeDiagnostics,
+) -> Result<hyper::Response<hyper::body::Incoming>, ProbeFailure> {
+    if Instant::now() >= deadline {
+        return Err(ProbeFailure::new(
+            Phase::HttpWrite,
+            Scope::Unknown,
+            Code::Timeout,
+        ));
+    }
+    let uri = if absolute {
+        target.as_str().to_string()
+    } else {
+        let mut uri = target.path().to_string();
+        if let Some(query) = target.query() {
+            uri.push('?');
+            uri.push_str(query);
+        }
+        uri
+    };
+    let mut request = Request::get(uri)
+        .header(header::HOST, probe_transport::authority(target)?)
+        .header(header::CONNECTION, "close");
+    if let Some(auth) = authorization {
+        request = request.header(header::PROXY_AUTHORIZATION, auth);
+    }
+    let request = request.body(Empty::<Bytes>::new()).map_err(|_| {
+        ProbeFailure::new(
+            Phase::HttpWrite,
+            Scope::Configuration,
+            Code::InvalidConfiguration,
+        )
+    })?;
+    let start = Instant::now();
+    let scope = if absolute {
+        Scope::Unknown
+    } else {
+        Scope::TargetRoute
+    };
+    let response = timeout_at(deadline, async {
+        let (mut sender, connection) = http1::Builder::new().max_headers(128).max_buf_size(MAX_HEADERS)
+            .handshake(TokioIo::new(io)).await.map_err(|e| ProbeFailure::external(Phase::HttpWrite, e))?;
+        // Poll both inline: cancellation drops both; no detached driver tasks or sockets.
+        tokio::pin!(connection);
+        let send = sender.send_request(request);
+        tokio::pin!(send);
+        tokio::select! {
+            biased;
+            response = &mut send => response.map_err(|e| ProbeFailure::external(Phase::HttpResponse, e)),
+            _completed = &mut connection => {
+                // The driver may deliver a zero-length response and finish in the same poll.
+                // Drain that response channel before treating a finished connection as failure.
+                send.await.map_err(|e| ProbeFailure::external(Phase::HttpResponse, e))
+            }
+        }
+    }).await.map_err(|_| ProbeFailure::new(Phase::HttpResponse, scope, Code::Timeout))??;
+    d.timings.http_final_headers_us = Some(start.elapsed().as_micros() as u64);
+    Ok(response)
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn proxy_authentication_required_is_not_a_successful_probe() {
-        assert!(validate_probe_status(StatusCode::PROXY_AUTHENTICATION_REQUIRED).is_err());
-        assert_eq!(validate_probe_status(StatusCode::NOT_FOUND).unwrap(), 404);
-        assert!(validate_probe_status(StatusCode::BAD_GATEWAY).is_err());
-    }
-}
+mod tests;

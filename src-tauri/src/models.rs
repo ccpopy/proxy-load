@@ -130,6 +130,7 @@ pub struct TestResult {
     pub error: Option<String>,
     #[serde(rename = "failureScope", skip_serializing_if = "Option::is_none")]
     pub failure_scope: Option<String>,
+    pub diagnostics: crate::proxy::failure::ProbeDiagnostics,
 }
 
 #[derive(Debug, Clone, Serialize)]

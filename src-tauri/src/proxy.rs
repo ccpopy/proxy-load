@@ -32,8 +32,13 @@ const SOCKS_AUTH_REJECTED: u8 = 0xff;
 const METRICS_WINDOW_MS: i64 = 5 * 60 * 1000;
 const MAX_TARGET_CIRCUITS: usize = 4096;
 const MAX_METRIC_SAMPLES: usize = 2048;
+pub(crate) mod failure;
 mod http_observer;
+pub(crate) mod limits;
+pub(crate) mod probe_tls;
+pub(crate) mod probe_transport;
 mod sticky_routes;
+pub(crate) mod target_quality;
 mod telemetry;
 
 #[derive(Clone)]
@@ -46,8 +51,10 @@ pub struct ProxyRuntime {
     metrics: Arc<SyncRwLock<HashMap<i64, ProxyMetrics>>>,
     circuit_breakers: Arc<SyncRwLock<HashMap<i64, CircuitBreaker>>>,
     target_circuits: Arc<SyncRwLock<HashMap<TargetRouteKey, TargetCircuit>>>,
+    target_quality: Arc<SyncRwLock<target_quality::TargetQuality>>,
     active_connections: Arc<std::sync::Mutex<HashMap<i64, i64>>>,
     connection_slots: Arc<tokio::sync::Semaphore>,
+    limits: limits::ConcurrencyLimits,
     handshake_slots: Arc<tokio::sync::Semaphore>,
     global_dial_slots: Arc<tokio::sync::Semaphore>,
     dial_slots: Arc<SyncMutex<HashMap<i64, Arc<tokio::sync::Semaphore>>>>,
@@ -131,6 +138,35 @@ struct ConnectedUpstream {
     prefetched_response: Vec<u8>,
     target_verified: bool,
     proxy_latency_us: u64,
+}
+
+#[derive(Clone, Copy)]
+struct Candidate<'a> {
+    config: &'a ProxyRecord,
+    inactive: bool,
+}
+impl std::ops::Deref for Candidate<'_> {
+    type Target = ProxyRecord;
+    fn deref(&self) -> &ProxyRecord {
+        self.config
+    }
+}
+impl Candidate<'_> {
+    fn into_record(self) -> ProxyRecord {
+        let mut record = self.config.clone();
+        if self.inactive {
+            record.status = Some("inactive".into());
+        } else if record.status.as_deref() == Some("inactive") {
+            record.status = Some("active".into());
+        }
+        record
+    }
+}
+fn prefer_candidates(proxies: Vec<Candidate<'_>>) -> Vec<Candidate<'_>> {
+    let (mut preferred, fallback): (Vec<_>, Vec<_>) =
+        proxies.into_iter().partition(|p| !p.inactive);
+    preferred.extend(fallback);
+    preferred
 }
 
 struct ConnectionLease {
@@ -228,6 +264,7 @@ struct RuntimeSettings {
     circuit: CircuitConfig,
     fail_fast: FailFastConfig,
     algorithm: String,
+    target_quality_mode: target_quality::Mode,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -289,6 +326,7 @@ impl RuntimeSettings {
             circuit,
             fail_fast,
             algorithm: "adaptive".to_string(),
+            target_quality_mode: target_quality::Mode::from_advanced(config)?,
         })
     }
 
@@ -323,6 +361,7 @@ impl ProxyRuntime {
         advanced: &Value,
     ) -> Result<Self> {
         let mut runtime_settings = RuntimeSettings::from_advanced(advanced)?;
+        let limits = limits::ConcurrencyLimits::from_advanced(advanced)?;
         if let Some(algorithm) = db.settings_map()?.get("algorithm") {
             runtime_settings.set_algorithm(algorithm)?;
         }
@@ -343,10 +382,12 @@ impl ProxyRuntime {
             metrics: Arc::new(SyncRwLock::new(HashMap::new())),
             circuit_breakers: Arc::new(SyncRwLock::new(HashMap::new())),
             target_circuits: Arc::new(SyncRwLock::new(HashMap::new())),
+            target_quality: Default::default(),
             active_connections: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            connection_slots: Arc::new(tokio::sync::Semaphore::new(1024)),
-            handshake_slots: Arc::new(tokio::sync::Semaphore::new(128)),
-            global_dial_slots: Arc::new(tokio::sync::Semaphore::new(64)),
+            connection_slots: Arc::new(tokio::sync::Semaphore::new(limits.max_connections)),
+            handshake_slots: Arc::new(tokio::sync::Semaphore::new(limits.max_handshakes)),
+            global_dial_slots: Arc::new(tokio::sync::Semaphore::new(limits.max_global_dials)),
+            limits,
             dial_slots: Arc::new(SyncMutex::new(HashMap::new())),
             dial_ready: Arc::new(tokio::sync::Notify::new()),
             dns_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -390,7 +431,17 @@ impl ProxyRuntime {
     pub fn database_stats(&self) -> Value {
         let mut stats = self.database_worker.stats();
         stats["timings"] = self.telemetry.snapshot();
+        stats["effectiveConcurrency"] = json!(self.limits);
+        stats["targetQualityEntries"] = json!(self
+            .target_quality
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .len());
         stats
+    }
+
+    pub fn concurrency_limits(&self) -> limits::ConcurrencyLimits {
+        self.limits
     }
 
     async fn set_service_status(&self, status: ProxyServiceStatus) {
@@ -414,12 +465,19 @@ impl ProxyRuntime {
     }
 
     pub async fn update_advanced_config(&self, advanced: &Value) -> Result<()> {
+        limits::ConcurrencyLimits::from_advanced(advanced)?;
         let mut current = self
             .runtime_settings
             .write()
             .unwrap_or_else(|e| e.into_inner());
         let mut next = RuntimeSettings::from_advanced(advanced)?;
         next.algorithm = current.algorithm.clone();
+        if next.target_quality_mode == target_quality::Mode::Off {
+            self.target_quality
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
+        }
         let circuit = next.circuit;
         *current = next;
         drop(current);
@@ -458,7 +516,7 @@ impl ProxyRuntime {
         self.dial_slots
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .remove(&proxy_id);
+            .retain(|id, slots| *id != proxy_id || Arc::strong_count(slots) > 1);
         self.metrics
             .write()
             .unwrap_or_else(|e| e.into_inner())
@@ -477,9 +535,8 @@ impl ProxyRuntime {
         Ok(self
             .db
             .routing_snapshot()
-            .proxies
-            .iter()
-            .any(|latest| latest.id == proxy.id && same_routing_configuration(proxy, latest)))
+            .proxy(proxy.id)
+            .is_some_and(|latest| same_routing_configuration(proxy, latest)))
     }
 
     async fn inbound_auth(&self) -> InboundAuth {
@@ -595,6 +652,7 @@ impl ProxyRuntime {
         self.select_from_snapshot(&self.db.routing_snapshot(), request, excluded, true)
     }
 
+    #[cfg(test)]
     fn select_from_snapshot(
         &self,
         snapshot: &crate::routing::RoutingSnapshot,
@@ -602,18 +660,46 @@ impl ProxyRuntime {
         excluded: &HashSet<i64>,
         commit_selection: bool,
     ) -> Result<Vec<ProxyRecord>> {
+        let context = self.route_context(snapshot, request);
+        self.select_from_context(&context, request, excluded, commit_selection)
+            .map(|candidates| candidates.into_iter().map(Candidate::into_record).collect())
+    }
+
+    fn route_context<'a>(
+        &self,
+        snapshot: &'a crate::routing::RoutingSnapshot,
+        request: &TargetRequest,
+    ) -> crate::routing::RouteContext<'a> {
+        crate::routing::RouteContext::new(
+            snapshot,
+            &request.original_host,
+            &self
+                .runtime_settings
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .algorithm,
+        )
+    }
+
+    fn select_from_context<'a>(
+        &self,
+        context: &crate::routing::RouteContext<'a>,
+        request: &TargetRequest,
+        excluded: &HashSet<i64>,
+        commit_selection: bool,
+    ) -> Result<Vec<Candidate<'a>>> {
+        let snapshot = context.snapshot;
         if snapshot.proxies.is_empty() {
             return Err(anyhow!("没有可用的代理"));
         }
 
-        let group_key = crate::routing::normalize_host(&request.original_host);
-        let pool = snapshot.pool(&group_key);
+        let group_key = &context.host;
+        let pool = context.pool;
         let pool_id = pool.map_or(0, |pool| pool.id);
-        // Filter references first; copy only candidates which can actually route.
-        let mut proxies = snapshot
-            .proxies
+        let mut proxies = context
+            .members
             .iter()
-            .filter(|proxy| pool.is_none_or(|pool| pool.members.contains(&proxy.id)))
+            .map(|i| &snapshot.proxies[*i])
             .peekable();
         if let Some(selection) = pool {
             if proxies.peek().is_none() {
@@ -629,15 +715,7 @@ impl ProxyRuntime {
             .unwrap_or_else(|e| e.into_inner())
             .retain(|id, _| *id == 0 || snapshot.pools.iter().any(|pool| pool.id == *id));
 
-        let mut algorithm = self
-            .runtime_settings
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .algorithm
-            .clone();
-        if let Some(override_algorithm) = pool.and_then(|pool| pool.algorithm_override.as_ref()) {
-            algorithm.clone_from(override_algorithm);
-        }
+        let algorithm = &context.algorithm;
 
         let mut eligible = Vec::new();
         {
@@ -670,22 +748,26 @@ impl ProxyRuntime {
                 {
                     continue;
                 }
-                let mut proxy = proxy.clone();
-                if let Some(status) = metrics.get(&proxy.id).and_then(|m| m.pushed_status.clone()) {
-                    proxy.status = Some(status);
-                }
-                eligible.push(proxy);
+                let status = metrics
+                    .get(&proxy.id)
+                    .and_then(|m| m.pushed_status.as_deref())
+                    .or(proxy.status.as_deref());
+                eligible.push(Candidate {
+                    config: proxy,
+                    inactive: status == Some("inactive"),
+                });
             }
         }
 
         let mut ordered = self.order_proxies_in_pool(
             eligible,
-            &algorithm,
-            &group_key,
+            algorithm,
+            group_key,
             pool_id,
             commit_selection,
+            Some((snapshot, request)),
         )?;
-        if let Some(policy) = sticky_routes::Policy::for_request(snapshot, request, &algorithm) {
+        if let Some(policy) = sticky_routes::Policy::for_context(context, request) {
             self.sticky_routes
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -743,10 +825,15 @@ impl ProxyRuntime {
             .record("selection_wait", wait.elapsed().as_micros() as u64);
         let selection_started = Instant::now();
         let snapshot = self.db.routing_snapshot();
+        let context = self.route_context(&snapshot, request);
         let mut saturated = false;
         let mut unavailable = excluded.clone();
         {
-            let slots = self.dial_slots.lock().unwrap_or_else(|e| e.into_inner());
+            let mut slots = self.dial_slots.lock().unwrap_or_else(|e| e.into_inner());
+            // Retain an old generation's occupied limiter until its leases release it.
+            slots.retain(|id, capacity| {
+                snapshot.node_generations.contains_key(id) || Arc::strong_count(capacity) > 1
+            });
             for (id, capacity) in slots.iter() {
                 if capacity.available_permits() == 0 {
                     unavailable.insert(*id);
@@ -754,26 +841,17 @@ impl ProxyRuntime {
             }
         }
         // Remember whether THIS pool has eligible but temporarily full nodes.
-        let candidates = self.select_from_snapshot(&snapshot, request, excluded, false)?;
+        let candidates = self.select_from_context(&context, request, excluded, false)?;
         saturated |= candidates
             .iter()
             .any(|proxy| unavailable.contains(&proxy.id));
-        let group_key = crate::routing::normalize_host(&request.original_host);
-        let pool = snapshot.pool(&group_key);
-        let algorithm = pool
-            .and_then(|pool| pool.algorithm_override.clone())
-            .unwrap_or_else(|| {
-                self.runtime_settings
-                    .read()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .algorithm
-                    .clone()
-            });
-        let failover_policy = sticky_routes::Policy::for_request(&snapshot, request, &algorithm)
-            .filter(|policy| {
-                !candidates.iter().any(|proxy| {
-                    proxy.id == policy.preferred && proxy.status.as_deref() != Some("inactive")
-                })
+        let pool = context.pool;
+        let algorithm = &context.algorithm;
+        let failover_policy =
+            sticky_routes::Policy::for_context(&context, request).filter(|policy| {
+                !candidates
+                    .iter()
+                    .any(|proxy| proxy.id == policy.preferred && !proxy.inactive)
             });
         let mut initial_candidates = Some(candidates);
         loop {
@@ -785,7 +863,7 @@ impl ProxyRuntime {
                 {
                     candidates
                 }
-                _ => self.select_from_snapshot(&snapshot, request, &unavailable, false)?,
+                _ => self.select_from_context(&context, request, &unavailable, false)?,
             };
             if candidates.is_empty() {
                 break;
@@ -803,7 +881,9 @@ impl ProxyRuntime {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .entry(proxy.id)
-                .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(32)))
+                .or_insert_with(|| {
+                    Arc::new(tokio::sync::Semaphore::new(self.limits.max_proxy_dials))
+                })
                 .clone();
             let Ok(permit) = slots.try_acquire_owned() else {
                 saturated = true;
@@ -811,7 +891,21 @@ impl ProxyRuntime {
             };
             let token = Arc::new(());
             if self.try_begin_attempt_token(proxy.id, request, Some(&token)) {
-                self.commit_pool_selection(pool.map_or(0, |pool| pool.id), &algorithm, proxy.id);
+                if self
+                    .runtime_settings
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .target_quality_mode
+                    == target_quality::Mode::Adaptive
+                {
+                    if let Some(key) = Self::quality_key(&proxy, generation, request) {
+                        self.target_quality
+                            .write()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .reserved(&key, monotonic_millis());
+                    }
+                }
+                self.commit_pool_selection(pool.map_or(0, |pool| pool.id), algorithm, proxy.id);
                 self.increment_active(proxy.id);
                 self.telemetry.record(
                     "selection_hold",
@@ -819,7 +913,7 @@ impl ProxyRuntime {
                 );
                 return Ok((
                     Some(ConnectionLease {
-                        proxy,
+                        proxy: proxy.into_record(),
                         generation,
                         active: self.active_connections.clone(),
                         attempt: token,
@@ -847,7 +941,15 @@ impl ProxyRuntime {
         algorithm: &str,
         host_key: &str,
     ) -> Result<Vec<ProxyRecord>> {
-        self.order_proxies_in_pool(proxies, algorithm, host_key, 0, true)
+        let candidates = proxies
+            .iter()
+            .map(|config| Candidate {
+                config,
+                inactive: config.status.as_deref() == Some("inactive"),
+            })
+            .collect();
+        self.order_proxies_in_pool(candidates, algorithm, host_key, 0, true, None)
+            .map(|proxies| proxies.into_iter().map(Candidate::into_record).collect())
     }
 
     fn commit_pool_selection(&self, pool_id: i64, algorithm: &str, proxy_id: i64) {
@@ -872,14 +974,59 @@ impl ProxyRuntime {
         }
     }
 
-    fn order_proxies_in_pool(
+    fn quality_key(
+        proxy: &ProxyRecord,
+        generation: u64,
+        request: &TargetRequest,
+    ) -> Option<target_quality::Key> {
+        let measurement = match proxy.proxy_type.as_str() {
+            "socks4" | "socks5" => target_quality::Measurement::SocksTargetConnect,
+            "http" | "https" if request.inbound != InboundProtocol::HttpForward => {
+                target_quality::Measurement::HttpConnectResponse
+            }
+            _ => return None, // HTTP forwarding has no comparable target-connect measurement.
+        };
+        Some(target_quality::Key {
+            proxy: proxy.id,
+            generation,
+            host: crate::routing::normalize_host(&request.original_host),
+            destination: crate::routing::normalize_host(&request.host),
+            port: request.port,
+            measurement,
+        })
+    }
+
+    fn record_target_quality(
         &self,
-        mut proxies: Vec<ProxyRecord>,
+        proxy: &ConnectionLease,
+        request: &TargetRequest,
+        success: bool,
+        latency_us: Option<u64>,
+    ) {
+        let settings = self
+            .runtime_settings
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        if settings.target_quality_mode == target_quality::Mode::Off {
+            return;
+        }
+        if let Some(key) = Self::quality_key(proxy, proxy.generation, request) {
+            self.target_quality
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .record(key, success, latency_us, monotonic_millis());
+        }
+    }
+
+    fn order_proxies_in_pool<'a>(
+        &self,
+        mut proxies: Vec<Candidate<'a>>,
         algorithm: &str,
         host_key: &str,
         pool_id: i64,
         commit_selection: bool,
-    ) -> Result<Vec<ProxyRecord>> {
+        target_context: Option<(&crate::routing::RoutingSnapshot, &TargetRequest)>,
+    ) -> Result<Vec<Candidate<'a>>> {
         if proxies.is_empty() {
             return Ok(proxies);
         }
@@ -897,7 +1044,7 @@ impl ProxyRuntime {
                 // One O(N) selection. Retries reselect with their excluded set.
                 if let Some((index, _)) = proxies.iter().enumerate().min_by_key(|(_, p)| {
                     (
-                        p.status.as_deref() == Some("inactive"),
+                        p.inactive,
                         active.get(&p.id).copied().unwrap_or(0),
                         p.id <= last,
                         p.id,
@@ -921,7 +1068,7 @@ impl ProxyRuntime {
                         .position(|proxy| proxy.id > last)
                         .unwrap_or(0);
                     proxies.rotate_left(selected);
-                    proxies = prioritize_route_status(proxies);
+                    proxies = prefer_candidates(proxies);
                 }
             }
             "sticky_host" => {
@@ -966,21 +1113,48 @@ impl ProxyRuntime {
                     .active_connections
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
+                let mode = self
+                    .runtime_settings
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .target_quality_mode;
+                let target_quality = self
+                    .target_quality
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner());
+                let target_key = |proxy: &ProxyRecord| {
+                    target_context.and_then(|(snapshot, request)| {
+                        snapshot
+                            .node_generations
+                            .get(&proxy.id)
+                            .and_then(|generation| Self::quality_key(proxy, *generation, request))
+                    })
+                };
                 let effective_score = |proxy: &ProxyRecord| {
                     let quality = metrics
                         .get(&proxy.id)
                         .filter(|metric| !metric.requests.is_empty())
                         .map(|metric| metric.score)
                         .unwrap_or_else(|| score_of(proxy));
-                    quality / (1 + active.get(&proxy.id).copied().unwrap_or(0).max(0)) as f64
+                    let multiplier = if mode == target_quality::Mode::Adaptive {
+                        target_key(proxy).map_or(1.0, |key| target_quality.multiplier(&key, now))
+                    } else {
+                        1.0
+                    };
+                    quality * multiplier
+                        / (1 + active.get(&proxy.id).copied().unwrap_or(0).max(0)) as f64
                 };
                 let learner = if learning_turn {
                     proxies
                         .iter()
                         .enumerate()
                         .filter(|(_, p)| {
-                            p.status.as_deref() != Some("inactive")
-                                && metrics.get(&p.id).is_none_or(|m| m.learning_remaining > 0)
+                            !p.inactive
+                                && (metrics.get(&p.id).is_none_or(|m| m.learning_remaining > 0)
+                                    || mode == target_quality::Mode::Adaptive
+                                        && target_key(p).is_some_and(|key| {
+                                            target_quality.exploration_due(&key, now)
+                                        }))
                         })
                         .min_by_key(|(_, p)| (p.id <= last, p.id))
                         .map(|(index, _)| index)
@@ -992,8 +1166,8 @@ impl ProxyRuntime {
                         .iter()
                         .enumerate()
                         .max_by(|(_, a), (_, b)| {
-                            (a.status.as_deref() != Some("inactive"))
-                                .cmp(&(b.status.as_deref() != Some("inactive")))
+                            (!a.inactive)
+                                .cmp(&(!b.inactive))
                                 .then_with(|| effective_score(a).total_cmp(&effective_score(b)))
                                 .then_with(|| b.id.cmp(&a.id))
                         })
@@ -1004,7 +1178,7 @@ impl ProxyRuntime {
                 }
             }
         }
-        let proxies = prioritize_route_status(proxies);
+        let proxies = prefer_candidates(proxies);
         if commit_selection {
             self.commit_pool_selection(pool_id, algorithm, proxies[0].id);
         }
@@ -1334,7 +1508,20 @@ impl ProxyRuntime {
         } else {
             self.db.status_revision(proxy_id)
         };
-        if success {
+        let owned_half_open = self
+            .circuit_breakers
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&proxy_id)
+            .is_some_and(|breaker| {
+                breaker.state == "HALF_OPEN"
+                    && breaker
+                        .attempt
+                        .as_ref()
+                        .and_then(std::sync::Weak::upgrade)
+                        .is_some()
+            });
+        if success && !owned_half_open {
             self.record_breaker_success(proxy_id).await;
         }
         if let Some(status) = applied_status {
@@ -1487,7 +1674,7 @@ async fn accept_clients(
 ) -> Result<()> {
     loop {
         while clients.try_join_next().is_some() {}
-        // Admission before spawn: at most 1024 live client tasks, no unbounded waiting queue.
+        // Admission before spawn: runtime's fixed connection limit, no unbounded task queue.
         let connection_permit = runtime.connection_slots.clone().acquire_owned().await?;
         let (client, addr) = match listener.accept().await {
             Ok(accepted) => accepted,
@@ -1814,6 +2001,12 @@ async fn connect_with_fail_fast(
                 proxy.global_dial_permit = None;
                 runtime.dial_ready.notify_waiters();
                 if stream.target_verified {
+                    runtime.record_target_quality(
+                        &proxy,
+                        request,
+                        true,
+                        Some(attempt_elapsed_us.saturating_sub(stream.proxy_latency_us)),
+                    );
                     // 评分只计当前节点自身的建连耗时；请求日志仍记录用户等待的总耗时。
                     runtime
                         .record_verified_connection_locked(&proxy, request, stream.proxy_latency_us)
@@ -1828,6 +2021,9 @@ async fn connect_with_fail_fast(
             }
             Err(error) => {
                 failover_started.get_or_insert_with(Instant::now);
+                if scope == FailureScope::Target {
+                    runtime.record_target_quality(&proxy, request, false, None);
+                }
                 if scope == FailureScope::LocalRoute {
                     runtime
                         .telemetry
@@ -2716,6 +2912,7 @@ fn latency_score(response_time_ms: Option<f64>) -> f64 {
     }
 }
 
+#[cfg(test)]
 fn prioritize_route_status(proxies: Vec<ProxyRecord>) -> Vec<ProxyRecord> {
     let mut preferred = Vec::new();
     let mut degraded = Vec::new();
@@ -2833,40 +3030,6 @@ pub(crate) fn monotonic_millis() -> i64 {
         .as_millis()
         .min((i64::MAX - 1) as u128) as i64
         + 1
-}
-
-/// Uses the same TCP/auth/target failure boundary as business routing, without health mutation.
-pub async fn probe_connection_health(
-    proxy: &ProxyRecord,
-    target: &url::Url,
-    budget: Duration,
-) -> Result<(), (&'static str, String)> {
-    let host = target.host_str().unwrap_or_default();
-    let request = TargetRequest {
-        host: host.into(),
-        original_host: host.into(),
-        port: target.port_or_known_default().unwrap_or(443),
-        address_type: address_type(host).unwrap_or(ADDR_DOMAIN),
-        inbound: InboundProtocol::HttpConnect,
-        initial_payload: Vec::new(),
-    };
-    let mut scope = FailureScope::Proxy;
-    timeout(budget, connect_through_proxy(proxy, &request, &mut scope))
-        .await
-        .unwrap_or_else(|_| Err(anyhow!("{}超时", scope.label())))
-        .map(|_| ())
-        .map_err(|error| {
-            (
-                if is_local_network_error(&error) {
-                    "network"
-                } else if scope == FailureScope::Proxy {
-                    "proxy"
-                } else {
-                    "target"
-                },
-                format!("{}: {error:#}", scope.label()),
-            )
-        })
 }
 
 fn is_local_network_error(error: &anyhow::Error) -> bool {

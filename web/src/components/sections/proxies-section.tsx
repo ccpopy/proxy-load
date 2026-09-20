@@ -65,7 +65,7 @@ export function ProxiesSection({
         method: "POST",
       })
       if (result.success) {
-        toast.success(`${proxy.name} 测试通过，响应 ${result.responseTime} ms`)
+        toast.success(`${proxy.name} 测试通过，总耗时 ${result.responseTime} ms`)
       } else {
         toast.error(`${proxy.name} 测试失败: ${result.error ?? "未返回错误详情"}`)
       }
@@ -135,7 +135,7 @@ export function ProxiesSection({
                     <div className="mt-2.5 grid gap-x-6 gap-y-1.5 md:grid-cols-2 xl:grid-cols-[minmax(16rem,1.8fr)_minmax(6rem,0.7fr)_minmax(6rem,0.7fr)_minmax(6rem,0.7fr)]">
                       <Stat label="地址" value={`${proxy.host}:${proxy.port}`} />
                       <Stat
-                        label="响应"
+                        label="代理建连"
                         value={
                           proxy.response_time != null
                             ? `${proxy.response_time} ms`

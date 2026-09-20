@@ -41,6 +41,254 @@ use crate::{
 };
 
 #[tokio::test]
+async fn concurrency_limits_are_restart_only_and_small_dial_quotas_release_on_cancel() {
+    let runtime = runtime();
+    let mut config = crate::database::default_advanced_config();
+    for (key, value) in [
+        ("max_connections", 2),
+        ("max_handshakes", 1),
+        ("max_global_dials", 1),
+        ("max_proxy_dials", 1),
+    ] {
+        config.insert(key.into(), json!(value));
+    }
+    runtime
+        .update_advanced_config(&json!(config))
+        .await
+        .unwrap();
+    assert_eq!(runtime.concurrency_limits().max_connections, 1024);
+    assert_eq!(runtime.global_dial_slots.available_permits(), 64);
+    let (events, _) = broadcast::channel(16);
+    let restarted = Arc::new(
+        ProxyRuntime::new(
+            Database::open_in_memory().unwrap(),
+            events,
+            "127.0.0.1",
+            0,
+            &json!(config),
+        )
+        .unwrap(),
+    );
+    let proxy = add_proxy(&restarted, 19901);
+    let lease = restarted
+        .reserve_proxy(&request("x.test"), &HashSet::new())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(restarted.global_dial_slots.available_permits(), 0);
+    assert_eq!(
+        restarted.dial_slots.lock().unwrap()[&proxy.id].available_permits(),
+        0
+    );
+    let limiter = restarted.dial_slots.lock().unwrap()[&proxy.id].clone();
+    restarted.reset_proxy_state(proxy.id).await;
+    assert!(Arc::ptr_eq(
+        &limiter,
+        &restarted.dial_slots.lock().unwrap()[&proxy.id]
+    ));
+    assert_eq!(limiter.available_permits(), 0);
+    let waiting = tokio::spawn({
+        let runtime = restarted.clone();
+        async move {
+            runtime
+                .reserve_proxy(&request("x.test"), &HashSet::new())
+                .await
+        }
+    });
+    tokio::task::yield_now().await;
+    waiting.abort();
+    assert!(waiting.await.err().unwrap().is_cancelled());
+    drop(lease);
+    assert_eq!(restarted.global_dial_slots.available_permits(), 1);
+    assert_eq!(
+        restarted.dial_slots.lock().unwrap()[&proxy.id].available_permits(),
+        1
+    );
+    assert!(restarted.metrics.read().unwrap().is_empty());
+    assert!(restarted.active_connections.lock().unwrap().is_empty());
+    let original = restarted.concurrency_limits();
+    config.insert("max_proxy_dials".into(), json!(2));
+    assert!(restarted
+        .update_advanced_config(&json!(config))
+        .await
+        .is_err());
+    assert_eq!(restarted.concurrency_limits(), original);
+}
+
+#[tokio::test]
+async fn target_quality_only_changes_same_target_adaptive_and_off_restores_original_selection() {
+    let runtime = runtime();
+    let a = add_proxy(&runtime, 19901);
+    let b = add_proxy(&runtime, 19902);
+    let x = request("x.test");
+    let y = request("y.test");
+    let snapshot = runtime.db.routing_snapshot();
+    let mut config = crate::database::default_advanced_config();
+    config.insert("target_quality_mode".into(), json!("adaptive"));
+    runtime
+        .update_advanced_config(&json!(config))
+        .await
+        .unwrap();
+    for _ in 0..32 {
+        for (proxy, delay) in [(&a, 1_000_000), (&b, 5_000)] {
+            runtime.target_quality.write().unwrap().record(
+                ProxyRuntime::quality_key(proxy, snapshot.node_generations[&proxy.id], &x).unwrap(),
+                true,
+                Some(delay),
+                monotonic_millis(),
+            );
+        }
+    }
+    assert_eq!(
+        runtime.select_proxies(&x, &HashSet::new()).unwrap()[0].id,
+        b.id
+    );
+    assert_eq!(
+        runtime.select_proxies(&y, &HashSet::new()).unwrap()[0].id,
+        a.id
+    );
+    assert!(runtime.metrics.read().unwrap().is_empty());
+    config.insert("target_quality_mode".into(), json!("observe"));
+    runtime
+        .update_advanced_config(&json!(config))
+        .await
+        .unwrap();
+    assert_eq!(
+        runtime.select_proxies(&x, &HashSet::new()).unwrap()[0].id,
+        a.id
+    );
+    config.insert("target_quality_mode".into(), json!("off"));
+    runtime
+        .update_advanced_config(&json!(config))
+        .await
+        .unwrap();
+    assert_eq!(runtime.target_quality.read().unwrap().len(), 0);
+    assert_eq!(
+        runtime.select_proxies(&x, &HashSet::new()).unwrap()[0].id,
+        a.id
+    );
+    let mut forwarding = x;
+    forwarding.inbound = InboundProtocol::HttpForward;
+    assert!(ProxyRuntime::quality_key(&a, 1, &forwarding).is_none());
+}
+
+#[tokio::test]
+async fn measured_connect_response_latency_is_target_scoped_not_proxy_tcp_latency() {
+    let runtime = runtime();
+    let mut config = default_advanced_config();
+    config.insert("target_quality_mode".into(), json!("adaptive"));
+    runtime
+        .update_advanced_config(&json!(config))
+        .await
+        .unwrap();
+    let target = request("slow-target.test");
+    let mut proxies = Vec::new();
+    for delay in [120, 0] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = add_proxy(&runtime, listener.local_addr().unwrap().port());
+        let group = runtime
+            .db
+            .create_proxy_group(ProxyGroupInput {
+                name: Some("latency-fixture".into()),
+                domains: Some(vec![target.host.clone()]),
+                proxy_ids: Some(vec![proxy.id]),
+                ..Default::default()
+            })
+            .unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..8 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                read_http_request_header(&mut stream, Vec::new(), 1000)
+                    .await
+                    .unwrap();
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+                stream.write_all(b"HTTP/1.1 200 OK\r\n\r\n").await.unwrap();
+            }
+        });
+        for _ in 0..8 {
+            let (lease, stream) = connect_with_fail_fast(runtime.clone(), &target, Instant::now())
+                .await
+                .unwrap();
+            assert_eq!(lease.id, proxy.id);
+            drop(stream);
+            drop(lease);
+        }
+        server.await.unwrap();
+        runtime.db.delete_proxy_group(group.id).unwrap();
+        proxies.push(proxy);
+    }
+    let snapshot = runtime.db.routing_snapshot();
+    let quality = runtime.target_quality.read().unwrap();
+    let factors: Vec<_> = proxies
+        .iter()
+        .map(|p| {
+            quality.multiplier(
+                &ProxyRuntime::quality_key(p, snapshot.node_generations[&p.id], &target).unwrap(),
+                monotonic_millis(),
+            )
+        })
+        .collect();
+    assert!(
+        factors[1] > factors[0],
+        "CONNECT latency must distinguish equal-loopback TCP paths: {factors:?}"
+    );
+    for p in &proxies {
+        assert_eq!(
+            quality.multiplier(
+                &ProxyRuntime::quality_key(
+                    p,
+                    snapshot.node_generations[&p.id],
+                    &request("other-target.test")
+                )
+                .unwrap(),
+                monotonic_millis()
+            ),
+            1.0
+        );
+    }
+}
+
+#[tokio::test]
+async fn probe_success_cannot_complete_another_connections_owned_half_open_attempt() {
+    let runtime = runtime();
+    let proxy = add_proxy(&runtime, 19901);
+    let req = request("x.test");
+    let config = runtime.runtime_settings.read().unwrap().circuit;
+    let mut breaker = CircuitBreaker::new(config);
+    breaker.state = "HALF_OPEN".into();
+    let owner = Arc::new(());
+    breaker.attempt = Some(Arc::downgrade(&owner));
+    runtime
+        .circuit_breakers
+        .write()
+        .unwrap()
+        .insert(proxy.id, breaker);
+    let generation = runtime
+        .db
+        .routing_snapshot()
+        .node_generations
+        .get(&proxy.id)
+        .copied();
+    runtime
+        .record_probe_result(
+            &proxy,
+            generation,
+            monotonic_millis(),
+            Some("active"),
+            Some(1),
+            true,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        runtime.circuit_breakers.read().unwrap()[&proxy.id].state,
+        "HALF_OPEN"
+    );
+    assert!(!runtime.is_candidate_available(proxy.id, &req).await);
+    drop(owner);
+}
+
+#[tokio::test]
 async fn releasing_capacity_wakes_the_matching_pool_not_only_an_unrelated_waiter() {
     let runtime = runtime();
     let a = add_proxy(&runtime, 19001);
@@ -611,7 +859,7 @@ async fn probe_target_failure_and_local_network_failure_do_not_poison_global_hea
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy = add_proxy(&runtime, listener.local_addr().unwrap().port());
     let server = tokio::spawn(async move {
-        for _ in 0..2 {
+        for _ in 0..1 {
             let (mut stream, _) = listener.accept().await.unwrap();
             read_http_request_header(&mut stream, Vec::new(), 1000)
                 .await

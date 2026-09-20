@@ -38,6 +38,11 @@ export const emptyOverview: Overview = {
 }
 
 export const defaultAdvanced: AdvancedConfig = {
+  target_quality_mode: "off",
+  max_connections: 1024,
+  max_handshakes: 128,
+  max_global_dials: 64,
+  max_proxy_dials: 32,
   proxy_port: 5678,
   allow_lan: false,
   inbound_auth_enabled: false,

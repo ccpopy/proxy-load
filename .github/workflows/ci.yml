@@ -45,6 +45,8 @@ jobs:
       - run: npm run test:signing
       - run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
       - run: cargo test --manifest-path src-tauri/Cargo.toml --locked
+      - name: Native single-connection SOCKS4a probe acceptance
+        run: cargo test --manifest-path src-tauri/Cargo.toml --locked native_probe_ -- --ignored
       - name: Native TCP half-close acceptance
         run: cargo test --manifest-path src-tauri/Cargo.toml --locked native_half_close -- --ignored
       - name: Native TCP environment baseline

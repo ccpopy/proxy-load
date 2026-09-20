@@ -2,6 +2,21 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createLatestRequestGuard } from '../web/src/lib/latest-request.ts';
 import * as constants from '../web/src/lib/constants.ts';
+import { advancedSettingsPayload, businessLimitError } from '../web/src/lib/advanced-settings.ts';
+
+test('concurrency settings retain defaults, validate bounds and never save runtime diagnostics', () => {
+  const config = { ...constants.defaultAdvanced, effective_concurrency: { max_connections: 2 } };
+  assert.equal(config.target_quality_mode, 'off');
+  assert.equal(config.max_connections, 1024);
+  assert.equal(config.max_handshakes, 128);
+  assert.equal(config.max_global_dials, 64);
+  assert.equal(config.max_proxy_dials, 32);
+  assert.equal(businessLimitError(config), null);
+  assert.ok(businessLimitError({ ...config, max_connections: 0 }));
+  assert.ok(businessLimitError({ ...config, max_proxy_dials: 65 }));
+  assert.ok(businessLimitError({ ...config, max_global_dials: 64.5 }));
+  assert.equal('effective_concurrency' in advancedSettingsPayload(config), false);
+});
 
 test('traffic logs default to ten rows and offer only the requested page sizes', () => {
   assert.equal(constants.INITIAL_TRAFFIC_PAGE_SIZE, 10);
