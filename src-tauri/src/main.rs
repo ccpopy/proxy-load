@@ -4,6 +4,8 @@ mod commands;
 mod database;
 mod database_worker;
 mod models;
+#[cfg(any(target_os = "windows", test))]
+mod portable_update;
 mod proxy;
 mod proxy_tester;
 mod routing;
@@ -113,6 +115,8 @@ pub fn run() {
                 });
             }
 
+            #[cfg(target_os = "windows")]
+            portable_update::mark_ready()?;
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -166,7 +170,7 @@ pub fn run() {
             if let Some(state) = _app_handle.try_state::<Arc<AppState>>() {
                 if !state
                     .proxy_runtime
-                    .flush_logs(std::time::Duration::from_secs(5))
+                    .stop_and_flush_logs(std::time::Duration::from_secs(5))
                 {
                     eprintln!("退出时日志队列未在 5 秒内完成刷新");
                 }

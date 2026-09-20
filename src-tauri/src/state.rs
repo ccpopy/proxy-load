@@ -648,6 +648,9 @@ impl AppState {
 fn spawn_proxy_server(runtime: Arc<ProxyRuntime>, proxy_host: String, proxy_port: u16) {
     tauri::async_runtime::spawn(async move {
         loop {
+            if runtime.is_stopping() {
+                break;
+            }
             if let Err(error) = proxy::serve(runtime.clone(), proxy_host.clone(), proxy_port).await
             {
                 eprintln!(

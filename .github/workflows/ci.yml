@@ -51,3 +51,12 @@ jobs:
         if: always()
         run: cargo test --manifest-path src-tauri/Cargo.toml --locked native_tcp_half_close_baseline -- --ignored
       - run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked -- -D warnings
+      - name: Windows release portable update handoff
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cargo build --release --manifest-path src-tauri/Cargo.toml --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $metadata = cargo metadata --manifest-path src-tauri/Cargo.toml --no-deps --format-version 1 | ConvertFrom-Json
+          $env:PORTABLE_UPDATE_HELPER = Join-Path $metadata.target_directory 'release/proxy-load-tauri.exe'
+          node --test scripts/portable-update.test.mjs

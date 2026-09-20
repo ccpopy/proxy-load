@@ -2,6 +2,35 @@
 use super::routing_tests::{add_proxy, request, runtime};
 use super::*;
 
+#[tokio::test]
+async fn shutdown_stops_admission_cancels_clients_and_releases_the_listener() {
+    let runtime = runtime();
+    let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = probe.local_addr().unwrap();
+    drop(probe);
+    let service = tokio::spawn(serve(runtime.clone(), "127.0.0.1".into(), address.port()));
+    timeout(Duration::from_secs(2), async {
+        while !runtime.service_status().await.running {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let mut client = TcpStream::connect(address).await.unwrap();
+    client.write_all(b"G").await.unwrap();
+    tokio::task::yield_now().await;
+    runtime.request_stop();
+    timeout(Duration::from_secs(2), service)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(runtime.connection_slots.available_permits(), 1024);
+    assert_eq!(runtime.handshake_slots.available_permits(), 128);
+    assert!(TcpListener::bind(address).await.is_ok());
+    assert!(runtime.stop_and_flush_logs(Duration::from_secs(2)));
+}
+
 async fn pair() -> (TcpStream, TcpStream, SocketAddr) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let client = TcpStream::connect(listener.local_addr().unwrap())

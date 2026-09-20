@@ -263,6 +263,15 @@ impl DatabaseWorker {
             .unwrap_or_else(|e| e.into_inner());
         queue.jobs.is_empty() && !queue.working
     }
+    pub fn seal_and_flush(&self, budget: Duration) -> bool {
+        self.0
+            .shared
+            .queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .stopped = true;
+        self.flush(budget)
+    }
     pub fn stats(&self) -> Value {
         let queue = self
             .0
@@ -336,5 +345,26 @@ mod tests {
         assert_eq!(db.traffic_logs(1, 25, None).unwrap().1, 200);
         assert_eq!(worker.stats()["droppedLogs"], json!(0));
         drop(worker);
+    }
+    #[test]
+    fn shutdown_barrier_rejects_future_producers_and_drains_accepted_logs() {
+        let db = Database::open_in_memory().unwrap();
+        let (events, _) = broadcast::channel(16);
+        let worker = DatabaseWorker::new(db.clone(), events).unwrap();
+        let log = || RequestLogEntry {
+            proxy_id: None,
+            target_host: "before-exit",
+            target_port: 80,
+            success: true,
+            response_time: Some(1),
+            error_message: None,
+            result_type: "tunnel_established",
+        };
+        worker.log(log());
+        assert!(worker.seal_and_flush(Duration::from_secs(2)));
+        worker.log(log());
+        assert!(worker.flush(Duration::from_secs(2)));
+        assert_eq!(db.traffic_logs(1, 25, None).unwrap().1, 1);
+        assert_eq!(worker.stats()["droppedLogs"], 1);
     }
 }

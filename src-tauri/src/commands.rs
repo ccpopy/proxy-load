@@ -49,6 +49,8 @@ const UPDATE_HELPER_INSTALLER_KIND_ARG: &str = "--installer-kind";
 const UPDATE_HELPER_INSTALL_DIR_ARG: &str = "--install-dir";
 #[cfg(target_os = "windows")]
 const UPDATE_HELPER_LAUNCH_PATH_ARG: &str = "--launch-path";
+#[cfg(target_os = "windows")]
+const UPDATE_HELPER_DIGEST_ARG: &str = "--verified-sha256";
 
 type CommandResult<T> = Result<T, CommandError>;
 
@@ -998,6 +1000,7 @@ pub async fn install_update(
     let response = github_get(&client, &selected.download_url, !use_mirror)
         .send()
         .await?;
+    let verified_digest = verified.sha256;
     let selected_path = crate::update_download::download_verified(
         response,
         &download_dir,
@@ -1006,8 +1009,32 @@ pub async fn install_update(
         verified,
     )
     .await?;
-    launch_update_installer(&app, &selected_path, &app_dir, &selected.kind)?;
+    launch_update_installer(
+        &app,
+        &selected_path,
+        &app_dir,
+        &selected.kind,
+        verified_digest,
+    )?;
     INSTALL_STARTED.store(true, std::sync::atomic::Ordering::Release);
+    #[cfg(target_os = "windows")]
+    if matches!(
+        selected.kind.as_str(),
+        "windows-portable" | "windows-nsis" | "windows-msi"
+    ) {
+        state.proxy_runtime.request_stop();
+        let runtime = state.proxy_runtime.clone();
+        let flushed = tokio::task::spawn_blocking(move || {
+            runtime.stop_and_flush_logs(Duration::from_secs(5))
+        })
+        .await
+        .unwrap_or(false);
+        if !flushed {
+            eprintln!("升级退出时日志未在预算内完成刷新");
+        }
+        tauri_plugin_single_instance::destroy(&app);
+        schedule_update_exit(app.clone());
+    }
 
     let message = match selected.kind.as_str() {
         "windows-portable" => "已下载便携更新包到当前应用目录，应用即将启动新版本",
@@ -1033,6 +1060,7 @@ fn launch_update_installer(
     selected_path: &Path,
     app_dir: &Path,
     kind: &str,
+    _verified_digest: [u8; 32],
 ) -> CommandResult<()> {
     let extension = selected_path
         .extension()
@@ -1041,7 +1069,7 @@ fn launch_update_installer(
         .to_ascii_lowercase();
 
     if kind == "windows-portable" {
-        return launch_portable_update(app, selected_path, app_dir);
+        return launch_portable_update(app, selected_path, app_dir, _verified_digest);
     }
     if kind == "macos-dmg" {
         return launch_macos_dmg_update(selected_path);
@@ -1049,7 +1077,7 @@ fn launch_update_installer(
 
     #[cfg(target_os = "windows")]
     if matches!(kind, "windows-nsis" | "windows-msi") {
-        return launch_windows_installer_update(app, selected_path, app_dir, kind);
+        return launch_windows_installer_update(app, selected_path, app_dir, kind, None);
     }
 
     match extension.as_str() {
@@ -1078,29 +1106,23 @@ fn launch_update_installer(
         }
     }
 
-    #[cfg(target_os = "windows")]
-    if matches!(kind, "windows-nsis" | "windows-msi") {
-        tauri_plugin_single_instance::destroy(app);
-        schedule_update_exit();
-    }
-
     Ok(())
 }
 
 #[cfg(target_os = "windows")]
 fn launch_windows_installer_update(
-    app: &AppHandle,
+    _app: &AppHandle,
     selected_path: &Path,
     app_dir: &Path,
     kind: &str,
+    digest: Option<[u8; 32]>,
 ) -> CommandResult<()> {
-    tauri_plugin_single_instance::destroy(app);
-
     let launch_path = std::env::current_exe()?;
     let helper_path = windows_update_helper_path()?;
     fs::copy(&launch_path, &helper_path)?;
 
-    Command::new(&helper_path)
+    let mut command = Command::new(&helper_path);
+    command
         .arg(UPDATE_HELPER_ARG)
         .arg(UPDATE_HELPER_PARENT_PID_ARG)
         .arg(std::process::id().to_string())
@@ -1113,10 +1135,20 @@ fn launch_windows_installer_update(
         .arg(UPDATE_HELPER_LAUNCH_PATH_ARG)
         .arg(&launch_path)
         .current_dir(app_dir)
-        .creation_flags(CREATE_NO_WINDOW)
-        .spawn()?;
-
-    schedule_update_exit();
+        .creation_flags(CREATE_NO_WINDOW);
+    if let Some(digest) = digest {
+        use base64::Engine;
+        command
+            .arg(UPDATE_HELPER_DIGEST_ARG)
+            .arg(base64::engine::general_purpose::STANDARD.encode(digest));
+    }
+    if let Some(directory) = crate::portable_update::inherited_data_dir(
+        std::env::var_os("DATA_DIR"),
+        &std::env::current_dir()?,
+    ) {
+        command.env("DATA_DIR", directory);
+    }
+    command.spawn()?;
     Ok(())
 }
 
@@ -1137,24 +1169,23 @@ fn launch_portable_update(
     app: &AppHandle,
     selected_path: &Path,
     app_dir: &Path,
+    digest: [u8; 32],
 ) -> CommandResult<()> {
-    tauri_plugin_single_instance::destroy(app);
-
-    Command::new(selected_path)
-        .current_dir(app_dir)
-        .creation_flags(CREATE_NO_WINDOW)
-        .spawn()?;
-
-    schedule_update_exit();
-
-    Ok(())
+    crate::portable_update::InstallPlan::new(selected_path, &std::env::current_exe()?, digest)?;
+    launch_windows_installer_update(
+        app,
+        selected_path,
+        app_dir,
+        "windows-portable",
+        Some(digest),
+    )
 }
 
 #[cfg(target_os = "windows")]
-fn schedule_update_exit() {
-    std::thread::spawn(|| {
+fn schedule_update_exit(app: AppHandle) {
+    std::thread::spawn(move || {
         std::thread::sleep(UPDATE_EXIT_DELAY);
-        std::process::exit(0);
+        app.exit(0);
     });
 }
 
@@ -1166,6 +1197,15 @@ pub fn run_windows_update_helper_from_args() -> AnyhowResult<bool> {
 
     wait_for_process_exit(args.parent_pid)
         .with_context(|| format!("等待旧应用进程退出失败: {}", args.parent_pid))?;
+
+    if args.installer_kind == "windows-portable" {
+        let digest = args
+            .digest
+            .ok_or_else(|| anyhow!("便携更新缺少已验证摘要"))?;
+        crate::portable_update::InstallPlan::new(&args.installer_path, &args.launch_path, digest)?
+            .install(crate::portable_update::launch_and_confirm)?;
+        return Ok(true);
+    }
 
     let installer_status =
         spawn_windows_update_installer(&args).context("启动或等待 Windows 更新安装器失败")?;
@@ -1230,6 +1270,7 @@ struct WindowsUpdateHelperArgs {
     installer_kind: String,
     install_dir: PathBuf,
     launch_path: PathBuf,
+    digest: Option<[u8; 32]>,
 }
 
 #[cfg(target_os = "windows")]
@@ -1251,6 +1292,7 @@ impl WindowsUpdateHelperArgs {
         let mut installer_kind = None;
         let mut install_dir = None;
         let mut launch_path = None;
+        let mut digest = None;
 
         let mut iter = args.into_iter();
         while let Some(arg) = iter.next() {
@@ -1291,6 +1333,16 @@ impl WindowsUpdateHelperArgs {
                         UPDATE_HELPER_LAUNCH_PATH_ARG,
                     )?));
                 }
+                UPDATE_HELPER_DIGEST_ARG => {
+                    use base64::Engine;
+                    let value = next_update_helper_value(&mut iter, UPDATE_HELPER_DIGEST_ARG)?;
+                    digest = Some(
+                        base64::engine::general_purpose::STANDARD
+                            .decode(value.to_string_lossy().as_bytes())?
+                            .try_into()
+                            .map_err(|_| anyhow!("更新摘要长度无效"))?,
+                    );
+                }
                 other => return Err(anyhow!("未知更新辅助进程参数: {other}")),
             }
         }
@@ -1301,6 +1353,7 @@ impl WindowsUpdateHelperArgs {
             installer_kind: installer_kind.ok_or_else(|| anyhow!("缺少更新安装器类型"))?,
             install_dir: install_dir.ok_or_else(|| anyhow!("缺少更新安装目录"))?,
             launch_path: launch_path.ok_or_else(|| anyhow!("缺少更新后启动路径"))?,
+            digest,
         })
     }
 }
@@ -1319,7 +1372,7 @@ fn wait_for_process_exit(pid: u32) -> std::io::Result<()> {
     const SYNCHRONIZE: u32 = 0x0010_0000;
     const WAIT_OBJECT_0: u32 = 0x0000_0000;
     const WAIT_FAILED: u32 = 0xffff_ffff;
-    const INFINITE: u32 = 0xffff_ffff;
+    const WAIT_TIMEOUT: u32 = 258;
     const ERROR_INVALID_PARAMETER: u32 = 87;
 
     unsafe {
@@ -1332,13 +1385,18 @@ fn wait_for_process_exit(pid: u32) -> std::io::Result<()> {
             return Err(std::io::Error::from_raw_os_error(error as i32));
         }
 
-        let wait = WaitForSingleObject(handle, INFINITE);
+        let wait = WaitForSingleObject(handle, 30_000);
         let close_result = CloseHandle(handle);
         if close_result == 0 {
             return Err(std::io::Error::last_os_error());
         }
         if wait == WAIT_OBJECT_0 {
             Ok(())
+        } else if wait == WAIT_TIMEOUT {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "旧应用在 30 秒内未退出，未修改程序或数据库",
+            ))
         } else if wait == WAIT_FAILED {
             Err(std::io::Error::last_os_error())
         } else {
@@ -1365,6 +1423,7 @@ fn launch_portable_update(
     _app: &AppHandle,
     selected_path: &Path,
     _app_dir: &Path,
+    _digest: [u8; 32],
 ) -> CommandResult<()> {
     Err(CommandError::new(format!(
         "当前平台暂不支持直接安装便携更新包: {}",

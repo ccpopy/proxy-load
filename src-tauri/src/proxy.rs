@@ -59,6 +59,7 @@ pub struct ProxyRuntime {
     selection_lock: Arc<SyncMutex<()>>,
     runtime_settings: Arc<SyncRwLock<RuntimeSettings>>,
     status_locks: Arc<Mutex<HashMap<i64, Arc<Mutex<()>>>>>,
+    shutdown: tokio::sync::watch::Sender<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -353,6 +354,7 @@ impl ProxyRuntime {
             selection_lock: Arc::new(SyncMutex::new(())),
             runtime_settings: Arc::new(SyncRwLock::new(runtime_settings)),
             status_locks: Arc::new(Mutex::new(HashMap::new())),
+            shutdown: tokio::sync::watch::channel(false).0,
         })
     }
 
@@ -362,6 +364,20 @@ impl ProxyRuntime {
 
     pub fn flush_logs(&self, budget: Duration) -> bool {
         self.database_worker.flush(budget)
+    }
+    pub fn request_stop(&self) {
+        self.shutdown.send_replace(true);
+    }
+    pub fn is_stopping(&self) -> bool {
+        *self.shutdown.borrow()
+    }
+    pub async fn cancelled(&self) {
+        let mut signal = self.shutdown.subscribe();
+        let _ = signal.wait_for(|stopping| *stopping).await;
+    }
+    pub fn stop_and_flush_logs(&self, budget: Duration) -> bool {
+        self.request_stop();
+        self.database_worker.seal_and_flush(budget)
     }
     pub fn database_stats(&self) -> Value {
         let mut stats = self.database_worker.stats();
@@ -1247,6 +1263,9 @@ impl ProxyRuntime {
 }
 
 pub async fn serve(runtime: Arc<ProxyRuntime>, host: String, port: u16) -> Result<()> {
+    if runtime.is_stopping() {
+        return Ok(());
+    }
     if let Err(error) = runtime.refresh_dns_cache().await {
         runtime
             .set_service_status(ProxyServiceStatus {
@@ -1288,7 +1307,27 @@ pub async fn serve(runtime: Arc<ProxyRuntime>, host: String, port: u16) -> Resul
         .await;
     println!("混合代理负载均衡服务器运行在 {host}:{port}（SOCKS5/HTTP）");
 
+    let mut clients = tokio::task::JoinSet::new();
+    let result = tokio::select! {
+        biased;
+        _ = runtime.cancelled() => Ok(()),
+        result = accept_clients(runtime.clone(), &listener, &mut clients, host, port) => result,
+    };
+    drop(listener);
+    clients.abort_all();
+    while clients.join_next().await.is_some() {}
+    result
+}
+
+async fn accept_clients(
+    runtime: Arc<ProxyRuntime>,
+    listener: &TcpListener,
+    clients: &mut tokio::task::JoinSet<()>,
+    host: String,
+    port: u16,
+) -> Result<()> {
     loop {
+        while clients.try_join_next().is_some() {}
         // Admission before spawn: at most 1024 live client tasks, no unbounded waiting queue.
         let connection_permit = runtime.connection_slots.clone().acquire_owned().await?;
         let (client, addr) = match listener.accept().await {
@@ -1324,7 +1363,7 @@ pub async fn serve(runtime: Arc<ProxyRuntime>, host: String, port: u16) -> Resul
             }
         };
         let runtime = runtime.clone();
-        tokio::spawn(async move {
+        clients.spawn(async move {
             let _connection_permit = connection_permit;
             if let Err(error) = handle_client(runtime, client, addr).await {
                 eprintln!("处理客户端连接失败 {addr}: {error:#}");
