@@ -186,8 +186,8 @@ struct ProxyMetrics {
     last_success: i64,
     pushed_status: Option<String>,
     successes: i64,
-    time_sum: i64,
-    time_count: i64,
+    time_sum: u64,
+    time_count: u64,
     learning_remaining: u8,
 }
 
@@ -195,7 +195,7 @@ struct ProxyMetrics {
 struct RequestMetric {
     timestamp: i64,
     success: bool,
-    response_time: Option<i64>,
+    latency_us: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -556,7 +556,7 @@ impl ProxyRuntime {
     }
 
     // 调用方持有代理状态锁，并已校验配置仍然有效。
-    async fn record_connection_success_locked(&self, proxy_id: i64, response_time: i64) {
+    async fn record_connection_success_locked(&self, proxy_id: i64, latency_us: u64) {
         let mark_active = {
             let mut metrics = self.metrics.write().unwrap_or_else(|e| e.into_inner());
             let metric = metrics.entry(proxy_id).or_insert_with(ProxyMetrics::new);
@@ -564,12 +564,17 @@ impl ProxyRuntime {
             if metric.pushed_status.as_deref() == Some("inactive") {
                 metric.learning_remaining = 3;
             }
-            metric.push(true, Some(response_time));
+            metric.push(true, Some(latency_us));
             metric.pushed_status = Some("active".to_string());
             changed
         };
         if mark_active {
-            self.apply_passive_status_locked(proxy_id, "active", Some(response_time));
+            // SQLite/UI remain millisecond-compatible; routing keeps microseconds.
+            self.apply_passive_status_locked(
+                proxy_id,
+                "active",
+                Some((latency_us.min(86_400_000_000) / 1000) as i64),
+            );
         }
     }
 
@@ -1117,7 +1122,7 @@ impl ProxyRuntime {
                     proxy.generation,
                 );
         }
-        self.record_connection_success_locked(proxy.id, (proxy_latency_us / 1000) as i64)
+        self.record_connection_success_locked(proxy.id, proxy_latency_us)
             .await;
     }
 
@@ -2677,16 +2682,21 @@ fn score_of(proxy: &ProxyRecord) -> f64 {
     } else {
         0.5
     };
-    let latency = latency_score(proxy.response_time.unwrap_or(1000));
+    let latency = latency_score(
+        proxy
+            .response_time
+            .filter(|time| *time >= 0)
+            .map(|time| time as f64),
+    );
     let priority = ((1000 - proxy.priority).clamp(0, 1000) as f64) / 10.0;
     (success_rate * 70.0 + latency * 0.25 + priority * 0.05).clamp(0.01, 100.0)
 }
 
-fn latency_score(response_time: i64) -> f64 {
-    if response_time <= 0 {
-        return 50.0;
+fn latency_score(response_time_ms: Option<f64>) -> f64 {
+    match response_time_ms.filter(|time| time.is_finite() && *time >= 0.0) {
+        Some(time) => 100.0 / (1.0 + time / 500.0),
+        None => 50.0,
     }
-    100.0 / (1.0 + response_time as f64 / 500.0)
 }
 
 fn prioritize_route_status(proxies: Vec<ProxyRecord>) -> Vec<ProxyRecord> {
@@ -2718,7 +2728,7 @@ impl ProxyMetrics {
         }
     }
 
-    fn push(&mut self, success: bool, response_time: Option<i64>) {
+    fn push(&mut self, success: bool, latency_us: Option<u64>) {
         let now = monotonic_millis();
         self.prune(now);
         if self.requests.len() == MAX_METRIC_SAMPLES {
@@ -2730,15 +2740,16 @@ impl ProxyMetrics {
         } else {
             0
         };
-        let response_time = response_time.map(|time| time.clamp(0, 86_400_000));
-        if let Some(time) = response_time {
+        // MAX_METRIC_SAMPLES * one day in microseconds fits comfortably in u64.
+        let latency_us = latency_us.map(|time| time.min(86_400_000_000));
+        if let Some(time) = latency_us {
             self.time_sum += time;
             self.time_count += 1;
         }
         self.requests.push_back(RequestMetric {
             timestamp: now,
             success,
-            response_time,
+            latency_us,
         });
         self.last_used = now;
         if success {
@@ -2766,14 +2777,14 @@ impl ProxyMetrics {
         }
     }
 
-    fn summary(&self) -> (i64, i64, i64) {
+    fn summary(&self) -> (i64, i64, Option<f64>) {
         (
             self.successes,
             self.requests.len() as i64 - self.successes,
             if self.time_count == 0 {
-                0
+                None
             } else {
-                self.time_sum / self.time_count
+                Some(self.time_sum as f64 / self.time_count as f64 / 1000.0)
             },
         )
     }
@@ -2781,7 +2792,7 @@ impl ProxyMetrics {
     fn remove_oldest(&mut self) {
         if let Some(sample) = self.requests.pop_front() {
             self.successes -= i64::from(sample.success);
-            if let Some(time) = sample.response_time {
+            if let Some(time) = sample.latency_us {
                 self.time_sum -= time;
                 self.time_count -= 1;
             }
@@ -2944,6 +2955,39 @@ mod acceptance_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn submillisecond_latency_score_is_monotonic_and_unknown_is_explicit() {
+        let scores = [0, 200, 900, 1000, 5000].map(|latency| {
+            let mut metrics = ProxyMetrics::new();
+            metrics.push(true, Some(latency));
+            assert_eq!(metrics.summary().2, Some(latency as f64 / 1000.0));
+            metrics.score
+        });
+        assert!(scores.windows(2).all(|pair| pair[0] > pair[1]));
+        let mut unknown = ProxyMetrics::new();
+        unknown.push(true, None);
+        assert!(scores[4] > unknown.score);
+        assert_eq!(unknown.summary().2, None);
+        assert!(latency_score(Some(0.0)) > latency_score(None));
+        assert_eq!(latency_score(Some(f64::NAN)), latency_score(None));
+    }
+
+    #[test]
+    fn microsecond_metrics_keep_zero_and_bound_extreme_samples_without_overflow() {
+        let mut metrics = ProxyMetrics::new();
+        for _ in 0..MAX_METRIC_SAMPLES * 2 {
+            metrics.push(true, Some(u64::MAX));
+        }
+        assert_eq!(metrics.time_sum, MAX_METRIC_SAMPLES as u64 * 86_400_000_000);
+        assert_eq!(metrics.summary().2, Some(86_400_000.0));
+        for _ in 0..MAX_METRIC_SAMPLES {
+            metrics.push(true, Some(0));
+        }
+        assert_eq!(metrics.time_sum, 0);
+        assert_eq!(metrics.time_count, MAX_METRIC_SAMPLES as u64);
+        assert_eq!(metrics.summary().2, Some(0.0));
+    }
 
     #[test]
     fn prioritize_route_status_keeps_inactive_candidates_after_preferred() {

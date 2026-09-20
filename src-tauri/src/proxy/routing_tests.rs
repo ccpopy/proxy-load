@@ -674,10 +674,10 @@ fn million_metric_updates_remain_bounded_and_incremental() {
     let started = Instant::now();
     let mut metric = ProxyMetrics::new();
     for index in 0..1_000_000 {
-        metric.push(index % 4 != 0, Some(100));
+        metric.push(index % 4 != 0, Some(100_000));
     }
     assert_eq!(metric.requests.len(), MAX_METRIC_SAMPLES);
-    assert_eq!(metric.summary(), (1536, 512, 100));
+    assert_eq!(metric.summary(), (1536, 512, Some(100.0)));
     eprintln!(
         "BENCH metrics updates=1000000 retained={} elapsed_us={}",
         metric.requests.len(),
@@ -687,7 +687,7 @@ fn million_metric_updates_remain_bounded_and_incremental() {
     metric.prune(last + METRICS_WINDOW_MS);
     assert!(!metric.requests.is_empty());
     metric.prune(last + METRICS_WINDOW_MS + 1);
-    assert_eq!(metric.summary(), (0, 0, 0));
+    assert_eq!(metric.summary(), (0, 0, None));
     assert_eq!(metric.score, 50.0);
 }
 
@@ -1842,9 +1842,9 @@ async fn successful_node_score_excludes_time_spent_before_its_own_attempt() {
                 .requests
                 .back()
                 .unwrap()
-                .response_time
+                .latency_us
                 .unwrap()
-                < 5000
+                < 5_000_000
         );
     }
     runtime.decrement_active(proxy.id).await;
