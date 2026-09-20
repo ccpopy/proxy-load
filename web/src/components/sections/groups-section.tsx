@@ -1,6 +1,7 @@
 import { Edit, Layers3, Plus, Trash2 } from "lucide-react"
 
 import { api } from "@/lib/api"
+import { groupAlgorithms } from "@/lib/group-policy"
 import type { ProxyGroup } from "@/types"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -47,6 +48,8 @@ export function GroupSection({
             <div className="min-w-0 space-y-3">
               <div className="flex flex-wrap items-center gap-2">
                 <span className="truncate font-medium">{group.name}</span>
+                <Badge variant="outline">{groupAlgorithms[group.algorithm_override || "inherit"] || "继承全局设置"}</Badge>
+                {(group.sticky_failover_seconds ?? 0) > 0 && <Badge variant="secondary">粘滞保持 {group.sticky_failover_seconds} 秒</Badge>}
                 {group.enabled !== 1 && (
                   <Badge variant="secondary">已禁用</Badge>
                 )}

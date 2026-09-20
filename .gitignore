@@ -179,3 +179,11 @@ release/*
 .playwright-cli/
 .codesign-mcp/
 
+# Local task documents
+/docs/
+
+# Never commit update signing private keys
+*.private.pem
+/.update-signing/
+/output/playwright/
+

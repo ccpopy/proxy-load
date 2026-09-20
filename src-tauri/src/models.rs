@@ -90,19 +90,33 @@ pub struct ProxyGroup {
     pub name: String,
     pub is_default: i64,
     pub enabled: i64,
+    #[serde(default)]
+    pub algorithm_override: Option<String>,
+    #[serde(default)]
+    pub sticky_failover_seconds: i64,
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
     pub domains: Vec<ProxyGroupDomain>,
     pub members: Vec<ProxyGroupMember>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct ProxyGroupInput {
     pub name: Option<String>,
     pub domains: Option<Vec<String>>,
     pub proxy_ids: Option<Vec<i64>>,
     pub is_default: Option<i64>,
     pub enabled: Option<i64>,
+    #[serde(default, deserialize_with = "nullable_algorithm")]
+    pub algorithm_override: Option<Option<String>>,
+    pub sticky_failover_seconds: Option<i64>,
+}
+
+// Omitted means preserve; explicit null means inherit the global algorithm.
+fn nullable_algorithm<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Option<String>>, D::Error> {
+    Option::<String>::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -114,6 +128,8 @@ pub struct TestResult {
     pub status_code: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(rename = "failureScope", skip_serializing_if = "Option::is_none")]
+    pub failure_scope: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -216,6 +232,10 @@ pub struct BundleGroup {
     pub is_default: i64,
     #[serde(default = "default_enabled")]
     pub enabled: i64,
+    #[serde(default)]
+    pub algorithm_override: Option<String>,
+    #[serde(default)]
+    pub sticky_failover_seconds: i64,
     #[serde(default)]
     pub domains: Vec<String>,
     #[serde(default)]

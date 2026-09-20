@@ -141,6 +141,11 @@ export function StatusSection({
           <MetricTile label="建连成功" value={overview.successRequests} />
           <MetricTile label="建连失败" value={overview.failedRequests} />
           <MetricTile label="运行时长" value={formatDuration(overview.uptime)} />
+          {overview.databaseQueue && (
+            <div className="col-span-full text-xs text-muted-foreground" role="status">
+              日志队列 {overview.databaseQueue.queueLength}/{overview.databaseQueue.capacity} · 丢弃 {overview.databaseQueue.droppedLogs} · 数据库错误 {overview.databaseQueue.databaseErrors}
+            </div>
+          )}
         </CardContent>
       </Card>
 
@@ -279,7 +284,11 @@ export function StatusSection({
                   </TableCell>
                   <TableCell>{log.proxy_name || "-"}</TableCell>
                   <TableCell>
-                      {log.success ? (
+                      {["forwarded_unverified", "request_forwarded", "transfer_finished", "transfer_error", "upstream_response_observed"].includes(log.result_type ?? "") ? (
+                        <Badge variant={log.result_type === "transfer_error" || (log.result_type === "upstream_response_observed" && !log.success) ? "destructive" : "outline"} title={log.error_message ?? undefined}>
+                          {resultTypeLabel(log.result_type)}
+                        </Badge>
+                      ) : log.success ? (
                       <Badge
                         variant="outline"
                         className="border-success/30 bg-success/10 text-success"
@@ -419,10 +428,18 @@ function MetricTile({
 function resultTypeLabel(resultType?: string | null) {
   switch (resultType) {
     case "proxy_connected":
+    case "tunnel_established":
     case "direct_success":
       return "代理建连"
     case "request_forwarded":
-      return "请求已转发"
+    case "forwarded_unverified":
+      return "已转发待响应"
+    case "upstream_response_observed":
+      return "已观测上游响应"
+    case "transfer_finished":
+      return "传输结束"
+    case "transfer_error":
+      return "传输中断"
     case "client_handshake_error":
     case "tunnel_setup_error":
       return "隧道建立失败"

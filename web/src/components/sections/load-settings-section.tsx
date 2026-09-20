@@ -86,13 +86,14 @@ export function LoadSettingsSection({
                     <SelectItem value="adaptive">自适应算法</SelectItem>
                     <SelectItem value="round_robin">轮询</SelectItem>
                     <SelectItem value="least_connections">最小连接数</SelectItem>
-                    <SelectItem value="sticky_host">会话粘滞</SelectItem>
+                    <SelectItem value="sticky_host">按目标主机粘滞</SelectItem>
                   </SelectGroup>
                 </SelectContent>
               </Select>
               <FieldDescription>
                 自适应算法综合近期建连成功率、延迟和当前连接数选路。新连接失败时，
                 会在当前分组的可用代理中重试；已建立的连接不会迁移。
+                按目标主机粘滞在故障切换时仍可能改变出口 IP。
               </FieldDescription>
             </Field>
 

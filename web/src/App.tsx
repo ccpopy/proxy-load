@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react"
 import { toast } from "sonner"
+import { createLatestRequestGuard } from "@/lib/latest-request"
 
 import {
   api,
@@ -111,6 +112,8 @@ export function App() {
     pageSize: INITIAL_TRAFFIC_PAGE_SIZE,
     proxySearch: "",
   })
+  const trafficRequestGuard = useRef(createLatestRequestGuard())
+  const trafficSnapshotRef = useRef<{ key: string; logs: TrafficLogPage } | null>(null)
   const runtimeRefreshTimerRef = useRef<number | null>(null)
   const runtimeRefreshPendingRef = useRef(false)
   const runtimeRefreshNeedsLogsRef = useRef(false)
@@ -128,11 +131,25 @@ export function App() {
         page_size: String(pageSize),
       })
       const trimmedSearch = proxySearch.trim()
+      const key = JSON.stringify([pageSize, trimmedSearch])
+      const isCurrent = trafficRequestGuard.current.begin(JSON.stringify([page, key]))
+      trafficViewRef.current = { page, pageSize, proxySearch: trimmedSearch }
+      const previous = trafficSnapshotRef.current
+      if (page > 1 && previous?.key === key && previous.logs.snapshotId !== undefined) {
+        params.set("snapshotId", String(previous.logs.snapshotId))
+        if (page === previous.logs.page + 1 && previous.logs.items.length) {
+          params.set("beforeId", String(previous.logs.items.at(-1)!.id))
+        }
+      }
       if (trimmedSearch) params.set("proxy", trimmedSearch)
-      const nextLogs = await api<TrafficLogPage>(
-        `/api/traffic-logs?${params.toString()}`
-      )
-      setTrafficLogs(nextLogs)
+      try {
+        const nextLogs = await api<TrafficLogPage>(`/api/traffic-logs?${params.toString()}`)
+        if (!isCurrent()) return
+        trafficSnapshotRef.current = { key, logs: nextLogs }
+        setTrafficLogs(nextLogs)
+      } catch (error) {
+        if (isCurrent()) throw error
+      }
     },
     []
   )
@@ -196,12 +213,13 @@ export function App() {
     (includeLogs: boolean) => {
       runtimeRefreshPendingRef.current = true
       runtimeRefreshNeedsLogsRef.current ||= includeLogs
+      if (document.hidden) return
       if (runtimeRefreshTimerRef.current !== null) return
 
       runtimeRefreshTimerRef.current = window.setTimeout(async () => {
         runtimeRefreshPendingRef.current = false
         const loadLogs =
-          runtimeRefreshNeedsLogsRef.current && sectionRef.current === "status"
+          runtimeRefreshNeedsLogsRef.current && sectionRef.current === "status" && trafficViewRef.current.page === 1
         runtimeRefreshNeedsLogsRef.current = false
         try {
           const view = trafficViewRef.current
@@ -416,12 +434,12 @@ export function App() {
   ])
 
   useEffect(() => {
-    trafficViewRef.current = {
-      page: trafficLogs.page,
-      pageSize: trafficLogs.pageSize,
-      proxySearch: trafficLogProxySearch,
+    const onVisible = () => {
+      if (!document.hidden) scheduleRuntimeRefresh(true)
     }
-  }, [trafficLogProxySearch, trafficLogs.page, trafficLogs.pageSize])
+    document.addEventListener("visibilitychange", onVisible)
+    return () => document.removeEventListener("visibilitychange", onVisible)
+  }, [scheduleRuntimeRefresh])
 
   useEffect(
     () => () => {

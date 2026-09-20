@@ -3,6 +3,8 @@
   "version": "26.9.11",
   "description": "代理负载均衡管理系统",
   "scripts": {
+    "test:frontend": "node --experimental-default-type=module --experimental-strip-types --test scripts/frontend-state.test.mjs",
+    "test:signing": "node --test scripts/update-signing.test.mjs",
     "start": "npm run tauri:dev",
     "dev": "vite --config web/vite.config.ts --host 127.0.0.1 --port 1420",
     "build:web": "tsc -p web/tsconfig.json && vite build --config web/vite.config.ts",

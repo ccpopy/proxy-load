@@ -148,8 +148,12 @@ pub async fn update_proxy(
     id: i64,
     input: ProxyInput,
 ) -> CommandResult<Value> {
+    let db = state.db.clone();
+    let (proxy, connection_changed) =
+        tokio::task::spawn_blocking(move || db.update_proxy(id, input))
+            .await
+            .map_err(|error| CommandError::new(format!("代理配置写入任务失败: {error}")))??;
     let _status_guard = state.proxy_runtime.lock_proxy_status(id).await;
-    let (proxy, connection_changed) = state.db.update_proxy(id, input)?;
     if connection_changed {
         state.proxy_configuration_changed(id).await;
     }
@@ -159,8 +163,11 @@ pub async fn update_proxy(
 
 #[tauri::command]
 pub async fn delete_proxy(state: tauri::State<'_, Arc<AppState>>, id: i64) -> CommandResult<Value> {
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.delete_proxy(id))
+        .await
+        .map_err(|error| CommandError::new(format!("代理删除任务失败: {error}")))??;
     let _status_guard = state.proxy_runtime.lock_proxy_status(id).await;
-    state.db.delete_proxy(id)?;
     state.proxy_deleted(id).await;
     state.emit("proxy_deleted", json!({ "id": id }));
     Ok(json!({ "message": "代理已删除" }))
@@ -599,7 +606,9 @@ pub async fn import_config_file(state: tauri::State<'_, Arc<AppState>>) -> Comma
 
 #[tauri::command]
 pub fn stats_overview(state: tauri::State<'_, Arc<AppState>>) -> CommandResult<Value> {
-    Ok(state.db.overview(state.uptime_seconds())?)
+    let mut overview = state.db.overview(state.uptime_seconds())?;
+    overview["databaseQueue"] = state.proxy_runtime.database_stats();
+    Ok(overview)
 }
 
 #[tauri::command]
@@ -614,7 +623,7 @@ pub fn stats_hourly(state: tauri::State<'_, Arc<AppState>>) -> CommandResult<Val
           AVG(CASE WHEN success = 1 THEN response_time END) as avg_response_time
         FROM request_logs
         WHERE created_at >= datetime('now', '-24 hours')
-          AND COALESCE(result_type, '') NOT IN ('health_success', 'health_failure')
+          AND COALESCE(result_type, '') NOT IN ('health_success', 'health_failure', 'request_forwarded', 'forwarded_unverified', 'transfer_finished', 'transfer_error')
         GROUP BY hour
         ORDER BY hour DESC
         "#,
@@ -634,7 +643,7 @@ pub fn stats_proxy_usage(state: tauri::State<'_, Arc<AppState>>) -> CommandResul
         FROM proxies p
         LEFT JOIN request_logs rl ON p.id = rl.proxy_id
           AND rl.created_at >= datetime('now', '-24 hours')
-          AND COALESCE(rl.result_type, '') NOT IN ('health_success', 'health_failure')
+          AND COALESCE(rl.result_type, '') NOT IN ('health_success', 'health_failure', 'request_forwarded', 'forwarded_unverified', 'transfer_finished', 'transfer_error')
         GROUP BY p.id
         ORDER BY total_requests DESC
         "#,
@@ -652,7 +661,7 @@ pub fn stats_targets(state: tauri::State<'_, Arc<AppState>>) -> CommandResult<Va
           AVG(CASE WHEN success = 1 THEN response_time END) as avg_response_time
         FROM request_logs
         WHERE created_at >= datetime('now', '-24 hours')
-          AND COALESCE(result_type, '') NOT IN ('health_success', 'health_failure')
+          AND COALESCE(result_type, '') NOT IN ('health_success', 'health_failure', 'request_forwarded', 'forwarded_unverified', 'transfer_finished', 'transfer_error')
         GROUP BY target_host
         ORDER BY request_count DESC
         LIMIT 20
@@ -670,7 +679,7 @@ pub fn stats_failed_targets(state: tauri::State<'_, Arc<AppState>>) -> CommandRe
           MAX(created_at) as last_fail_time
         FROM request_logs
         WHERE success = 0 AND created_at >= datetime('now', '-24 hours')
-          AND COALESCE(result_type, '') NOT IN ('health_success', 'health_failure')
+          AND COALESCE(result_type, '') NOT IN ('health_success', 'health_failure', 'request_forwarded', 'forwarded_unverified', 'transfer_finished', 'transfer_error')
         GROUP BY target_host, target_port
         ORDER BY fail_count DESC
         LIMIT 10
@@ -832,24 +841,34 @@ pub fn traffic_logs(
     page: Option<i64>,
     page_size: Option<i64>,
     proxy_search: Option<String>,
+    snapshot_id: Option<i64>,
+    before_id: Option<i64>,
 ) -> CommandResult<Value> {
     let page = ensure_positive(page.unwrap_or(1), "page")?;
     let page_size = ensure_positive(page_size.unwrap_or(50), "pageSize")?;
-    let (items, total) = state
-        .db
-        .traffic_logs(page, page_size, proxy_search.as_deref())?;
+    let (items, total, snapshot_id) = state.db.traffic_logs_snapshot(
+        page,
+        page_size,
+        proxy_search.as_deref(),
+        snapshot_id,
+        before_id,
+    )?;
     let total_pages = (total as f64 / page_size as f64).ceil().max(1.0) as i64;
     Ok(json!({
         "items": items,
         "page": page,
         "pageSize": page_size,
         "total": total,
-        "totalPages": total_pages
+        "totalPages": total_pages,
+        "snapshotId": snapshot_id
     }))
 }
 
 #[tauri::command]
 pub fn clear_traffic_logs(state: tauri::State<'_, Arc<AppState>>) -> CommandResult<Value> {
+    if !state.proxy_runtime.flush_logs(Duration::from_secs(5)) {
+        return Err(CommandError::new("日志正在写入，请稍后再清空"));
+    }
     let deleted = state.db.clear_traffic_logs()?;
     state.emit("traffic_logs_cleared", json!({ "deleted": deleted }));
     Ok(json!({ "deleted": deleted }))
@@ -916,6 +935,17 @@ pub async fn install_update(
     artifact_path: Option<String>,
     use_mirror: Option<bool>,
 ) -> CommandResult<Value> {
+    static INSTALL_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    static INSTALL_STARTED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    let _installation = INSTALL_LOCK
+        .try_lock()
+        .map_err(|_| CommandError::new("已有更新正在下载或安装"))?;
+    if INSTALL_STARTED.load(std::sync::atomic::Ordering::Acquire) {
+        return Err(CommandError::new(
+            "安装程序已经启动，请完成安装后重新启动应用",
+        ));
+    }
     let use_mirror = use_mirror.unwrap_or(false);
     let mirror = update_mirror::selected_url(&state.db, use_mirror)?;
     let info = build_update_info(mirror.as_deref()).await?;
@@ -942,8 +972,42 @@ pub async fn install_update(
             "更新包文件名与当前运行程序相同，无法在运行中覆盖自身",
         ));
     }
-    download_release_asset(&selected.download_url, &selected_path, !use_mirror).await?;
+    crate::update_download::validate_file_name(&selected.file_name)?;
+    let public_key = crate::update_auth::public_key()?;
+    let client = github_client(Duration::from_secs(120))?;
+    let manifest_response = github_get(
+        &client,
+        &format!("{}.manifest.json", selected.download_url),
+        !use_mirror,
+    )
+    .send()
+    .await?;
+    let manifest = crate::update_auth::read_manifest(manifest_response).await?;
+    let verified = crate::update_auth::verify(
+        &manifest,
+        &public_key,
+        &crate::update_auth::ExpectedArtifact {
+            file_name: &selected.file_name,
+            version: &selected.version,
+            platform: std::env::consts::OS,
+            arch: std::env::consts::ARCH,
+            kind: &selected.kind,
+            size: selected.size,
+        },
+    )?;
+    let response = github_get(&client, &selected.download_url, !use_mirror)
+        .send()
+        .await?;
+    let selected_path = crate::update_download::download_verified(
+        response,
+        &download_dir,
+        &selected.file_name,
+        &selected.kind,
+        verified,
+    )
+    .await?;
     launch_update_installer(&app, &selected_path, &app_dir, &selected.kind)?;
+    INSTALL_STARTED.store(true, std::sync::atomic::Ordering::Release);
 
     let message = match selected.kind.as_str() {
         "windows-portable" => "已下载便携更新包到当前应用目录，应用即将启动新版本",
@@ -1359,7 +1423,13 @@ async fn build_update_info(mirror_base: Option<&str>) -> CommandResult<UpdateInf
         .into_iter()
         .filter_map(|asset| {
             let kind = artifact_kind_from_name(&asset.name)?;
-            if !is_current_platform_artifact(kind, install_mode) {
+            if !is_current_platform_artifact(kind, install_mode)
+                || !crate::update_download::matches_architecture(
+                    &asset.name,
+                    kind,
+                    std::env::consts::ARCH,
+                )
+            {
                 return None;
             }
             Some(UpdateArtifact {
@@ -1542,19 +1612,6 @@ fn extract_release_asset_names(html: &str, tag: &str) -> Vec<String> {
         rest = &rest[position + marker.len()..];
     }
     names
-}
-
-async fn download_release_asset(
-    download_url: &str,
-    target_path: &Path,
-    with_token: bool,
-) -> CommandResult<()> {
-    let client = github_client(Duration::from_secs(120))?;
-    let response = github_get(&client, download_url, with_token).send().await?;
-    let response = ensure_github_success(response, "下载").await?;
-
-    fs::write(target_path, response.bytes().await?)?;
-    Ok(())
 }
 
 fn github_client(timeout: Duration) -> CommandResult<reqwest::Client> {

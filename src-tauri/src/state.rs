@@ -28,6 +28,7 @@ pub struct AppState {
     pub db: Database,
     pub events: broadcast::Sender<ServerEvent>,
     pub started_at: i64,
+    started_monotonic: i64,
     pub proxy_host: String,
     pub proxy_port: u16,
     pub proxy_runtime: Arc<ProxyRuntime>,
@@ -37,6 +38,7 @@ pub struct AppState {
     settings_update_lock: Arc<Mutex<()>>,
     probe_notify: Arc<Notify>,
     dns_notify: Arc<Notify>,
+    probe_slots: Arc<Semaphore>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -82,6 +84,7 @@ impl AppState {
             db,
             events,
             started_at,
+            started_monotonic: proxy::monotonic_millis(),
             proxy_host,
             proxy_port,
             proxy_runtime,
@@ -91,6 +94,7 @@ impl AppState {
             settings_update_lock: Arc::new(Mutex::new(())),
             probe_notify: Arc::new(Notify::new()),
             dns_notify: Arc::new(Notify::new()),
+            probe_slots: Arc::new(Semaphore::new(64)),
         };
         state.spawn_periodic_proxy_tests();
         state.spawn_dynamic_dns_refresh();
@@ -99,7 +103,7 @@ impl AppState {
     }
 
     pub fn uptime_seconds(&self) -> i64 {
-        ((now_millis() - self.started_at) / 1000).max(0)
+        proxy::monotonic_millis().saturating_sub(self.started_monotonic) / 1000
     }
 
     pub fn emit(&self, event_type: impl Into<String>, data: Value) {
@@ -190,50 +194,58 @@ impl AppState {
         }
     }
 
-    /// 解析所有“启用+动态”的映射，IP 变化才写库并刷新代理 DNS 缓存，广播事件让前端同步。
+    /// Bounded concurrent, deduplicated resolution; each completed domain is published immediately.
     async fn refresh_dynamic_mappings(&self) -> Result<()> {
+        self.refresh_dynamic_mappings_with(|domain| async move { resolve_ipv4(&domain).await })
+            .await
+    }
+
+    async fn refresh_dynamic_mappings_with<F, Fut>(&self, resolver: F) -> Result<()>
+    where
+        F: Fn(String) -> Fut + Clone + Send + 'static,
+        Fut: std::future::Future<Output = Option<String>> + Send,
+    {
         let mappings = self.db.list_dynamic_dns_mappings()?;
-        if mappings.is_empty() {
-            return Ok(());
-        }
-        let mut changed = false;
+        let mut domains = HashMap::<String, Vec<_>>::new();
         for mapping in mappings {
-            let Some(ip) = resolve_ipv4(&mapping.domain).await else {
-                eprintln!("动态DNS解析失败，保留原地址: {}", mapping.domain);
+            domains
+                .entry(crate::routing::normalize_host(&mapping.domain))
+                .or_default()
+                .push(mapping);
+        }
+        let mut pending = domains.into_iter();
+        let mut tasks = JoinSet::new();
+        loop {
+            while tasks.len() < 4 {
+                let Some((domain, mappings)) = pending.next() else {
+                    break;
+                };
+                let resolver = resolver.clone();
+                tasks.spawn(async move {
+                    let ip = resolver(domain).await;
+                    (mappings, ip)
+                });
+            }
+            let Some(result) = tasks.join_next().await else {
+                break;
+            };
+            let (mappings, ip) = result?;
+            let Some(ip) = ip else {
                 continue;
             };
-            if ip == mapping.ip {
-                continue;
-            }
-            match self.db.update_dns_ip_if_unchanged(
-                mapping.id,
-                &mapping.domain,
-                &mapping.ip,
-                mapping.enabled,
-                mapping.dynamic,
-                &ip,
-            ) {
-                Ok(true) => {}
-                Ok(false) => continue,
-                Err(error) => {
-                    eprintln!("动态DNS更新失败 {}: {error:#}", mapping.domain);
-                    continue;
+            for mapping in mappings {
+                if self.db.update_dns_ip_if_unchanged(
+                    mapping.id,
+                    &mapping.domain,
+                    &mapping.ip,
+                    mapping.enabled,
+                    mapping.dynamic,
+                    &ip,
+                )? {
+                    self.proxy_runtime.refresh_dns_cache().await?;
+                    self.emit("dns_mapping_updated", json!({"mapping": self.db.get_dns_mapping(mapping.id)?, "previousIp": mapping.ip, "ip": ip, "dynamic": true}));
                 }
             }
-            changed = true;
-            let updated = self.db.get_dns_mapping(mapping.id)?;
-            self.emit(
-                "dns_mapping_updated",
-                json!({
-                    "mapping": updated,
-                    "previousIp": mapping.ip,
-                    "ip": ip,
-                    "dynamic": true
-                }),
-            );
-        }
-        if changed {
-            self.proxy_runtime.refresh_dns_cache().await?;
         }
         Ok(())
     }
@@ -255,12 +267,20 @@ impl AppState {
         tauri::async_runtime::spawn(async move {
             loop {
                 match state.log_retention_days() {
-                    Ok(retention_days) => match state.db.prune_request_logs(retention_days) {
-                        Ok(deleted) if deleted > 0 => {
-                            eprintln!("已清理 {deleted} 条过期流量日志");
+                    Ok(retention_days) => loop {
+                        let db = state.db.clone();
+                        match tokio::task::spawn_blocking(move || {
+                            db.prune_request_logs(retention_days)
+                        })
+                        .await
+                        {
+                            Ok(Ok(500)) => time::sleep(Duration::from_millis(10)).await,
+                            Ok(Ok(_)) => break,
+                            error => {
+                                eprintln!("清理过期流量日志失败: {error:?}");
+                                break;
+                            }
                         }
-                        Ok(_) => {}
-                        Err(error) => eprintln!("清理过期流量日志失败: {error:#}"),
                     },
                     Err(error) => {
                         eprintln!("日志保留配置无效，本轮未执行清理: {error:#}");
@@ -327,7 +347,7 @@ impl AppState {
         last_probe: &mut HashMap<i64, i64>,
     ) -> Result<()> {
         let proxies = self.db.list_enabled_proxies()?;
-        let now = now_millis();
+        let now = proxy::monotonic_millis();
         for proxy in &proxies {
             last_probe.insert(proxy.id, now);
         }
@@ -358,7 +378,7 @@ impl AppState {
         };
 
         let recent_success = self.proxy_runtime.recent_success_map().await;
-        let now = now_millis();
+        let now = proxy::monotonic_millis();
         let active_window = schedule.active_window.as_millis() as i64;
         let base_interval = schedule.base_interval.as_millis() as i64;
         let recovery_interval = schedule.recovery_interval.as_millis() as i64;
@@ -370,7 +390,7 @@ impl AppState {
                 continue;
             }
             let last_success = recent_success.get(&proxy.id).copied().unwrap_or(0);
-            if last_success > 0 && now - last_success < active_window {
+            if last_success > 0 && now.saturating_sub(last_success) < active_window {
                 continue;
             }
             let interval = if proxy.status.as_deref() == Some("active") {
@@ -378,9 +398,20 @@ impl AppState {
             } else {
                 recovery_interval
             };
+            let failures = self
+                .probe_failures
+                .lock()
+                .await
+                .get(&proxy.id)
+                .copied()
+                .unwrap_or(0);
+            let interval = interval.saturating_mul(1i64 << failures.saturating_sub(1).min(3));
+            let jitter = (crate::routing::affinity(proxy.id, "probe-schedule", 0) % 1000) as i64
+                * (interval / 10)
+                / 1000;
             let due_now = last_probe
                 .get(&proxy.id)
-                .is_none_or(|last| now - last >= interval);
+                .is_none_or(|last| now.saturating_sub(*last) >= interval.saturating_add(jitter));
             if due_now {
                 due.push(proxy);
             }
@@ -438,6 +469,15 @@ impl AppState {
                 .clone()
         };
         let _probe_guard = probe_lock.lock().await;
+        // Includes manual probes; no separate unlimited manual concurrency path.
+        let _global_permit = time::timeout(
+            Duration::from_secs(5),
+            self.probe_slots
+                .clone()
+                .acquire_many_owned(64u32.div_ceil(self.probe_schedule()?.concurrency as u32)),
+        )
+        .await
+        .map_err(|_| anyhow!("测活队列繁忙，请稍后重试"))??;
         let Some(proxy) = self.db.get_proxy(scheduled_proxy.id)? else {
             return Ok(None);
         };
@@ -471,10 +511,14 @@ impl AppState {
             return Err(anyhow!("测试地址必须是包含主机名的 HTTP 或 HTTPS URL"));
         }
 
-        let probe_started_at = now_millis();
+        let probe_started_at = proxy::monotonic_millis();
+        let probe_generation = self
+            .db
+            .routing_snapshot()
+            .node_generations
+            .get(&proxy.id)
+            .copied();
         if origin == ProbeOrigin::Manual {
-            self.db
-                .update_proxy_status(proxy.id, "testing", proxy.response_time, 0, 0)?;
             self.emit("proxy_testing", json!({ "id": proxy.id }));
         }
 
@@ -492,6 +536,10 @@ impl AppState {
         let desired_status = if result.success {
             self.probe_failures.lock().await.remove(&proxy.id);
             Some("active")
+        } else if result.failure_scope.as_deref() != Some("proxy") {
+            // A test destination failure is not evidence that this proxy is globally unhealthy.
+            self.probe_failures.lock().await.remove(&proxy.id);
+            None
         } else if traffic_was_alive_before_apply {
             self.probe_failures.lock().await.remove(&proxy.id);
             None
@@ -512,6 +560,7 @@ impl AppState {
             .proxy_runtime
             .record_probe_result(
                 &proxy,
+                probe_generation,
                 probe_started_at,
                 desired_status,
                 result.success.then_some(result.response_time),
@@ -689,7 +738,114 @@ pub async fn resolve_ipv4(domain: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::ProbeOrigin;
+    use super::*;
+
+    #[tokio::test]
+    async fn dns_slow_domain_does_not_block_publication_and_same_ip_refreshes_timestamp() {
+        use crate::models::DnsInput;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let db = Database::open_in_memory().unwrap();
+        let (events, mut receiver) = broadcast::channel(32);
+        let runtime = Arc::new(
+            ProxyRuntime::new(
+                db.clone(),
+                events.clone(),
+                "127.0.0.1",
+                0,
+                &json!(crate::database::default_advanced_config()),
+            )
+            .unwrap(),
+        );
+        let state = AppState {
+            db,
+            events,
+            started_at: now_millis(),
+            started_monotonic: proxy::monotonic_millis(),
+            proxy_host: "127.0.0.1".into(),
+            proxy_port: 0,
+            proxy_runtime: runtime,
+            probe_locks: Default::default(),
+            probe_failures: Default::default(),
+            forced_probes: Default::default(),
+            settings_update_lock: Default::default(),
+            probe_notify: Default::default(),
+            dns_notify: Default::default(),
+            probe_slots: Arc::new(Semaphore::new(64)),
+        };
+        let mut ids = Vec::new();
+        for domain in [
+            "slow.test",
+            "same.test",
+            "failed.test",
+            "one.test",
+            "two.test",
+            "three.test",
+        ] {
+            let mapping = state
+                .db
+                .create_dns_mapping(DnsInput {
+                    domain: domain.into(),
+                    ip: "127.0.0.1".into(),
+                    description: None,
+                    enabled: Some(1),
+                    dynamic: Some(1),
+                })
+                .unwrap();
+            ids.push(mapping.id);
+        }
+        let gate = Arc::new(Notify::new());
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let task = tokio::spawn({
+            let state = state.clone();
+            let gate = gate.clone();
+            let active = active.clone();
+            let peak = peak.clone();
+            async move {
+                state
+                    .refresh_dynamic_mappings_with(move |domain| {
+                        let gate = gate.clone();
+                        let active = active.clone();
+                        let peak = peak.clone();
+                        async move {
+                            let current = active.fetch_add(1, Ordering::Relaxed) + 1;
+                            peak.fetch_max(current, Ordering::Relaxed);
+                            if domain == "slow.test" {
+                                gate.notified().await;
+                            }
+                            tokio::task::yield_now().await;
+                            active.fetch_sub(1, Ordering::Relaxed);
+                            if domain == "failed.test" {
+                                None
+                            } else {
+                                Some("127.0.0.1".into())
+                            }
+                        }
+                    })
+                    .await
+                    .unwrap();
+            }
+        });
+        time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!task.is_finished());
+        gate.notify_one();
+        task.await.unwrap();
+        assert!(state
+            .db
+            .get_dns_mapping(ids[1])
+            .unwrap()
+            .unwrap()
+            .last_resolved
+            .is_some());
+        let failed = state.db.get_dns_mapping(ids[2]).unwrap().unwrap();
+        assert_eq!(failed.ip, "127.0.0.1");
+        assert!(failed.last_resolved.is_none());
+        assert!(peak.load(Ordering::Relaxed) <= 4);
+        assert_eq!(active.load(Ordering::Relaxed), 0);
+    }
 
     #[test]
     fn startup_probe_failure_is_authoritative() {

@@ -173,6 +173,10 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
     }
     const proxySearch = route.searchParams.get("proxy")?.trim()
     if (proxySearch) args.proxySearch = proxySearch
+    for (const key of ["snapshotId", "beforeId"]) {
+      const value = route.searchParams.get(key)
+      if (value !== null) args[key] = Number(value)
+    }
     return command<T>("traffic_logs", args)
   }
   if (method === "DELETE" && route.pathname === "/api/traffic-logs") {

@@ -11,17 +11,50 @@ use crate::models::{ProxyRecord, TestResult};
 
 pub async fn test_proxy(proxy: &ProxyRecord, test_url: &str, timeout_ms: u64) -> TestResult {
     let start = Instant::now();
-    match execute_proxy_test(proxy, test_url, timeout_ms).await {
+    let budget = Duration::from_millis(timeout_ms.max(1));
+    if let Ok(target) = Url::parse(test_url) {
+        if let Err((scope @ ("proxy" | "network"), error)) = crate::proxy::probe_connection_health(
+            proxy,
+            &target,
+            (budget / 2).min(Duration::from_secs(5)),
+        )
+        .await
+        {
+            return TestResult {
+                success: false,
+                response_time: elapsed_ms(start),
+                status_code: None,
+                error: Some(error),
+                failure_scope: Some(scope.into()),
+            };
+        }
+    }
+    match execute_proxy_test(
+        proxy,
+        test_url,
+        budget.saturating_sub(start.elapsed()).as_millis().max(1) as u64,
+    )
+    .await
+    {
         Ok(status) => TestResult {
             success: true,
             response_time: elapsed_ms(start),
             status_code: Some(status),
             error: None,
+            failure_scope: None,
         },
         Err(error) => TestResult {
             success: false,
             response_time: elapsed_ms(start),
             status_code: None,
+            failure_scope: Some(
+                if error.to_string().contains("HTTP 407") {
+                    "proxy"
+                } else {
+                    "target"
+                }
+                .into(),
+            ),
             error: Some(error.to_string()),
         },
     }
@@ -34,8 +67,7 @@ async fn execute_proxy_test(proxy: &ProxyRecord, test_url: &str, timeout_ms: u64
     }
 
     let proxy_url = build_proxy_url(proxy)?;
-    let reqwest_proxy = Proxy::all(proxy_url.as_str())
-        .with_context(|| format!("代理 URL 无效: {}", proxy_url.as_str()))?;
+    let reqwest_proxy = Proxy::all(proxy_url.as_str()).context("代理 URL 无效")?;
     let client = Client::builder()
         .proxy(reqwest_proxy)
         .timeout(Duration::from_millis(timeout_ms.max(1)))

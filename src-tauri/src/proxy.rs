@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     net::{Ipv4Addr, SocketAddr},
-    sync::Arc,
+    sync::{Arc, Mutex as SyncMutex, RwLock as SyncRwLock},
     time::Instant,
 };
 
@@ -31,20 +31,33 @@ const SOCKS_AUTH_USERNAME_PASSWORD: u8 = 0x02;
 const SOCKS_AUTH_REJECTED: u8 = 0xff;
 const METRICS_WINDOW_MS: i64 = 5 * 60 * 1000;
 const MAX_TARGET_CIRCUITS: usize = 4096;
+const MAX_METRIC_SAMPLES: usize = 2048;
+mod http_observer;
+mod sticky_routes;
+mod telemetry;
 
 #[derive(Clone)]
 pub struct ProxyRuntime {
     db: Database,
+    database_worker: crate::database_worker::DatabaseWorker,
+    telemetry: Arc<telemetry::Telemetry>,
     events: broadcast::Sender<ServerEvent>,
     service_status: Arc<RwLock<ProxyServiceStatus>>,
-    metrics: Arc<RwLock<HashMap<i64, ProxyMetrics>>>,
-    circuit_breakers: Arc<RwLock<HashMap<i64, CircuitBreaker>>>,
-    target_circuits: Arc<RwLock<HashMap<TargetRouteKey, TargetCircuit>>>,
-    active_connections: Arc<RwLock<HashMap<i64, i64>>>,
+    metrics: Arc<SyncRwLock<HashMap<i64, ProxyMetrics>>>,
+    circuit_breakers: Arc<SyncRwLock<HashMap<i64, CircuitBreaker>>>,
+    target_circuits: Arc<SyncRwLock<HashMap<TargetRouteKey, TargetCircuit>>>,
+    active_connections: Arc<std::sync::Mutex<HashMap<i64, i64>>>,
+    connection_slots: Arc<tokio::sync::Semaphore>,
+    handshake_slots: Arc<tokio::sync::Semaphore>,
+    global_dial_slots: Arc<tokio::sync::Semaphore>,
+    dial_slots: Arc<SyncMutex<HashMap<i64, Arc<tokio::sync::Semaphore>>>>,
+    dial_ready: Arc<tokio::sync::Notify>,
     dns_cache: Arc<RwLock<HashMap<String, String>>>,
-    round_robin_index: Arc<Mutex<usize>>,
-    selection_lock: Arc<Mutex<()>>,
-    runtime_settings: Arc<RwLock<RuntimeSettings>>,
+    round_robin_index: Arc<SyncMutex<HashMap<i64, i64>>>,
+    adaptive_sequence: Arc<SyncMutex<HashMap<i64, u64>>>,
+    sticky_routes: Arc<SyncMutex<sticky_routes::StickyRoutes>>,
+    selection_lock: Arc<SyncMutex<()>>,
+    runtime_settings: Arc<SyncRwLock<RuntimeSettings>>,
     status_locks: Arc<Mutex<HashMap<i64, Arc<Mutex<()>>>>>,
 }
 
@@ -80,8 +93,8 @@ impl TargetRouteKey {
     fn new(proxy_id: i64, request: &TargetRequest) -> Self {
         Self {
             proxy_id,
-            original_host: request.original_host.to_ascii_lowercase(),
-            resolved_host: request.host.to_ascii_lowercase(),
+            original_host: crate::routing::normalize_host(&request.original_host),
+            resolved_host: crate::routing::normalize_host(&request.host),
             port: request.port,
         }
     }
@@ -96,6 +109,7 @@ struct TargetCircuit {
 enum FailureScope {
     Proxy,
     Target,
+    Network,
 }
 
 impl FailureScope {
@@ -103,6 +117,7 @@ impl FailureScope {
         match self {
             Self::Proxy => "代理连接/认证",
             Self::Target => "目标链路",
+            Self::Network => "本地网络不可用",
         }
     }
 }
@@ -112,6 +127,40 @@ struct ConnectedUpstream {
     outbound_initial_payload: Option<Vec<u8>>,
     prefetched_response: Vec<u8>,
     target_verified: bool,
+    proxy_latency_us: u64,
+}
+
+struct ConnectionLease {
+    proxy: ProxyRecord,
+    generation: u64,
+    active: Arc<std::sync::Mutex<HashMap<i64, i64>>>,
+    attempt: Arc<()>,
+    dial_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    global_dial_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    failover_policy: Option<sticky_routes::Policy>,
+    dial_ready: Arc<tokio::sync::Notify>,
+}
+impl std::ops::Deref for ConnectionLease {
+    type Target = ProxyRecord;
+    fn deref(&self) -> &ProxyRecord {
+        &self.proxy
+    }
+}
+impl Drop for ConnectionLease {
+    fn drop(&mut self) {
+        let had_permit = self.dial_permit.take().is_some();
+        let had_global_permit = self.global_dial_permit.take().is_some();
+        if had_permit || had_global_permit {
+            self.dial_ready.notify_waiters();
+        }
+        let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = active.get_mut(&self.proxy.id) {
+            *count -= 1;
+            if *count <= 0 {
+                active.remove(&self.proxy.id);
+            }
+        }
+    }
 }
 
 pub struct ProxyRuntimeStats {
@@ -133,6 +182,10 @@ struct ProxyMetrics {
     last_used: i64,
     last_success: i64,
     pushed_status: Option<String>,
+    successes: i64,
+    time_sum: i64,
+    time_count: i64,
+    learning_remaining: u8,
 }
 
 #[derive(Debug, Clone)]
@@ -149,6 +202,8 @@ struct CircuitBreaker {
     threshold: i64,
     timeout_ms: i64,
     next_attempt: i64,
+    #[serde(skip)]
+    attempt: Option<std::sync::Weak<()>>,
 }
 
 #[derive(Clone, Default)]
@@ -268,8 +323,12 @@ impl ProxyRuntime {
         if let Some(algorithm) = db.settings_map()?.get("algorithm") {
             runtime_settings.set_algorithm(algorithm)?;
         }
+        let database_worker =
+            crate::database_worker::DatabaseWorker::new(db.clone(), events.clone())?;
         Ok(Self {
             db,
+            database_worker,
+            telemetry: Arc::new(telemetry::Telemetry::default()),
             events,
             service_status: Arc::new(RwLock::new(ProxyServiceStatus {
                 state: "starting".to_string(),
@@ -278,20 +337,36 @@ impl ProxyRuntime {
                 port: listen_port,
                 error: Some("代理服务正在启动".to_string()),
             })),
-            metrics: Arc::new(RwLock::new(HashMap::new())),
-            circuit_breakers: Arc::new(RwLock::new(HashMap::new())),
-            target_circuits: Arc::new(RwLock::new(HashMap::new())),
-            active_connections: Arc::new(RwLock::new(HashMap::new())),
+            metrics: Arc::new(SyncRwLock::new(HashMap::new())),
+            circuit_breakers: Arc::new(SyncRwLock::new(HashMap::new())),
+            target_circuits: Arc::new(SyncRwLock::new(HashMap::new())),
+            active_connections: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            connection_slots: Arc::new(tokio::sync::Semaphore::new(1024)),
+            handshake_slots: Arc::new(tokio::sync::Semaphore::new(128)),
+            global_dial_slots: Arc::new(tokio::sync::Semaphore::new(64)),
+            dial_slots: Arc::new(SyncMutex::new(HashMap::new())),
+            dial_ready: Arc::new(tokio::sync::Notify::new()),
             dns_cache: Arc::new(RwLock::new(HashMap::new())),
-            round_robin_index: Arc::new(Mutex::new(0)),
-            selection_lock: Arc::new(Mutex::new(())),
-            runtime_settings: Arc::new(RwLock::new(runtime_settings)),
+            round_robin_index: Arc::new(SyncMutex::new(HashMap::new())),
+            adaptive_sequence: Arc::new(SyncMutex::new(HashMap::new())),
+            sticky_routes: Arc::new(SyncMutex::new(sticky_routes::StickyRoutes::default())),
+            selection_lock: Arc::new(SyncMutex::new(())),
+            runtime_settings: Arc::new(SyncRwLock::new(runtime_settings)),
             status_locks: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
     pub async fn service_status(&self) -> ProxyServiceStatus {
         self.service_status.read().await.clone()
+    }
+
+    pub fn flush_logs(&self, budget: Duration) -> bool {
+        self.database_worker.flush(budget)
+    }
+    pub fn database_stats(&self) -> Value {
+        let mut stats = self.database_worker.stats();
+        stats["timings"] = self.telemetry.snapshot();
+        stats
     }
 
     async fn set_service_status(&self, status: ProxyServiceStatus) {
@@ -304,22 +379,40 @@ impl ProxyRuntime {
     }
 
     pub async fn refresh_dns_cache(&self) -> Result<()> {
-        let mappings = self.db.active_dns_mappings()?;
+        let mappings = self
+            .db
+            .active_dns_mappings()?
+            .into_iter()
+            .map(|(host, ip)| (crate::routing::normalize_host(&host), ip))
+            .collect();
         *self.dns_cache.write().await = mappings;
         Ok(())
     }
 
     pub async fn update_advanced_config(&self, advanced: &Value) -> Result<()> {
-        let mut current = self.runtime_settings.write().await;
+        let mut current = self
+            .runtime_settings
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         let mut next = RuntimeSettings::from_advanced(advanced)?;
         next.algorithm = current.algorithm.clone();
         let circuit = next.circuit;
         *current = next;
         drop(current);
-        for breaker in self.circuit_breakers.write().await.values_mut() {
+        for breaker in self
+            .circuit_breakers
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .values_mut()
+        {
             breaker.apply_config(circuit);
         }
-        for target in self.target_circuits.write().await.values_mut() {
+        for target in self
+            .target_circuits
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .values_mut()
+        {
             target.breaker.apply_config(circuit);
         }
         Ok(())
@@ -329,35 +422,59 @@ impl ProxyRuntime {
         if let Some(algorithm) = settings.get("algorithm").and_then(Value::as_str) {
             self.runtime_settings
                 .write()
-                .await
+                .unwrap_or_else(|e| e.into_inner())
                 .set_algorithm(algorithm)?;
+            *self.sticky_routes.lock().unwrap_or_else(|e| e.into_inner()) =
+                sticky_routes::StickyRoutes::default();
         }
         Ok(())
     }
 
     pub async fn reset_proxy_state(&self, proxy_id: i64) {
-        self.metrics.write().await.remove(&proxy_id);
-        self.circuit_breakers.write().await.remove(&proxy_id);
+        self.dial_slots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&proxy_id);
+        self.metrics
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&proxy_id);
+        self.circuit_breakers
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&proxy_id);
         self.target_circuits
             .write()
-            .await
+            .unwrap_or_else(|e| e.into_inner())
             .retain(|key, _| key.proxy_id != proxy_id);
     }
 
     fn proxy_configuration_is_current(&self, proxy: &ProxyRecord) -> Result<bool> {
         Ok(self
             .db
-            .get_proxy(proxy.id)?
-            .is_some_and(|latest| same_routing_configuration(proxy, &latest)))
+            .routing_snapshot()
+            .proxies
+            .iter()
+            .any(|latest| latest.id == proxy.id && same_routing_configuration(proxy, latest)))
     }
 
     async fn inbound_auth(&self) -> InboundAuth {
-        self.runtime_settings.read().await.inbound_auth.clone()
+        self.runtime_settings
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .inbound_auth
+            .clone()
     }
 
     pub async fn stats(&self) -> HashMap<i64, ProxyRuntimeStats> {
-        let metrics = self.metrics.read().await;
-        let active = self.active_connections.read().await;
+        let mut metrics = self.metrics.write().unwrap_or_else(|e| e.into_inner());
+        for metric in metrics.values_mut() {
+            metric.prune(monotonic_millis());
+        }
+        let active = self
+            .active_connections
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut stats = HashMap::with_capacity(metrics.len().max(active.len()));
         for (proxy_id, metric) in metrics.iter() {
             stats.insert(
@@ -378,7 +495,10 @@ impl ProxyRuntime {
     }
 
     pub async fn circuit_breaker_stats(&self) -> Vec<Value> {
-        let breakers = self.circuit_breakers.read().await;
+        let breakers = self
+            .circuit_breakers
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
         breakers
             .iter()
             .map(|(proxy_id, breaker)| {
@@ -392,13 +512,20 @@ impl ProxyRuntime {
             .collect()
     }
 
-    async fn increment_active(&self, proxy_id: i64) {
-        let mut active = self.active_connections.write().await;
+    fn increment_active(&self, proxy_id: i64) {
+        let mut active = self
+            .active_connections
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         *active.entry(proxy_id).or_insert(0) += 1;
     }
 
+    #[cfg(test)]
     async fn decrement_active(&self, proxy_id: i64) {
-        let mut active = self.active_connections.write().await;
+        let mut active = self
+            .active_connections
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         match active.get_mut(&proxy_id) {
             Some(value) if *value > 1 => *value -= 1,
             Some(_) => {
@@ -411,7 +538,7 @@ impl ProxyRuntime {
     // 调用方持有代理状态锁，并已校验配置仍然有效。
     async fn record_connection_success_locked(&self, proxy_id: i64, response_time: i64) {
         let mark_active = {
-            let mut metrics = self.metrics.write().await;
+            let mut metrics = self.metrics.write().unwrap_or_else(|e| e.into_inner());
             let metric = metrics.entry(proxy_id).or_insert_with(ProxyMetrics::new);
             metric.push(true, Some(response_time));
             metric.pushed_status.as_deref() != Some("active")
@@ -420,7 +547,7 @@ impl ProxyRuntime {
         {
             self.metrics
                 .write()
-                .await
+                .unwrap_or_else(|e| e.into_inner())
                 .entry(proxy_id)
                 .or_insert_with(ProxyMetrics::new)
                 .pushed_status = Some("active".to_string());
@@ -428,119 +555,316 @@ impl ProxyRuntime {
     }
 
     async fn record_request(&self, entry: RequestLogEntry<'_>) {
-        if let Err(db_error) = self.db.log_request(&entry) {
-            eprintln!("写入请求日志失败: {db_error:#}");
-        }
-
-        let event = ServerEvent {
-            event_type: "request_logged".to_string(),
-            data: Value::Null,
-            timestamp: now_millis(),
-        };
-        let _ = self.events.send(event);
+        self.database_worker.log(entry);
     }
 
-    async fn select_proxies(
+    #[cfg(test)]
+    fn select_proxies(
         &self,
         request: &TargetRequest,
         excluded: &HashSet<i64>,
     ) -> Result<Vec<ProxyRecord>> {
-        let mut proxies = self.db.list_enabled_proxies()?;
+        self.select_from_snapshot(&self.db.routing_snapshot(), request, excluded)
+    }
+
+    fn select_from_snapshot(
+        &self,
+        snapshot: &crate::routing::RoutingSnapshot,
+        request: &TargetRequest,
+        excluded: &HashSet<i64>,
+    ) -> Result<Vec<ProxyRecord>> {
+        let mut proxies = snapshot.proxies.clone();
         if proxies.is_empty() {
             return Err(anyhow!("没有可用的代理"));
         }
 
-        let group_key = request.original_host.to_lowercase();
-        if let Some(selection) = self.db.group_proxy_selection(&group_key)? {
-            #[cfg(debug_assertions)]
-            eprintln!(
-                "代理路由命中: target={group_key}, group={}, candidates={:?}",
-                selection.group_name, selection.proxy_ids
-            );
-            proxies.retain(|proxy| selection.proxy_ids.contains(&proxy.id));
+        let group_key = crate::routing::normalize_host(&request.original_host);
+        let mut pool_id = 0;
+        if let Some(selection) = snapshot.pool(&group_key) {
+            pool_id = selection.id;
+            proxies.retain(|proxy| selection.members.contains(&proxy.id));
             if proxies.is_empty() {
                 return Err(anyhow!(
                     "目标 {} 匹配的代理分组「{}」没有可用代理",
                     group_key,
-                    selection.group_name
+                    selection.name
                 ));
             }
-        } else {
-            #[cfg(debug_assertions)]
-            eprintln!("代理路由未命中分组: target={group_key}, 使用全部已启用代理");
         }
+        self.round_robin_index
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|id, _| *id == 0 || snapshot.pools.iter().any(|pool| pool.id == *id));
 
-        let algorithm = self.runtime_settings.read().await.algorithm.clone();
+        let mut algorithm = self
+            .runtime_settings
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .algorithm
+            .clone();
+        if let Some(override_algorithm) = snapshot
+            .pool(&group_key)
+            .and_then(|pool| pool.algorithm_override.as_ref())
+        {
+            algorithm.clone_from(override_algorithm);
+        }
 
         let mut eligible = Vec::new();
-        for proxy in proxies {
-            if excluded.contains(&proxy.id) || !self.is_candidate_available(proxy.id, request).await
-            {
-                continue;
+        {
+            // Normalize the route once and acquire each read lock once per pool,
+            // not three locks and two IDNA conversions per candidate.
+            let base_key = TargetRouteKey::new(0, request);
+            let metrics = self.metrics.read().unwrap_or_else(|e| e.into_inner());
+            let breakers = self
+                .circuit_breakers
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            let targets = self
+                .target_circuits
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            for mut proxy in proxies {
+                if let Some(status) = metrics.get(&proxy.id).and_then(|m| m.pushed_status.clone()) {
+                    proxy.status = Some(status);
+                }
+                let key = TargetRouteKey {
+                    proxy_id: proxy.id,
+                    ..base_key.clone()
+                };
+                if excluded.contains(&proxy.id)
+                    || !breakers
+                        .get(&proxy.id)
+                        .is_none_or(CircuitBreaker::can_attempt_snapshot)
+                    || !targets
+                        .get(&key)
+                        .is_none_or(|target| target.breaker.can_attempt_snapshot())
+                {
+                    continue;
+                }
+                eligible.push(proxy);
             }
-            eligible.push(proxy);
         }
 
-        self.order_proxies(eligible, &algorithm, &group_key).await
+        let mut ordered = self.order_proxies_in_pool(eligible, &algorithm, &group_key, pool_id)?;
+        if let Some(policy) = sticky_routes::Policy::for_request(snapshot, request, &algorithm) {
+            self.sticky_routes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .prefer(&policy, snapshot, &mut ordered);
+        }
+        Ok(ordered)
     }
 
     async fn reserve_proxy(
         &self,
         request: &TargetRequest,
         excluded: &HashSet<i64>,
-    ) -> Result<Option<ProxyRecord>> {
-        // 只串行化选路和计数预占，不锁网络 I/O，避免并发请求都读到同一份空闲快照。
-        let _selection = self.selection_lock.lock().await;
-        for proxy in self.select_proxies(request, excluded).await? {
-            if self.try_begin_attempt(proxy.id, request).await {
-                self.increment_active(proxy.id).await;
-                return Ok(Some(proxy));
+    ) -> Result<Option<ConnectionLease>> {
+        loop {
+            // Tokio's semaphore queues global capacity waiters fairly. Waking
+            // every global waiter for each released slot causes contention and
+            // lets recently scheduled requests repeatedly overtake older ones.
+            let queued = Instant::now();
+            let global_dial_permit = self.global_dial_slots.clone().acquire_owned().await?;
+            self.telemetry.record(
+                "global_dial_queue_wait",
+                queued.elapsed().as_micros() as u64,
+            );
+            // Register before looking at capacity so release cannot be missed.
+            let ready = self.dial_ready.notified();
+            tokio::pin!(ready);
+            ready.as_mut().enable();
+            let (lease, saturated) =
+                self.try_reserve_proxy(request, excluded, global_dial_permit)?;
+            if lease.is_some() || !saturated {
+                return Ok(lease);
             }
+            // Capacity waits remain asynchronous and bounded by the caller's deadline.
+            let queued = Instant::now();
+            ready.await;
+            self.telemetry
+                .record("dial_queue_wait", queued.elapsed().as_micros() as u64);
         }
-        Ok(None)
     }
 
-    async fn order_proxies(
+    // Pure in-memory selection + reservation. No await, SQL, network or filesystem
+    // operations may be added while this short lock is held.
+    fn try_reserve_proxy(
+        &self,
+        request: &TargetRequest,
+        excluded: &HashSet<i64>,
+        global_dial_permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> Result<(Option<ConnectionLease>, bool)> {
+        let wait = Instant::now();
+        let _selection = self
+            .selection_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        self.telemetry
+            .record("selection_wait", wait.elapsed().as_micros() as u64);
+        let selection_started = Instant::now();
+        let snapshot = self.db.routing_snapshot();
+        let mut saturated = false;
+        let candidates = self.select_from_snapshot(&snapshot, request, excluded)?;
+        let algorithm = self
+            .runtime_settings
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .algorithm
+            .clone();
+        let failover_policy = sticky_routes::Policy::for_request(&snapshot, request, &algorithm)
+            .filter(|policy| {
+                !candidates.iter().any(|proxy| {
+                    proxy.id == policy.preferred && proxy.status.as_deref() != Some("inactive")
+                })
+            });
+        for proxy in candidates {
+            let Some(generation) = snapshot.node_generations.get(&proxy.id).copied() else {
+                continue;
+            };
+            if self.db.routing_snapshot().node_generations.get(&proxy.id) != Some(&generation) {
+                continue;
+            }
+            let slots = self
+                .dial_slots
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .entry(proxy.id)
+                .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(32)))
+                .clone();
+            let Ok(permit) = slots.try_acquire_owned() else {
+                saturated = true;
+                continue;
+            };
+            let token = Arc::new(());
+            if self.try_begin_attempt_token(proxy.id, request, Some(&token)) {
+                self.increment_active(proxy.id);
+                self.telemetry.record(
+                    "selection_hold",
+                    selection_started.elapsed().as_micros() as u64,
+                );
+                return Ok((
+                    Some(ConnectionLease {
+                        proxy,
+                        generation,
+                        active: self.active_connections.clone(),
+                        attempt: token,
+                        dial_permit: Some(permit),
+                        global_dial_permit: Some(global_dial_permit),
+                        failover_policy,
+                        dial_ready: self.dial_ready.clone(),
+                    }),
+                    false,
+                ));
+            }
+        }
+        self.telemetry.record(
+            "selection_hold",
+            selection_started.elapsed().as_micros() as u64,
+        );
+        drop(global_dial_permit);
+        Ok((None, saturated))
+    }
+
+    #[cfg(test)]
+    fn order_proxies(
+        &self,
+        proxies: Vec<ProxyRecord>,
+        algorithm: &str,
+        host_key: &str,
+    ) -> Result<Vec<ProxyRecord>> {
+        self.order_proxies_in_pool(proxies, algorithm, host_key, 0)
+    }
+
+    fn order_proxies_in_pool(
         &self,
         mut proxies: Vec<ProxyRecord>,
         algorithm: &str,
         host_key: &str,
+        pool_id: i64,
     ) -> Result<Vec<ProxyRecord>> {
         match algorithm {
             "least_connections" => {
-                let active = self.active_connections.read().await;
-                proxies.sort_by(|a, b| {
-                    active
-                        .get(&a.id)
-                        .copied()
-                        .unwrap_or(0)
-                        .cmp(&active.get(&b.id).copied().unwrap_or(0))
-                        .then_with(|| score_of(b).total_cmp(&score_of(a)))
-                });
+                let mut cursors = self
+                    .round_robin_index
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let active = self
+                    .active_connections
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let last = cursors.get(&pool_id).copied().unwrap_or(0);
+                // One O(N) selection. Retries reselect with their excluded set.
+                if let Some((index, _)) = proxies.iter().enumerate().min_by_key(|(_, p)| {
+                    (
+                        p.status.as_deref() == Some("inactive"),
+                        active.get(&p.id).copied().unwrap_or(0),
+                        p.id <= last,
+                        p.id,
+                    )
+                }) {
+                    proxies.swap(0, index);
+                    cursors.insert(pool_id, proxies[0].id);
+                }
             }
             "round_robin" => {
-                let mut index = self.round_robin_index.lock().await;
+                // Stable ID ring: health/exclusion skips do not redefine cursor positions.
+                // Priority edits do not move the ring; a removed cursor resumes at its successor.
+                proxies.sort_by_key(|proxy| proxy.id);
+                let mut cursors = self
+                    .round_robin_index
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let last = cursors.get(&pool_id).copied().unwrap_or(0);
                 if !proxies.is_empty() {
-                    let selected = *index % proxies.len();
+                    let selected = proxies
+                        .iter()
+                        .position(|proxy| proxy.id > last)
+                        .unwrap_or(0);
                     proxies.rotate_left(selected);
-                    *index = index.saturating_add(1);
+                    proxies = prioritize_route_status(proxies);
+                    cursors.insert(pool_id, proxies[0].id);
                 }
             }
             "sticky_host" => {
-                if !proxies.is_empty() && !host_key.is_empty() {
-                    let idx = stable_hash(host_key) % proxies.len();
-                    proxies.rotate_left(idx);
-                }
+                let host = crate::routing::normalize_host(host_key);
+                proxies.sort_by_cached_key(|proxy| {
+                    std::cmp::Reverse(crate::routing::affinity(pool_id, &host, proxy.id))
+                });
             }
             _ => {
-                let mut metrics = self.metrics.write().await;
-                let now = now_millis();
+                let mut sequences = self
+                    .adaptive_sequence
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                sequences.retain(|pool, _| {
+                    *pool == 0
+                        || self
+                            .db
+                            .routing_snapshot()
+                            .pools
+                            .iter()
+                            .any(|p| p.id == *pool)
+                });
+                let sequence = sequences.entry(pool_id).or_default();
+                *sequence = sequence.wrapping_add(1);
+                let learning_turn = (*sequence).is_multiple_of(16);
+                let mut cursors = self
+                    .round_robin_index
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let last = cursors.get(&pool_id).copied().unwrap_or(0);
+                let mut metrics = self.metrics.write().unwrap_or_else(|e| e.into_inner());
+                let now = monotonic_millis();
                 for proxy in &proxies {
                     if let Some(metric) = metrics.get_mut(&proxy.id) {
                         metric.prune(now);
                     }
                 }
-                let active = self.active_connections.read().await;
+                let active = self
+                    .active_connections
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 let effective_score = |proxy: &ProxyRecord| {
                     let quality = metrics
                         .get(&proxy.id)
@@ -549,36 +873,87 @@ impl ProxyRuntime {
                         .unwrap_or_else(|| score_of(proxy));
                     quality / (1 + active.get(&proxy.id).copied().unwrap_or(0).max(0)) as f64
                 };
-                proxies.sort_by(|a, b| effective_score(b).total_cmp(&effective_score(a)));
+                let learner = if learning_turn {
+                    proxies
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, p)| {
+                            p.status.as_deref() != Some("inactive")
+                                && metrics.get(&p.id).is_none_or(|m| m.learning_remaining > 0)
+                        })
+                        .min_by_key(|(_, p)| (p.id <= last, p.id))
+                        .map(|(index, _)| index)
+                } else {
+                    None
+                };
+                let best = learner.or_else(|| {
+                    proxies
+                        .iter()
+                        .enumerate()
+                        .max_by(|(_, a), (_, b)| {
+                            (a.status.as_deref() != Some("inactive"))
+                                .cmp(&(b.status.as_deref() != Some("inactive")))
+                                .then_with(|| effective_score(a).total_cmp(&effective_score(b)))
+                                .then_with(|| b.id.cmp(&a.id))
+                        })
+                        .map(|(index, _)| index)
+                });
+                if let Some(index) = best {
+                    proxies.swap(0, index);
+                    if learning_turn {
+                        cursors.insert(pool_id, proxies[0].id);
+                    }
+                }
             }
         }
         Ok(prioritize_route_status(proxies))
     }
 
+    #[cfg(test)]
     async fn is_candidate_available(&self, proxy_id: i64, request: &TargetRequest) -> bool {
         let proxy_available = self
             .circuit_breakers
             .read()
-            .await
+            .unwrap_or_else(|e| e.into_inner())
             .get(&proxy_id)
             .is_none_or(CircuitBreaker::can_attempt_snapshot);
         proxy_available
             && self
                 .target_circuits
                 .read()
-                .await
+                .unwrap_or_else(|e| e.into_inner())
                 .get(&TargetRouteKey::new(proxy_id, request))
                 .is_none_or(|target| target.breaker.can_attempt_snapshot())
     }
 
+    #[cfg(test)]
     async fn try_begin_attempt(&self, proxy_id: i64, request: &TargetRequest) -> bool {
-        let config = self.runtime_settings.read().await.circuit;
-        let mut breakers = self.circuit_breakers.write().await;
+        self.try_begin_attempt_token(proxy_id, request, None)
+    }
+
+    fn try_begin_attempt_token(
+        &self,
+        proxy_id: i64,
+        request: &TargetRequest,
+        token: Option<&Arc<()>>,
+    ) -> bool {
+        let config = self
+            .runtime_settings
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .circuit;
+        let mut breakers = self
+            .circuit_breakers
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         let breaker = breakers
             .entry(proxy_id)
             .or_insert_with(|| CircuitBreaker::new(config));
         breaker.apply_config(config);
-        let mut targets = self.target_circuits.write().await;
+        let mut targets = self
+            .target_circuits
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         let target = targets.get_mut(&TargetRouteKey::new(proxy_id, request));
         if !breaker.can_attempt_snapshot()
             || target
@@ -589,13 +964,27 @@ impl ProxyRuntime {
         }
         if let Some(target) = target {
             target.breaker.try_begin_attempt();
+            if target.breaker.state == "HALF_OPEN" {
+                target.breaker.attempt = token.map(Arc::downgrade);
+            }
         }
-        breaker.try_begin_attempt()
+        let begun = breaker.try_begin_attempt();
+        if breaker.state == "HALF_OPEN" {
+            breaker.attempt = token.map(Arc::downgrade);
+        }
+        begun
     }
 
     async fn record_breaker_success(&self, proxy_id: i64) {
-        let config = self.runtime_settings.read().await.circuit;
-        let mut breakers = self.circuit_breakers.write().await;
+        let config = self
+            .runtime_settings
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .circuit;
+        let mut breakers = self
+            .circuit_breakers
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         let breaker = breakers
             .entry(proxy_id)
             .or_insert_with(|| CircuitBreaker::new(config));
@@ -603,23 +992,29 @@ impl ProxyRuntime {
         breaker.record_success();
     }
 
-    async fn cancel_half_open_attempt(&self, proxy_id: i64, request: &TargetRequest) {
-        if let Some(breaker) = self.circuit_breakers.write().await.get_mut(&proxy_id) {
-            breaker.cancel_half_open_attempt();
-        }
-        self.cancel_target_half_open_attempt(proxy_id, request)
-            .await;
-    }
-
     async fn cancel_target_half_open_attempt(&self, proxy_id: i64, request: &TargetRequest) {
         if let Some(target) = self
             .target_circuits
             .write()
-            .await
+            .unwrap_or_else(|e| e.into_inner())
             .get_mut(&TargetRouteKey::new(proxy_id, request))
         {
             target.breaker.cancel_half_open_attempt();
         }
+    }
+
+    #[cfg(test)]
+    async fn cancel_half_open_attempt(&self, proxy_id: i64, request: &TargetRequest) {
+        if let Some(breaker) = self
+            .circuit_breakers
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(&proxy_id)
+        {
+            breaker.cancel_half_open_attempt();
+        }
+        self.cancel_target_half_open_attempt(proxy_id, request)
+            .await;
     }
 
     async fn record_route_failure_locked(
@@ -628,6 +1023,10 @@ impl ProxyRuntime {
         request: &TargetRequest,
         scope: FailureScope,
     ) {
+        if scope == FailureScope::Network {
+            // Network-down is not evidence against a particular proxy or destination.
+            return;
+        }
         if scope == FailureScope::Proxy {
             self.record_breaker_failure_locked(proxy_id).await;
             self.cancel_target_half_open_attempt(proxy_id, request)
@@ -636,20 +1035,27 @@ impl ProxyRuntime {
         }
         // 已连上代理，失败属于此目标链路；不影响其他网站的评分、状态或全局熔断。
         self.record_breaker_success(proxy_id).await;
-        let config = self.runtime_settings.read().await.circuit;
+        let config = self
+            .runtime_settings
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .circuit;
         let key = TargetRouteKey::new(proxy_id, request);
-        let now = now_millis();
-        let mut targets = self.target_circuits.write().await;
+        let now = monotonic_millis();
+        let mut targets = self
+            .target_circuits
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         if !targets.contains_key(&key) {
             targets.retain(|_, target| {
-                target.breaker.state == "HALF_OPEN"
+                target.breaker.half_open_in_flight()
                     || now.saturating_sub(target.last_failure)
                         < METRICS_WINDOW_MS.max(target.breaker.timeout_ms)
             });
             if targets.len() >= MAX_TARGET_CIRCUITS {
                 let oldest = targets
                     .iter()
-                    .filter(|(_, target)| target.breaker.state != "HALF_OPEN")
+                    .filter(|(_, target)| !target.breaker.half_open_in_flight())
                     .min_by_key(|(_, target)| target.last_failure)
                     .map(|(key, _)| key.clone());
                 if let Some(oldest) = oldest {
@@ -669,16 +1075,23 @@ impl ProxyRuntime {
     }
 
     async fn record_breaker_failure_locked(&self, proxy_id: i64) {
-        let config = self.runtime_settings.read().await.circuit;
+        let config = self
+            .runtime_settings
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .circuit;
         {
-            let mut metrics = self.metrics.write().await;
+            let mut metrics = self.metrics.write().unwrap_or_else(|e| e.into_inner());
             metrics
                 .entry(proxy_id)
                 .or_insert_with(ProxyMetrics::new)
                 .push(false, None);
         }
         let just_opened = {
-            let mut breakers = self.circuit_breakers.write().await;
+            let mut breakers = self
+                .circuit_breakers
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
             let breaker = breakers
                 .entry(proxy_id)
                 .or_insert_with(|| CircuitBreaker::new(config));
@@ -691,7 +1104,7 @@ impl ProxyRuntime {
             // 熔断器刚打开，说明真实流量已连续失败，立即把状态刷成 inactive，
             // 让主动测活以更短的“恢复间隔”盯住它。
             if self.apply_passive_status_locked(proxy_id, "inactive", None) {
-                let mut metrics = self.metrics.write().await;
+                let mut metrics = self.metrics.write().unwrap_or_else(|e| e.into_inner());
                 let metric = metrics.entry(proxy_id).or_insert_with(ProxyMetrics::new);
                 metric.pushed_status = Some("inactive".to_string());
             }
@@ -702,7 +1115,7 @@ impl ProxyRuntime {
     pub async fn recent_success_map(&self) -> HashMap<i64, i64> {
         self.metrics
             .read()
-            .await
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .map(|(id, metric)| (*id, metric.last_success))
             .collect()
@@ -711,6 +1124,7 @@ impl ProxyRuntime {
     pub async fn record_probe_result(
         &self,
         proxy: &ProxyRecord,
+        generation: Option<u64>,
         probe_started_at: i64,
         desired_status: Option<&str>,
         response_time: Option<i64>,
@@ -719,10 +1133,20 @@ impl ProxyRuntime {
         let proxy_id = proxy.id;
         let status_lock = self.status_lock(proxy_id).await;
         let _guard = status_lock.lock().await;
+        if self
+            .db
+            .routing_snapshot()
+            .node_generations
+            .get(&proxy_id)
+            .copied()
+            != generation
+        {
+            return Err(anyhow!("代理配置代号在测试期间已变化，已丢弃旧测试结果"));
+        }
         let traffic_proved_alive = self
             .metrics
             .read()
-            .await
+            .unwrap_or_else(|e| e.into_inner())
             .get(&proxy_id)
             .is_some_and(|metric| metric.last_success > probe_started_at);
         let applied_status = if desired_status == Some("inactive") && traffic_proved_alive {
@@ -730,27 +1154,54 @@ impl ProxyRuntime {
         } else {
             desired_status
         };
-        if !self
-            .db
-            .record_proxy_probe_result(proxy, applied_status, response_time, success)?
-        {
-            return Err(anyhow!(
-                "代理配置在测试结果写入前发生变化，已丢弃旧测试结果"
-            ));
-        }
+        let revision = if applied_status.is_some() {
+            self.db.reserve_status_revision(proxy_id)
+        } else {
+            self.db.status_revision(proxy_id)
+        };
         if success {
             self.record_breaker_success(proxy_id).await;
         }
         if let Some(status) = applied_status {
-            let mut metrics = self.metrics.write().await;
+            let mut metrics = self.metrics.write().unwrap_or_else(|e| e.into_inner());
             let metric = metrics.entry(proxy_id).or_insert_with(ProxyMetrics::new);
+            if success && metric.pushed_status.as_deref() == Some("inactive") {
+                metric.learning_remaining = 3;
+            }
             metric.pushed_status = Some(status.to_string());
+        }
+        // Publish runtime health under the short status guard, then persist off
+        // the async executor. SQL must never keep a business connection waiting
+        // for this guard. Generation + revision reject stale queued writes.
+        drop(_guard);
+        let db = self.db.clone();
+        let observed = proxy.clone();
+        let stored_status = applied_status.map(str::to_string);
+        let updated = tokio::task::spawn_blocking(move || {
+            db.persist_probe_result(
+                &observed,
+                generation,
+                revision,
+                stored_status.as_deref(),
+                response_time,
+                success,
+            )
+        })
+        .await??;
+        if !updated {
+            return Err(anyhow!(
+                "代理配置在测试结果写入前发生变化，已丢弃旧测试结果"
+            ));
         }
         Ok((applied_status.map(str::to_string), traffic_proved_alive))
     }
 
     async fn status_lock(&self, proxy_id: i64) -> Arc<Mutex<()>> {
         let mut locks = self.status_locks.lock().await;
+        let snapshot = self.db.routing_snapshot();
+        locks.retain(|id, lock| {
+            Arc::strong_count(lock) > 1 || snapshot.node_generations.contains_key(id)
+        });
         locks
             .entry(proxy_id)
             .or_insert_with(|| Arc::new(Mutex::new(())))
@@ -768,38 +1219,25 @@ impl ProxyRuntime {
         status: &str,
         response_time: Option<i64>,
     ) -> bool {
-        match self
-            .db
-            .update_proxy_status(proxy_id, status, response_time, 0, 0)
-        {
-            Ok(true) => {}
-            Ok(false) => return false,
-            Err(error) => {
-                eprintln!("被动更新代理状态失败 proxy_id={proxy_id}: {error:#}");
-                return false;
-            }
-        }
-        if let Ok(Some(proxy)) = self.db.get_proxy(proxy_id) {
-            let _ = self.events.send(ServerEvent {
-                event_type: "proxy_tested".to_string(),
-                data: json!({
-                    "proxy": proxy,
-                    "result": {
-                        "success": status == "active",
-                        "responseTime": response_time.unwrap_or(0)
-                    },
-                    "passive": true
-                }),
-                timestamp: now_millis(),
-            });
-        }
-        true
+        let snapshot = self.db.routing_snapshot();
+        snapshot
+            .proxies
+            .iter()
+            .find(|proxy| proxy.id == proxy_id)
+            .is_some_and(|proxy| {
+                self.database_worker.status(
+                    proxy.clone(),
+                    snapshot.node_generations[&proxy_id],
+                    status,
+                    response_time,
+                )
+            })
     }
 
     async fn resolve_target(&self, mut request: TargetRequest) -> TargetRequest {
         if request.address_type == ADDR_DOMAIN {
             let mappings = self.dns_cache.read().await;
-            if let Some(mapped) = mappings.get(&request.host.to_lowercase()) {
+            if let Some(mapped) = mappings.get(&crate::routing::normalize_host(&request.host)) {
                 request.host = mapped.clone();
                 request.address_type = ADDR_IPV4;
             }
@@ -851,9 +1289,28 @@ pub async fn serve(runtime: Arc<ProxyRuntime>, host: String, port: u16) -> Resul
     println!("混合代理负载均衡服务器运行在 {host}:{port}（SOCKS5/HTTP）");
 
     loop {
+        // Admission before spawn: at most 1024 live client tasks, no unbounded waiting queue.
+        let connection_permit = runtime.connection_slots.clone().acquire_owned().await?;
         let (client, addr) = match listener.accept().await {
             Ok(accepted) => accepted,
             Err(error) => {
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::Interrupted
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::WouldBlock
+                ) {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+                if error
+                    .raw_os_error()
+                    .is_some_and(|code| [23, 24, 10024, 10055].contains(&code))
+                {
+                    eprintln!("代理 accept 资源不足，保留监听并退避: {error}");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
                 runtime
                     .set_service_status(ProxyServiceStatus {
                         state: "failed".to_string(),
@@ -868,6 +1325,7 @@ pub async fn serve(runtime: Arc<ProxyRuntime>, host: String, port: u16) -> Resul
         };
         let runtime = runtime.clone();
         tokio::spawn(async move {
+            let _connection_permit = connection_permit;
             if let Err(error) = handle_client(runtime, client, addr).await {
                 eprintln!("处理客户端连接失败 {addr}: {error:#}");
             }
@@ -883,7 +1341,8 @@ async fn handle_client(
     let start = Instant::now();
     let inbound_auth = runtime.inbound_auth().await;
     let request = timeout(Duration::from_secs(5), async {
-        let initial = read_some_with_timeout(&mut client, 1000).await?;
+        let _handshake_permit = runtime.handshake_slots.clone().acquire_owned().await?;
+        let initial = sniff_protocol(&mut client).await?;
         if initial.first().copied() == Some(SOCKS_VERSION) {
             handle_socks5_handshake(&mut client, initial, &inbound_auth).await
         } else if looks_like_http_proxy_request(&initial) {
@@ -898,13 +1357,38 @@ async fn handle_client(
     let original_host = request.original_host.clone();
     let original_port = request.port;
     let request = runtime.resolve_target(request).await;
-    match connect_with_fail_fast(runtime.clone(), &request, start).await {
+    let connect_start = Instant::now();
+    let budget = Duration::from_millis(
+        runtime
+            .runtime_settings
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .fail_fast
+            .total_timeout_ms,
+    );
+    let deadline = tokio::time::Instant::from_std(connect_start + budget);
+    let connection = tokio::time::timeout_at(
+        deadline,
+        connect_with_fail_fast(runtime.clone(), &request, connect_start),
+    )
+    .await
+    .unwrap_or_else(|_| Err(anyhow!("代理建连总截止时间已到")));
+    match connection {
         Ok((selected_proxy, mut upstream)) => {
             let proxy_id = selected_proxy.id;
-            if let Err(error) =
-                complete_client_handshake(&mut client, &mut upstream, &request).await
+            let prefetched_bytes = upstream.prefetched_response.len() as u64;
+            let initial_bytes = upstream
+                .outbound_initial_payload
+                .as_ref()
+                .map_or(request.initial_payload.len(), Vec::len)
+                as u64;
+            if let Err(error) = tokio::time::timeout_at(
+                deadline,
+                complete_client_handshake(&mut client, &mut upstream, &request),
+            )
+            .await
+            .unwrap_or_else(|_| Err(anyhow!("代理连接交付超时")))
             {
-                runtime.decrement_active(proxy_id).await;
                 let error_message = error.to_string();
                 runtime
                     .record_request(RequestLogEntry {
@@ -925,18 +1409,91 @@ async fn handle_client(
                     proxy_id: Some(proxy_id),
                     target_host: &original_host,
                     target_port: i64::from(original_port),
-                    success: true,
+                    success: upstream.target_verified
+                        && request.inbound != InboundProtocol::HttpForward,
                     response_time: Some(response_time),
                     error_message: None,
-                    result_type: if upstream.target_verified {
-                        "proxy_connected"
+                    result_type: if upstream.target_verified
+                        && request.inbound != InboundProtocol::HttpForward
+                    {
+                        "tunnel_established"
                     } else {
-                        "request_forwarded"
+                        "forwarded_unverified"
                     },
                 })
                 .await;
-            let copy_result = io::copy_bidirectional(&mut client, &mut upstream.stream).await;
-            runtime.decrement_active(proxy_id).await;
+            let transfer_start = Instant::now();
+            let counters = Arc::new(http_observer::TransferCounters::default());
+            counters
+                .read
+                .store(prefetched_bytes, std::sync::atomic::Ordering::Relaxed);
+            counters
+                .written
+                .store(initial_bytes, std::sync::atomic::Ordering::Relaxed);
+            let copy_result = if request.inbound == InboundProtocol::HttpForward {
+                let (sender, receiver) = tokio::sync::oneshot::channel();
+                let transfer = async {
+                    let mut observed = http_observer::HttpObserver::with_counters(
+                        &mut upstream.stream,
+                        Some(sender),
+                        counters.clone(),
+                    );
+                    io::copy_bidirectional(&mut client, &mut observed).await
+                };
+                let observe = async {
+                    if let Ok(status) = receiver.await {
+                        let _guard = runtime.lock_proxy_status(proxy_id).await;
+                        if runtime
+                            .db
+                            .routing_snapshot()
+                            .node_generations
+                            .get(&proxy_id)
+                            == Some(&selected_proxy.generation)
+                        {
+                            if status == 407 {
+                                runtime.record_breaker_failure_locked(proxy_id).await;
+                            }
+                            let detail = format!("HTTP {status}");
+                            runtime
+                                .record_request(RequestLogEntry {
+                                    proxy_id: Some(proxy_id),
+                                    target_host: &original_host,
+                                    target_port: i64::from(original_port),
+                                    success: status != 407,
+                                    response_time: Some(start.elapsed().as_millis() as i64),
+                                    error_message: Some(&detail),
+                                    result_type: "upstream_response_observed",
+                                })
+                                .await;
+                        }
+                    }
+                };
+                tokio::join!(transfer, observe).0
+            } else {
+                let mut observed = http_observer::HttpObserver::with_counters(
+                    &mut upstream.stream,
+                    None,
+                    counters.clone(),
+                );
+                io::copy_bidirectional(&mut client, &mut observed).await
+            };
+            let details = json!({"durationMs": transfer_start.elapsed().as_millis(), "bytesSent": counters.written.load(std::sync::atomic::Ordering::Relaxed), "bytesReceived": counters.read.load(std::sync::atomic::Ordering::Relaxed), "closeReason": copy_result.as_ref().err().map_or_else(|| "eof".to_string(), ToString::to_string), "stage": "transfer"}).to_string();
+            runtime
+                .record_request(RequestLogEntry {
+                    proxy_id: Some(proxy_id),
+                    target_host: &original_host,
+                    target_port: i64::from(original_port),
+                    success: copy_result.is_ok(),
+                    response_time: None,
+                    error_message: Some(&details),
+                    result_type: if copy_result.is_ok() {
+                        "transfer_finished"
+                    } else {
+                        "transfer_error"
+                    },
+                })
+                .await;
+            drop(selected_proxy);
             if let Err(error) = copy_result {
                 eprintln!(
                     "代理隧道传输中断: target={original_host}:{original_port}, proxy_id={proxy_id}, error={error}"
@@ -967,25 +1524,34 @@ async fn connect_with_fail_fast(
     runtime: Arc<ProxyRuntime>,
     request: &TargetRequest,
     start: Instant,
-) -> Result<(ProxyRecord, ConnectedUpstream)> {
-    let config = runtime.runtime_settings.read().await.fail_fast;
+) -> Result<(ConnectionLease, ConnectedUpstream)> {
+    let config = runtime
+        .runtime_settings
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .fail_fast;
 
     let total_timeout = Duration::from_millis(config.total_timeout_ms);
     let mut attempted = 0usize;
     let mut excluded = HashSet::new();
     let mut errors = Vec::new();
+    let mut failover_started: Option<Instant> = None;
     while !config.enabled || attempted < config.max_attempts {
         if start.elapsed() >= total_timeout {
             return Err(anyhow!("总超时: {}", errors.join("; ")));
         }
-        let Some(proxy) = runtime.reserve_proxy(request, &excluded).await? else {
+        let Some(mut proxy) = timeout(
+            total_timeout.saturating_sub(start.elapsed()),
+            runtime.reserve_proxy(request, &excluded),
+        )
+        .await
+        .map_err(|_| anyhow!("选路等待超时"))??
+        else {
             break;
         };
         excluded.insert(proxy.id);
         let remaining = total_timeout.saturating_sub(start.elapsed());
         if remaining.is_zero() {
-            runtime.decrement_active(proxy.id).await;
-            runtime.cancel_half_open_attempt(proxy.id, request).await;
             return Err(anyhow!("总超时: {}", errors.join("; ")));
         }
         attempted += 1;
@@ -997,19 +1563,49 @@ async fn connect_with_fail_fast(
         )
         .await
         .unwrap_or_else(|_| Err(anyhow!("{}超时", scope.label())));
-        let attempt_elapsed = attempt_started.elapsed().as_millis() as i64;
+        let attempt_elapsed_us = attempt_started.elapsed().as_micros() as u64;
+        if attempt.as_ref().err().is_some_and(is_local_network_error) {
+            scope = FailureScope::Network;
+        }
+        runtime.telemetry.record(
+            "attempt_total",
+            attempt_started.elapsed().as_micros() as u64,
+        );
         let _status_guard = runtime.lock_proxy_status(proxy.id).await;
         let configuration_current = match runtime.proxy_configuration_is_current(&proxy) {
             Ok(current) => current,
             Err(error) => {
-                runtime.decrement_active(proxy.id).await;
-                runtime.cancel_half_open_attempt(proxy.id, request).await;
                 return Err(error.context("连接结束后校验代理配置失败"));
             }
         };
-        if !configuration_current {
-            runtime.decrement_active(proxy.id).await;
-            runtime.cancel_half_open_attempt(proxy.id, request).await;
+        let owns = |breaker: &CircuitBreaker| {
+            breaker
+                .attempt
+                .as_ref()
+                .is_none_or(|token| token.ptr_eq(&Arc::downgrade(&proxy.attempt)))
+        };
+        let owns_global = runtime
+            .circuit_breakers
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&proxy.id)
+            .is_none_or(owns);
+        let owns_target = runtime
+            .target_circuits
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&TargetRouteKey::new(proxy.id, request))
+            .is_none_or(|target| owns(&target.breaker));
+        if !configuration_current
+            || !owns_global
+            || !owns_target
+            || runtime
+                .db
+                .routing_snapshot()
+                .node_generations
+                .get(&proxy.id)
+                != Some(&proxy.generation)
+        {
             attempted = attempted.saturating_sub(1);
             errors.push(format!("{}: 连接期间代理配置已变化", proxy.name));
             continue;
@@ -1017,23 +1613,57 @@ async fn connect_with_fail_fast(
 
         match attempt {
             Ok(stream) => {
+                if let Some(failed_at) = failover_started {
+                    runtime.telemetry.record(
+                        "failover_after_failure",
+                        failed_at.elapsed().as_micros() as u64,
+                    );
+                }
+                runtime
+                    .telemetry
+                    .record("proxy_tcp_auth", stream.proxy_latency_us);
+                runtime.telemetry.record(
+                    "target_handshake",
+                    attempt_elapsed_us.saturating_sub(stream.proxy_latency_us),
+                );
+                runtime
+                    .telemetry
+                    .record("connect_total", start.elapsed().as_micros() as u64);
+                proxy.dial_permit = None;
+                proxy.global_dial_permit = None;
+                runtime.dial_ready.notify_waiters();
                 runtime.record_breaker_success(proxy.id).await;
+                if let Some(policy) = &proxy.failover_policy {
+                    runtime
+                        .sticky_routes
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remember(
+                            policy,
+                            &runtime.db.routing_snapshot(),
+                            proxy.id,
+                            proxy.generation,
+                        );
+                }
                 if stream.target_verified {
                     runtime
                         .target_circuits
                         .write()
-                        .await
+                        .unwrap_or_else(|e| e.into_inner())
                         .remove(&TargetRouteKey::new(proxy.id, request));
                     // 评分只计当前节点自身的建连耗时；请求日志仍记录用户等待的总耗时。
                     runtime
-                        .record_connection_success_locked(proxy.id, attempt_elapsed)
+                        .record_connection_success_locked(
+                            proxy.id,
+                            (stream.proxy_latency_us / 1000) as i64,
+                        )
                         .await;
                 } else {
                     runtime
                         .cancel_target_half_open_attempt(proxy.id, request)
                         .await;
                 }
-                #[cfg(debug_assertions)]
+                #[cfg(all(debug_assertions, not(test)))]
                 eprintln!(
                     "代理路由成功: target={}:{}, proxy_id={}, proxy_name={}, proxy_type={}",
                     request.original_host, request.port, proxy.id, proxy.name, proxy.proxy_type
@@ -1041,10 +1671,25 @@ async fn connect_with_fail_fast(
                 return Ok((proxy, stream));
             }
             Err(error) => {
+                failover_started.get_or_insert_with(Instant::now);
+                if scope == FailureScope::Network {
+                    runtime
+                        .telemetry
+                        .record("local_network_failure", attempt_elapsed_us);
+                    return Err(error.context("本地网络不可用"));
+                }
+                runtime.telemetry.record(
+                    if scope == FailureScope::Proxy {
+                        "proxy_failure"
+                    } else {
+                        "target_failure"
+                    },
+                    attempt_started.elapsed().as_micros() as u64,
+                );
                 runtime
                     .record_route_failure_locked(proxy.id, request, scope)
                     .await;
-                runtime.decrement_active(proxy.id).await;
+                #[cfg(all(debug_assertions, not(test)))]
                 eprintln!(
                     "代理路由尝试失败: target={}:{}, proxy_id={}, proxy_name={}, scope={}, error={error:#}",
                     request.original_host, request.port, proxy.id, proxy.name, scope.label()
@@ -1055,7 +1700,7 @@ async fn connect_with_fail_fast(
     }
 
     if attempted == 0 && errors.is_empty() {
-        return Err(anyhow!("所有候选代理当前均处于熔断状态"));
+        return Err(anyhow!("所有候选代理当前均处于熔断状态或拨号容量已满"));
     }
     Err(anyhow!("所有代理都失败: {}", errors.join("; ")))
 }
@@ -1066,22 +1711,28 @@ async fn connect_through_proxy(
     scope: &mut FailureScope,
 ) -> Result<ConnectedUpstream> {
     match proxy.proxy_type.as_str() {
-        "socks5" => connect_socks5(proxy, request, scope)
-            .await
-            .map(|stream| ConnectedUpstream {
-                stream,
-                outbound_initial_payload: None,
-                prefetched_response: Vec::new(),
-                target_verified: true,
-            }),
-        "socks4" => connect_socks4(proxy, request, scope)
-            .await
-            .map(|stream| ConnectedUpstream {
-                stream,
-                outbound_initial_payload: None,
-                prefetched_response: Vec::new(),
-                target_verified: true,
-            }),
+        "socks5" => {
+            connect_socks5(proxy, request, scope)
+                .await
+                .map(|(stream, proxy_latency_us)| ConnectedUpstream {
+                    stream,
+                    outbound_initial_payload: None,
+                    prefetched_response: Vec::new(),
+                    target_verified: true,
+                    proxy_latency_us,
+                })
+        }
+        "socks4" => {
+            connect_socks4(proxy, request, scope)
+                .await
+                .map(|(stream, proxy_latency_us)| ConnectedUpstream {
+                    stream,
+                    outbound_initial_payload: None,
+                    prefetched_response: Vec::new(),
+                    target_verified: true,
+                    proxy_latency_us,
+                })
+        }
         "http" | "https" => connect_http_proxy(proxy, request, scope).await,
         other => Err(anyhow!("不支持的代理类型: {other}")),
     }
@@ -1091,7 +1742,8 @@ async fn connect_socks5(
     proxy: &ProxyRecord,
     request: &TargetRequest,
     scope: &mut FailureScope,
-) -> Result<TcpStream> {
+) -> Result<(TcpStream, u64)> {
+    let start = Instant::now();
     let mut stream = TcpStream::connect((proxy.host.as_str(), proxy.port as u16)).await?;
     let use_auth = proxy
         .username
@@ -1130,6 +1782,7 @@ async fn connect_socks5(
         return Err(anyhow!("SOCKS5服务器未接受认证方式"));
     }
 
+    let proxy_latency_us = start.elapsed().as_micros() as u64;
     *scope = FailureScope::Target;
     stream
         .write_all(&build_socks5_connect_request(request)?)
@@ -1149,20 +1802,22 @@ async fn connect_socks5(
     }
     *scope = FailureScope::Proxy;
     read_socks5_bind_address(&mut stream, header[3]).await?;
-    Ok(stream)
+    Ok((stream, proxy_latency_us))
 }
 
 async fn connect_socks4(
     proxy: &ProxyRecord,
     request: &TargetRequest,
     scope: &mut FailureScope,
-) -> Result<TcpStream> {
+) -> Result<(TcpStream, u64)> {
+    let start = Instant::now();
     let mut stream = TcpStream::connect((proxy.host.as_str(), proxy.port as u16)).await?;
     // SOCKS4 只有 USERID 字段，没有密码认证；配置层会拒绝 SOCKS4 密码。
     let userid = proxy.username.as_deref().unwrap_or("");
     if userid.len() > 255 {
         return Err(anyhow!("SOCKS4 用户标识过长"));
     }
+    let proxy_latency_us = start.elapsed().as_micros() as u64;
     *scope = FailureScope::Target;
     let packet = build_socks4_connect_request(request, userid)?;
     stream.write_all(&packet).await?;
@@ -1178,7 +1833,7 @@ async fn connect_socks4(
         }
         return Err(anyhow!("{}", socks4_reply_message(response[1])));
     }
-    Ok(stream)
+    Ok((stream, proxy_latency_us))
 }
 
 fn build_socks4_connect_request(request: &TargetRequest, userid: &str) -> Result<Vec<u8>> {
@@ -1222,7 +1877,9 @@ async fn connect_http_proxy(
     request: &TargetRequest,
     scope: &mut FailureScope,
 ) -> Result<ConnectedUpstream> {
+    let start = Instant::now();
     let mut stream = TcpStream::connect((proxy.host.as_str(), proxy.port as u16)).await?;
+    let proxy_latency_us = start.elapsed().as_micros() as u64;
     *scope = FailureScope::Target;
     if request.inbound == InboundProtocol::HttpForward {
         let payload = build_http_forward_proxy_payload(proxy, request)?;
@@ -1231,6 +1888,7 @@ async fn connect_http_proxy(
             outbound_initial_payload: Some(payload),
             prefetched_response: Vec::new(),
             target_verified: false,
+            proxy_latency_us,
         });
     }
 
@@ -1269,6 +1927,7 @@ async fn connect_http_proxy(
         outbound_initial_payload: None,
         prefetched_response,
         target_verified: true,
+        proxy_latency_us,
     })
 }
 
@@ -1603,6 +2262,7 @@ async fn send_inbound_error(
     Ok(())
 }
 
+#[cfg(test)]
 async fn read_some_with_timeout(stream: &mut TcpStream, timeout_ms: u64) -> Result<Vec<u8>> {
     let mut buffer = vec![0u8; 1024];
     let size = timeout(Duration::from_millis(timeout_ms), stream.read(&mut buffer)).await??;
@@ -1686,6 +2346,9 @@ async fn read_http_request_header(
     let maximum_wait = Duration::from_millis(timeout_ms);
     loop {
         if let Some((header, remainder)) = split_http_header(&buffer) {
+            if header.len() > 64 * 1024 {
+                return Err(anyhow!("HTTP请求头过大"));
+            }
             return Ok((
                 String::from_utf8(header.to_vec()).context("HTTP请求头不是有效UTF-8")?,
                 remainder.to_vec(),
@@ -1701,7 +2364,7 @@ async fn read_http_request_header(
             return Err(anyhow!("HTTP请求头未完整读取"));
         }
         buffer.extend_from_slice(&temp[..size]);
-        if buffer.len() > 64 * 1024 {
+        if buffer.len() > 64 * 1024 && split_http_header(&buffer).is_none() {
             return Err(anyhow!("HTTP请求头过大"));
         }
     }
@@ -1771,6 +2434,30 @@ fn looks_like_http_proxy_request(data: &[u8]) -> bool {
     ]
     .iter()
     .any(|method| prefix.starts_with(method))
+}
+
+async fn sniff_protocol(stream: &mut TcpStream) -> Result<Vec<u8>> {
+    const METHODS: [&[u8]; 9] = [
+        b"CONNECT ",
+        b"GET ",
+        b"POST ",
+        b"HEAD ",
+        b"PUT ",
+        b"DELETE ",
+        b"OPTIONS ",
+        b"PATCH ",
+        b"TRACE ",
+    ];
+    let mut prefix = Vec::with_capacity(8);
+    loop {
+        prefix.push(stream.read_u8().await?);
+        if prefix[0] == SOCKS_VERSION || looks_like_http_proxy_request(&prefix) {
+            return Ok(prefix);
+        }
+        if !METHODS.iter().any(|method| method.starts_with(&prefix)) {
+            return Err(anyhow!("不支持的入站代理协议"));
+        }
+    }
 }
 
 fn build_socks5_connect_request(request: &TargetRequest) -> Result<Vec<u8>> {
@@ -1879,33 +2566,43 @@ fn prioritize_route_status(proxies: Vec<ProxyRecord>) -> Vec<ProxyRecord> {
     preferred
 }
 
-fn stable_hash(value: &str) -> usize {
-    let mut hash: i32 = 0;
-    for byte in value.bytes() {
-        hash = hash.wrapping_mul(31).wrapping_add(byte as i32);
-    }
-    hash.unsigned_abs() as usize
-}
-
 impl ProxyMetrics {
     fn new() -> Self {
         Self {
-            requests: VecDeque::new(),
+            requests: VecDeque::with_capacity(MAX_METRIC_SAMPLES),
             score: 50.0,
-            last_used: now_millis(),
+            last_used: monotonic_millis(),
             last_success: 0,
             pushed_status: None,
+            successes: 0,
+            time_sum: 0,
+            time_count: 0,
+            learning_remaining: 3,
         }
     }
 
     fn push(&mut self, success: bool, response_time: Option<i64>) {
-        let now = now_millis();
+        let now = monotonic_millis();
+        self.prune(now);
+        if self.requests.len() == MAX_METRIC_SAMPLES {
+            self.remove_oldest();
+        }
+        self.successes += i64::from(success);
+        self.learning_remaining = if success {
+            self.learning_remaining.saturating_sub(1)
+        } else {
+            0
+        };
+        let response_time = response_time.map(|time| time.clamp(0, 86_400_000));
+        if let Some(time) = response_time {
+            self.time_sum += time;
+            self.time_count += 1;
+        }
         self.requests.push_back(RequestMetric {
             timestamp: now,
             success,
             response_time,
         });
-        self.prune(now);
         self.last_used = now;
         if success {
             self.last_success = now;
@@ -1921,7 +2618,7 @@ impl ProxyMetrics {
             .map(|metric| now.saturating_sub(metric.timestamp) > METRICS_WINDOW_MS)
             .unwrap_or(false)
         {
-            self.requests.pop_front();
+            self.remove_oldest();
         }
         if self.requests.len() != old_len {
             self.score = if self.requests.is_empty() {
@@ -1933,27 +2630,89 @@ impl ProxyMetrics {
     }
 
     fn summary(&self) -> (i64, i64, i64) {
-        let success = self.requests.iter().filter(|item| item.success).count() as i64;
-        let failed = self.requests.len() as i64 - success;
-        let times = self
-            .requests
-            .iter()
-            .filter_map(|item| item.response_time)
-            .collect::<Vec<_>>();
-        let avg = if times.is_empty() {
-            0
-        } else {
-            times.iter().sum::<i64>() / times.len() as i64
-        };
-        (success, failed, avg)
+        (
+            self.successes,
+            self.requests.len() as i64 - self.successes,
+            if self.time_count == 0 {
+                0
+            } else {
+                self.time_sum / self.time_count
+            },
+        )
+    }
+
+    fn remove_oldest(&mut self) {
+        if let Some(sample) = self.requests.pop_front() {
+            self.successes -= i64::from(sample.success);
+            if let Some(time) = sample.response_time {
+                self.time_sum -= time;
+                self.time_count -= 1;
+            }
+        }
     }
 
     fn calculate_score(&self) -> f64 {
         let (success, failed, avg_rt) = self.summary();
-        let total = (success + failed).max(1) as f64;
-        let success_rate = success as f64 / total;
+        // A small neutral prior avoids treating a single fast success as certainty.
+        let total = (success + failed + 4) as f64;
+        let success_rate = (success + 2) as f64 / total;
         (success_rate * 75.0 + latency_score(avg_rt) * 0.25).clamp(0.01, 100.0)
     }
+}
+
+pub(crate) fn monotonic_millis() -> i64 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    START
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_millis()
+        .min((i64::MAX - 1) as u128) as i64
+        + 1
+}
+
+/// Uses the same TCP/auth/target failure boundary as business routing, without health mutation.
+pub async fn probe_connection_health(
+    proxy: &ProxyRecord,
+    target: &url::Url,
+    budget: Duration,
+) -> Result<(), (&'static str, String)> {
+    let host = target.host_str().unwrap_or_default();
+    let request = TargetRequest {
+        host: host.into(),
+        original_host: host.into(),
+        port: target.port_or_known_default().unwrap_or(443),
+        address_type: address_type(host).unwrap_or(ADDR_DOMAIN),
+        inbound: InboundProtocol::HttpConnect,
+        initial_payload: Vec::new(),
+    };
+    let mut scope = FailureScope::Proxy;
+    timeout(budget, connect_through_proxy(proxy, &request, &mut scope))
+        .await
+        .unwrap_or_else(|_| Err(anyhow!("{}超时", scope.label())))
+        .map(|_| ())
+        .map_err(|error| {
+            (
+                if is_local_network_error(&error) {
+                    "network"
+                } else if scope == FailureScope::Proxy {
+                    "proxy"
+                } else {
+                    "target"
+                },
+                format!("{}: {error:#}", scope.label()),
+            )
+        })
+}
+
+fn is_local_network_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .any(|io| {
+            matches!(io.raw_os_error(), Some(10050 | 10051))
+                || cfg!(target_os = "linux") && matches!(io.raw_os_error(), Some(100 | 101))
+                || cfg!(target_os = "macos") && matches!(io.raw_os_error(), Some(50 | 51))
+        })
 }
 
 impl CircuitBreaker {
@@ -1964,6 +2723,7 @@ impl CircuitBreaker {
             threshold: config.failure_threshold,
             timeout_ms: config.timeout_ms,
             next_attempt: 0,
+            attempt: None,
         }
     }
 
@@ -1980,7 +2740,7 @@ impl CircuitBreaker {
         if self.state == "CLOSED" {
             return true;
         }
-        if self.state == "OPEN" && now_millis() >= self.next_attempt {
+        if self.can_attempt_snapshot() {
             self.state = "HALF_OPEN".to_string();
             return true;
         }
@@ -1991,33 +2751,55 @@ impl CircuitBreaker {
         if self.state == "CLOSED" {
             return true;
         }
-        self.state == "OPEN" && now_millis() >= self.next_attempt
+        (self.state == "OPEN" && monotonic_millis() >= self.next_attempt)
+            || (self.state == "HALF_OPEN"
+                && self
+                    .attempt
+                    .as_ref()
+                    .is_some_and(|token| token.upgrade().is_none()))
+    }
+
+    fn half_open_in_flight(&self) -> bool {
+        self.state == "HALF_OPEN"
+            && self
+                .attempt
+                .as_ref()
+                .is_none_or(|token| token.strong_count() > 0)
     }
 
     fn record_success(&mut self) {
         self.failures = 0;
         self.state = "CLOSED".to_string();
         self.next_attempt = 0;
+        self.attempt = None;
     }
 
     fn record_failure(&mut self) {
         self.failures += 1;
         if self.state == "HALF_OPEN" || self.failures >= self.threshold {
             self.state = "OPEN".to_string();
-            self.next_attempt = now_millis() + self.timeout_ms;
+            self.next_attempt = monotonic_millis().saturating_add(self.timeout_ms);
+            self.attempt = None;
         }
     }
 
     fn cancel_half_open_attempt(&mut self) {
         if self.state == "HALF_OPEN" {
             self.state = "OPEN".to_string();
-            self.next_attempt = now_millis().saturating_add(self.timeout_ms);
+            self.next_attempt = monotonic_millis().saturating_add(self.timeout_ms);
+            self.attempt = None;
         }
     }
 }
 
 #[cfg(test)]
 mod routing_tests;
+
+#[cfg(test)]
+mod benchmarks;
+
+#[cfg(test)]
+mod acceptance_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2045,6 +2827,16 @@ mod tests {
 
         updated.host = "127.0.0.2".to_string();
         assert!(!same_routing_configuration(&original, &updated));
+
+        let mut updated = original.clone();
+        updated.test_url = Some("https://probe.example.test/".into());
+        assert!(!crate::routing::same_node(&original, &updated));
+        let mut updated = original.clone();
+        updated.test_timeout = Some(original.test_timeout.unwrap_or(0) + 1);
+        assert!(!crate::routing::same_node(&original, &updated));
+        let mut updated = original.clone();
+        updated.skip_cert_verify = 1 - original.skip_cert_verify;
+        assert!(!crate::routing::same_node(&original, &updated));
     }
 
     #[test]

@@ -288,7 +288,25 @@ v*
 - macOS Apple Silicon
 - macOS Intel
 
-workflow 会创建正式 GitHub Release，并上传 Tauri bundle 和 Windows 便携 exe。普通提交不会触发发布。
+workflow 先运行三平台回归检查，随后构建并签名本地安装包，上传安装包及对应的 `.manifest.json`。所有选定平台成功后才将草稿发布为正式 GitHub Release；普通提交只运行检查，不触发发布。Release 内容来自仓库中的 `RELEASE_NOTES.md`，发布前应仅保留本次变更。
+
+### 更新验签配置（不需要应用商店证书）
+
+这是应用内更新包的 Ed25519 发布者验签，不是 Windows/macOS 应用签名，也不替代 Apple 公证。首次配置由仓库维护者在可信设备上执行一次：
+
+```powershell
+node scripts/update-signing.mjs generate "$HOME/proxy-load-keys/update.private.pem"
+```
+
+密钥必须存储在仓库外，妥善备份私钥并限制本机文件访问权限（Windows 请检查 ACL）。不要在聊天、日志或提交中粘贴私钥。配置 GitHub Actions：
+
+- Secret `PROXY_LOAD_UPDATE_PRIVATE_KEY`：私钥 PEM 文件完整内容。
+- Variable `PROXY_LOAD_UPDATE_PUBLIC_KEY`：相邻 `.pub` 文件的 Base64 公钥内容；构建时嵌入应用。
+- 可选 Secret `PROXY_LOAD_UPDATE_KEY_PASSWORD`：使用自行加密的 PEM 私钥时填写密码。
+
+缺少配置或公私钥不匹配会阻止 Release。私钥只传入签名步骤，不传给应用编译步骤。每份清单绑定版本、系统、架构、安装形式、文件名、长度及 SHA-256 摘要；镜像仅负责传输，不能提供或替换应用信任的公钥。缺签、验签失败或内容不符时拒绝安装，不降级为未验签更新。
+
+首次启用前，应通过可信渠道手动安装包含正确公钥的版本；旧的未验签客户端不会因服务器增加清单而自动获得验签能力。后续发布必须沿用同一私钥；直接替换公钥会使旧客户端拒绝新包，密钥轮换需要单独设计过渡。未配置公钥的开发构建仍可运行，但不能自动安装更新。本仓库不包含生产私钥，也不会由脚本自动配置仓库 Secrets。
 
 ## 运行端口和配置
 
@@ -302,7 +320,7 @@ workflow 会创建正式 GitHub Release，并上传 Tauri bundle 和 Windows 便
 | `periodic_test_interval` | `180000` | 活跃节点心跳测活间隔，单位毫秒 |
 | `probe_recovery_interval` | `180000` | 失败或未知节点重测间隔，单位毫秒 |
 | `probe_failure_threshold` | `2` | 定时测活连续失败多少次后标记离线 |
-| `startup_probe_enabled` | `true` | 应用启动时是否立即探测全部已启用代理；启动探测失败会直接标记离线 |
+| `startup_probe_enabled` | `true` | 应用启动时是否立即探测全部已启用代理；代理连接/认证失败可标记离线，单个测试站失败不会全局降级 |
 | `log_retention_days` | `7` | 流量日志及其派生统计保留天数 |
 | `circuit_failure_threshold` | `5` | 熔断失败阈值 |
 | `failfast_enabled` | `true` | 是否启用快速失败 |
@@ -325,6 +343,20 @@ workflow 会创建正式 GitHub Release，并上传 Tauri bundle 和 Windows 便
 
 Rust 后端启动时会自动创建表，并补齐缺失字段。
 
+代理选路使用内存配置快照，配置保存成功后用于新连接。请求日志由有界后台队列批写：最多 2048 项（为失败和状态事件预留 256 项），每批最多 128 项、合并等待最多 100ms。运行状态显示队列长度、丢弃数和持久化错误；队列满时优先保留失败事件，不无限增长。正常退出最多等待 5 秒刷盘，异常断电仍可能丢失未落盘记录。
+
+仪表盘聚合缓存最多 5 秒，清空日志和删除代理会使缓存失效，重启后从已有日志重建。删除代理沿用原有日志关联删除语义；清空后正在结束的新连接仍可产生新日志。历史日志使用固定 ID 快照，连续向后翻页使用游标；每页上限 200 条。
+
+四种负载策略保留原配置值。轮询与最小连接数平局按池独立轮转；按目标主机粘滞使用稳定成员 ID 的 HRW 排名，优先级排序不改变哈希身份。自适应保留质量/当前负载选优，指标最多保留五分钟内最近 2048 个样本；新节点及恢复节点获得有界学习机会，但不会绕过熔断。既有超时配置不会被新默认值覆盖。
+
+每个分组可继承全局算法或覆盖为四种算法之一。主机粘滞支持 0–86400 秒故障切换保持期：主节点故障后成功使用的备用节点，在保持期内优先用于同一目标的新连接；不会因每次成功访问而续期。备用节点失败、被禁用、分组规则或成员配置变更时失效；仅因拨号容量排队而换节点不会建立保持绑定。默认 0（关闭），已有分组默认继承全局算法。绑定缓存最多 4096 项，重启后清空。禁用节点可保留在成员列表中，但不参加自动测活和业务选路。
+
+代理服务限制为最多 1024 个已接收连接、128 个并发入站握手、全局 64 个及每节点 32 个同时拨号；入站握手预算为 5 秒，后续排队/选路/拨号/交付共享配置的建连总预算。选路临界区只做短时内存操作，数据库写入与网络等待在外部执行。全局拨号槽位使用异步公平队列；节点槽位满时释放选路锁及全局许可等待通知，不把容量不足记为节点故障。已经建立的隧道不受建连总超时限制；半关闭处理使用双向独立复制，并由原生 TCP 验收检查另一方向能否继续传输。失败切换只用于尚未发出业务数据的新连接，不重放 POST，也不迁移既有 TCP/TLS 会话。
+
+普通 HTTP 日志区分“已转发待响应”“上游已响应”和传输结束/错误，目标 HTTP 5xx 不直接判定代理全局故障；407 属于代理认证失败。传输记录包含双向字节数、持续时间和关闭原因。系统明确报告本地网络不可用时单独归类，不根据一批超时猜测本地断网。
+
+更新下载先验证不超过 16 KiB 的发布者签名清单，再写入独立会话目录中的流式 `.part` 文件，限制为 1 GiB，完成签名所绑定的摘要、大小及格式检查后才发布；取消与失败清理未完成文件。资产按系统、安装形式及 CPU 架构筛选，Windows 便携包验证 PE 架构，NSIS 允许为 64 位载荷使用 32 位安装器外壳。后端禁止重复安装，并保留 Windows 辅助进程等待旧进程退出的交接。未接入操作系统应用签名或 Apple 公证。
+
 当前入口是 Tauri：
 
 ```bash
@@ -337,8 +369,38 @@ npm start
 
 ```bash
 npm run build:web
-cargo check --manifest-path src-tauri/Cargo.toml
+npm run test:frontend
+npm run test:signing
+cargo fmt --manifest-path src-tauri/Cargo.toml --check
+cargo test --manifest-path src-tauri/Cargo.toml --locked
+cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked -- -D warnings
 ```
+
+PR 与 main 分支推送会执行 Windows / Linux / macOS 回归检查；Release 构建依赖同一提交的检查通过。可手动运行确定性本地模拟基准：
+
+```bash
+cargo test --release --manifest-path src-tauri/Cargo.toml --locked benchmark_loopback_matrix -- --ignored --nocapture
+cargo test --manifest-path src-tauri/Cargo.toml --locked million_metric_updates -- --nocapture
+```
+
+设置 `PROXY_LOAD_BENCH_OUTPUT` 输出 JSON；`PROXY_LOAD_BENCH_DB=disk` 使用实际临时 SQLite WAL 数据库，默认预置 100000 条历史日志（可用 `PROXY_LOAD_BENCH_HISTORY` 调整）。默认内存模式用于快速回归，不能代表磁盘性能。PowerShell 示例：
+
+```powershell
+$env:PROXY_LOAD_BENCH_DB = 'disk'
+$env:PROXY_LOAD_BENCH_OUTPUT = "$PWD/docs/performance-release-disk.json"
+cargo test --release --manifest-path src-tauri/Cargo.toml --locked benchmark_loopback_matrix -- --ignored --nocapture
+```
+
+矩阵覆盖 3/10/100 节点、1/32/256 并发、短连接/保留 100ms 的隧道/混合、认证失败、上游握手超时及单目标拒绝，同时运行日志、统计查询与优先级更新。可以用 `PROXY_LOAD_BENCH_NODES`、`PROXY_LOAD_BENCH_CONCURRENCY`、`PROXY_LOAD_BENCH_SCENARIOS`（逗号分隔）筛选。基准单次拨号预算 500ms、总建连预算 5 秒、失败阈值 1；只作用于测试实例。输出构建模式、历史量、冷暖阶段延迟分位数、各阶段耗时、可达率、选路锁等待/持有、故障后切换耗时、事件循环延迟、后台队列、分布和进程资源。冷暖是单次运行的前后半段，不是独立稳定态测试；不代表公网性能或小时级转发吞吐，不承诺无感会话迁移。比较性能时单独运行基准，避免同时编译或执行完整测试。
+
+常规测试还覆盖取消释放及建连截止时间之后的原生 TCP 大文件双向转发。原生半关闭验收和不经过代理的裸 TCP 对照默认忽略，由 CI 单独执行：
+
+```bash
+cargo test --manifest-path src-tauri/Cargo.toml --locked native_half_close -- --ignored
+cargo test --manifest-path src-tauri/Cargo.toml --locked native_tcp_half_close_baseline -- --ignored
+```
+
+如果两者均失败，需要先排查运行环境；不能以 Tokio 内存流测试替代原生网络验收。三平台 CI 配置不等同于实际已通过，真实浏览器/WebSocket、长时间运行、系统休眠恢复及安装器仍需要在目标设备验证。
 
 完整打包检查：
 

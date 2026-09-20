@@ -29,6 +29,11 @@ env:
   RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
 
 jobs:
+  checks:
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref }}
+
   prepare:
     name: Prepare build matrix
     runs-on: ubuntu-latest
@@ -65,7 +70,7 @@ jobs:
 
   build:
     name: Build ${{ matrix.label }}
-    needs: prepare
+    needs: [prepare, checks]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -74,6 +79,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref }}
 
       - name: Install Linux system dependencies
         if: runner.os == 'Linux'
@@ -109,52 +116,43 @@ jobs:
         run: |
           node -e "const fs = require('fs'); const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8')); console.log('version=' + pkg.version)" >> "$GITHUB_OUTPUT"
 
-      - name: Build and upload Tauri bundles
+      - name: Validate update signing configuration
+        env:
+          PROXY_LOAD_UPDATE_PRIVATE_KEY: ${{ secrets.PROXY_LOAD_UPDATE_PRIVATE_KEY }}
+          PROXY_LOAD_UPDATE_PUBLIC_KEY: ${{ vars.PROXY_LOAD_UPDATE_PUBLIC_KEY }}
+          PROXY_LOAD_UPDATE_KEY_PASSWORD: ${{ secrets.PROXY_LOAD_UPDATE_KEY_PASSWORD }}
+        run: node scripts/update-signing.mjs check
+
+      - name: Build Tauri bundles
+        id: tauri-build
         uses: tauri-apps/tauri-action@action-v0.6.2
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PROXY_LOAD_UPDATE_PUBLIC_KEY: ${{ vars.PROXY_LOAD_UPDATE_PUBLIC_KEY }}
         with:
           tauriScript: npm run tauri
           args: ${{ matrix.args }}
-          tagName: ${{ env.RELEASE_TAG }}
-          releaseName: proxy-load ${{ env.RELEASE_TAG }}
-          releaseBody: |
-            ## Changes
 
-            ### 调整
-
-            - 国内加速镜像更换为 https://ghproxy.net，用于检查 GitHub 发布版本和下载更新包。
-            - 自适应选路纳入实时连接数，正在建连的请求也参与计数，降低并发请求集中到同一代理的情况。
-            - 移除代理重试间固定的 300ms 等待，每次重试重新比较当前候选负载。
-            - 新配置默认单次连接超时 5 秒、总超时 15 秒，最多尝试 3 个代理；已有保存配置保持不变。
-
-            ### 修复
-
-            - 区分代理连接或认证故障与目标链路故障，目标失败不再混入代理全局熔断和评分。
-            - 按代理、目标域名、实际连接地址和端口独立管理目标链路冷却，避免一个网站不可达影响其他目标。
-            - 修正成功代理的评分耗时，仅计算该节点自身建连时间，并清理过期的运行时评分样本。
-
-            ### 文档与测试
-
-            - 补充分组路由、默认分组、自动切换边界及高级配置说明。
-            - 新增 22 项回归测试，覆盖并发选路、故障隔离、重试边界、超时分类和业务请求不重放。
-          releaseDraft: false
-          prerelease: ${{ contains(env.RELEASE_TAG, '-') }}
-          assetNamePattern: proxy-load_${{ steps.package-version.outputs.version }}_[platform]_[arch][setup][ext]
-
-      - name: Upload Windows portable executable
-        if: runner.os == 'Windows'
-        shell: pwsh
+      - name: Sign and upload local build artifacts
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ env.RELEASE_TAG }}
-          PACKAGE_VERSION: ${{ steps.package-version.outputs.version }}
-        run: |
-          $portable = "src-tauri/target/release/proxy-load-tauri.exe"
-          if (-not (Test-Path $portable)) {
-            throw "Windows portable executable not found: $portable"
-          }
-          $asset = "proxy-load_${env:PACKAGE_VERSION}_x64-portable.exe"
-          Copy-Item -Path $portable -Destination $asset -Force
-          gh release upload $env:RELEASE_TAG $asset --clobber
+          BUILD_LABEL: ${{ matrix.label }}
+          TAURI_ARTIFACT_PATHS: ${{ steps.tauri-build.outputs.artifactPaths }}
+          PROXY_LOAD_UPDATE_PRIVATE_KEY: ${{ secrets.PROXY_LOAD_UPDATE_PRIVATE_KEY }}
+          PROXY_LOAD_UPDATE_PUBLIC_KEY: ${{ vars.PROXY_LOAD_UPDATE_PUBLIC_KEY }}
+          PROXY_LOAD_UPDATE_KEY_PASSWORD: ${{ secrets.PROXY_LOAD_UPDATE_KEY_PASSWORD }}
+        run: node scripts/publish-signed-release.mjs
+
+  publish:
+    name: Publish signed release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref }}
+      - name: Publish only after every selected build succeeds
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release edit "$RELEASE_TAG" --draft=false --notes-file RELEASE_NOTES.md
 

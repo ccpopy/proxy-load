@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     env, fs,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock, RwLock},
     time::Duration,
 };
 
@@ -17,13 +17,18 @@ use crate::models::{
 };
 
 const TRAFFIC_LOG_VISIBLE_AFTER_ID_KEY: &str = "traffic_log_visible_after_id";
+use crate::routing::{RoutingPool, RoutingSnapshot};
 
 #[derive(Clone)]
 pub struct Database {
     conn: Arc<Mutex<Connection>>,
     db_path: PathBuf,
+    routing: Arc<RwLock<Arc<RoutingSnapshot>>>,
+    query_cache: Arc<Mutex<HashMap<String, (std::time::Instant, Value)>>>,
+    status_revisions: Arc<Mutex<HashMap<i64, u64>>>,
 }
 
+#[cfg(test)]
 pub struct ProxyGroupSelection {
     pub group_name: String,
     pub proxy_ids: HashSet<i64>,
@@ -41,12 +46,44 @@ pub struct RequestLogEntry<'a> {
 
 impl Database {
     #[cfg(test)]
+    pub(crate) fn open_test_file(path: PathBuf, history: usize) -> Result<Self> {
+        let db = Self {
+            conn: Arc::new(Mutex::new(Connection::open(&path)?)),
+            db_path: path,
+            routing: Arc::new(RwLock::new(Arc::new(RoutingSnapshot::default()))),
+            query_cache: Arc::new(Mutex::new(HashMap::new())),
+            status_revisions: Arc::new(Mutex::new(HashMap::new())),
+        };
+        db.migrate()?;
+        let mut conn = db.connection()?;
+        assert_eq!(
+            conn.query_row("PRAGMA journal_mode", [], |r| r.get::<_, String>(0))?,
+            "wal"
+        );
+        let tx = conn.transaction()?;
+        {
+            let mut insert = tx.prepare("INSERT INTO request_logs (target_host,target_port,success,response_time,result_type) VALUES (?,443,1,10,'tunnel_established')")?;
+            for i in 0..history {
+                insert.execute([format!("history-{}.test", i % 100)])?;
+            }
+        }
+        tx.commit()?;
+        db.publish_routing(&conn)?;
+        drop(conn);
+        Ok(db)
+    }
+
+    #[cfg(test)]
     pub(crate) fn open_in_memory() -> Result<Self> {
         let db = Self {
             conn: Arc::new(Mutex::new(Connection::open_in_memory()?)),
             db_path: PathBuf::from(":memory:"),
+            routing: Arc::new(RwLock::new(Arc::new(RoutingSnapshot::default()))),
+            query_cache: Arc::new(Mutex::new(HashMap::new())),
+            status_revisions: Arc::new(Mutex::new(HashMap::new())),
         };
         db.migrate()?;
+        db.publish_routing(&*db.connection()?)?;
         Ok(db)
     }
 
@@ -67,13 +104,201 @@ impl Database {
         let db = Self {
             conn: Arc::new(Mutex::new(conn)),
             db_path,
+            routing: Arc::new(RwLock::new(Arc::new(RoutingSnapshot::default()))),
+            query_cache: Arc::new(Mutex::new(HashMap::new())),
+            status_revisions: Arc::new(Mutex::new(HashMap::new())),
         };
         db.migrate()?;
+        db.publish_routing(&*db.connection()?)?;
         Ok(db)
     }
 
     pub fn path(&self) -> PathBuf {
         self.db_path.clone()
+    }
+
+    pub fn routing_snapshot(&self) -> Arc<RoutingSnapshot> {
+        self.routing
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub fn background_connection(&self) -> Result<Self> {
+        if self.db_path == Path::new(":memory:") {
+            return Ok(self.clone());
+        }
+        let conn = Connection::open(&self.db_path)?;
+        conn.busy_timeout(Duration::from_secs(2))?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+            db_path: self.db_path.clone(),
+            routing: self.routing.clone(),
+            query_cache: self.query_cache.clone(),
+            status_revisions: self.status_revisions.clone(),
+        })
+    }
+
+    pub fn update_passive_status(
+        &self,
+        proxy: &ProxyRecord,
+        generation: u64,
+        revision: u64,
+        status: &str,
+        time: Option<i64>,
+    ) -> Result<()> {
+        let conn = self.connection()?;
+        if self.routing_snapshot().node_generations.get(&proxy.id) != Some(&generation)
+            || self
+                .status_revisions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&proxy.id)
+                != Some(&revision)
+        {
+            return Ok(());
+        }
+        conn.execute(
+            "UPDATE proxies SET status = ?, response_time = ? WHERE id = ?",
+            params![status, time, proxy.id],
+        )?;
+        self.publish_routing(&conn)
+    }
+
+    pub fn reserve_status_revision(&self, id: i64) -> u64 {
+        let mut revisions = self
+            .status_revisions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let revision = revisions.entry(id).or_default();
+        *revision = revision.wrapping_add(1);
+        *revision
+    }
+
+    pub fn status_revision(&self, id: i64) -> u64 {
+        self.status_revisions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    pub fn hold_connection_for_test(
+        &self,
+        entered: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) {
+        let _guard = self.connection().unwrap();
+        entered.send(()).unwrap();
+        let _ = release.recv_timeout(Duration::from_secs(2));
+    }
+
+    pub fn log_requests(&self, logs: &[crate::database_worker::OwnedLog]) -> Result<usize> {
+        if logs.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.connection()?;
+        let tx = conn.transaction()?;
+        {
+            let mut statement = tx.prepare_cached("INSERT INTO request_logs (proxy_id,target_host,target_port,success,response_time,error_message,result_type) VALUES ((SELECT id FROM proxies WHERE id = ?),?,?,?,?,?,?)")?;
+            for owned in logs {
+                let log = owned.entry();
+                statement.execute(params![
+                    log.proxy_id,
+                    log.target_host,
+                    log.target_port,
+                    i64::from(log.success),
+                    log.response_time,
+                    log.error_message,
+                    log.result_type
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(logs.len())
+    }
+
+    // Called while the DB writer lock is still held, so older publications cannot overtake new edits.
+    fn publish_routing(&self, conn: &Connection) -> Result<()> {
+        let previous = self.routing_snapshot();
+        let generation = previous.generation.wrapping_add(1);
+        let proxies = conn
+            .prepare("SELECT * FROM proxies WHERE enabled = 1 ORDER BY priority, id")?
+            .query_map([], proxy_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let node_generations: HashMap<i64, u64> = proxies
+            .iter()
+            .map(|proxy| {
+                let unchanged = previous
+                    .proxies
+                    .iter()
+                    .any(|old| old.id == proxy.id && crate::routing::same_node(old, proxy));
+                (
+                    proxy.id,
+                    if unchanged {
+                        previous.node_generations[&proxy.id]
+                    } else {
+                        generation
+                    },
+                )
+            })
+            .collect();
+        let groups = conn
+            .prepare("SELECT id, name, is_default, algorithm_override, sticky_failover_seconds FROM proxy_groups WHERE enabled = 1 ORDER BY id")?
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut pools = Vec::with_capacity(groups.len());
+        for (id, name, default, algorithm_override, sticky_failover_seconds) in groups {
+            let mut pool = RoutingPool {
+                id,
+                name,
+                is_default: default == 1,
+                members: query_group_members(conn, id)?
+                    .into_iter()
+                    .map(|member| member.proxy_id)
+                    .collect(),
+                rules: query_group_domains(conn, id)?
+                    .into_iter()
+                    .map(|domain| crate::routing::normalize_rule(&domain.domain))
+                    .collect(),
+                algorithm_override,
+                sticky_failover_seconds,
+                revision: generation,
+            };
+            if let Some(old) = previous.pools.iter().find(|old| old.id == id) {
+                if old.members == pool.members
+                    && old.rules == pool.rules
+                    && old.is_default == pool.is_default
+                    && old.algorithm_override == pool.algorithm_override
+                    && old.sticky_failover_seconds == pool.sticky_failover_seconds
+                    && pool
+                        .members
+                        .iter()
+                        .all(|id| previous.node_generations.get(id) == node_generations.get(id))
+                {
+                    pool.revision = old.revision;
+                }
+            }
+            pools.push(pool);
+        }
+        *self.routing.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(RoutingSnapshot {
+            generation,
+            proxies,
+            node_generations,
+            pools,
+        });
+        Ok(())
     }
 
     fn connection(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {
@@ -176,6 +401,18 @@ impl Database {
         add_column_if_missing(&conn, "proxies", "test_timeout", "INTEGER DEFAULT NULL")?;
         add_column_if_missing(&conn, "proxies", "skip_cert_verify", "INTEGER DEFAULT 0")?;
         add_column_if_missing(&conn, "request_logs", "result_type", "TEXT")?;
+        add_column_if_missing(
+            &conn,
+            "proxy_groups",
+            "algorithm_override",
+            "TEXT DEFAULT NULL",
+        )?;
+        add_column_if_missing(
+            &conn,
+            "proxy_groups",
+            "sticky_failover_seconds",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
         add_column_if_missing(&conn, "dns_mappings", "dynamic", "INTEGER DEFAULT 0")?;
         add_column_if_missing(
             &conn,
@@ -339,6 +576,7 @@ impl Database {
             ],
         )?;
         let id = conn.last_insert_rowid();
+        self.publish_routing(&conn)?;
         drop(conn);
         self.get_proxy(id)?
             .ok_or_else(|| anyhow!("代理创建后无法读取"))
@@ -395,14 +633,28 @@ impl Database {
                 id
             ],
         )?;
+        self.publish_routing(&conn)?;
         drop(conn);
         let proxy = self.get_proxy(id)?.ok_or_else(|| anyhow!("代理不存在"))?;
         Ok((proxy, reset_status))
     }
 
     pub fn delete_proxy(&self, id: i64) -> Result<()> {
+        self.query_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         let conn = self.connection()?;
         conn.execute("DELETE FROM proxies WHERE id = ?", params![id])?;
+        self.publish_routing(&conn)?;
+        self.status_revisions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&id);
+        self.query_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         Ok(())
     }
 
@@ -412,6 +664,7 @@ impl Database {
             "UPDATE proxies SET priority = ? WHERE id = ?",
             params![priority, id],
         )?;
+        self.publish_routing(&conn)?;
         Ok(())
     }
 
@@ -425,9 +678,11 @@ impl Database {
             )?;
         }
         tx.commit()?;
+        self.publish_routing(&conn)?;
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn update_proxy_status(
         &self,
         id: i64,
@@ -449,9 +704,11 @@ impl Database {
             "#,
             params![status, response_time, success_delta, fail_delta, id],
         )?;
+        self.publish_routing(&conn)?;
         Ok(updated == 1)
     }
 
+    #[cfg(test)]
     pub fn record_proxy_probe_result(
         &self,
         proxy: &ProxyRecord,
@@ -459,7 +716,43 @@ impl Database {
         response_time: Option<i64>,
         success: bool,
     ) -> Result<bool> {
+        let revision = self.reserve_status_revision(proxy.id);
+        let generation = self
+            .routing_snapshot()
+            .node_generations
+            .get(&proxy.id)
+            .copied();
+        self.persist_probe_result(proxy, generation, revision, status, response_time, success)
+    }
+
+    pub fn persist_probe_result(
+        &self,
+        proxy: &ProxyRecord,
+        generation: Option<u64>,
+        revision: u64,
+        status: Option<&str>,
+        response_time: Option<i64>,
+        success: bool,
+    ) -> Result<bool> {
         let conn = self.connection()?;
+        if self
+            .routing_snapshot()
+            .node_generations
+            .get(&proxy.id)
+            .copied()
+            != generation
+        {
+            return Ok(false);
+        }
+        // A newer business/probe result owns health. Still retain this probe's
+        // observation timestamp/counters without overwriting newer status.
+        let status = status.filter(|_| {
+            self.status_revisions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&proxy.id)
+                == Some(&revision)
+        });
         let updated = conn.execute(
             r#"
             UPDATE proxies
@@ -478,7 +771,7 @@ impl Database {
                 status,
                 response_time,
                 i64::from(success),
-                i64::from(!success),
+                i64::from(!success && status == Some("inactive")),
                 proxy.id,
                 proxy.proxy_type,
                 proxy.host,
@@ -491,6 +784,7 @@ impl Database {
                 proxy.skip_cert_verify
             ],
         )?;
+        self.publish_routing(&conn)?;
         Ok(updated == 1)
     }
 
@@ -598,6 +892,8 @@ impl Database {
                 name: group.name,
                 is_default: group.is_default,
                 enabled: group.enabled,
+                algorithm_override: group.algorithm_override,
+                sticky_failover_seconds: group.sticky_failover_seconds,
                 domains: group
                     .domains
                     .into_iter()
@@ -719,12 +1015,18 @@ impl Database {
         }
 
         for group in &bundle.proxy_groups {
+            let algorithm =
+                crate::routing::normalize_algorithm(group.algorithm_override.as_deref());
             let name = group.name.trim();
             let invalid_domain = group.domains.iter().any(|domain| {
                 let domain = domain.trim().to_lowercase();
                 !domain.is_empty() && validate_group_domain(&domain).is_err()
             });
-            if name.is_empty() || invalid_domain {
+            if name.is_empty()
+                || invalid_domain
+                || algorithm.is_err()
+                || crate::routing::validate_hold(group.sticky_failover_seconds).is_err()
+            {
                 summary.proxy_groups.skipped += 1;
                 continue;
             }
@@ -747,8 +1049,8 @@ impl Database {
             )?;
             let is_default = i64::from(group.is_default == 1 && has_default == 0);
             tx.execute(
-                "INSERT INTO proxy_groups (name, is_default, enabled) VALUES (?, ?, ?)",
-                params![name, is_default, i64::from(group.enabled != 0)],
+                "INSERT INTO proxy_groups (name, is_default, enabled, algorithm_override, sticky_failover_seconds) VALUES (?, ?, ?, ?, ?)",
+                params![name, is_default, i64::from(group.enabled != 0), algorithm?, group.sticky_failover_seconds],
             )?;
             let group_id = tx.last_insert_rowid();
             save_group_domains(&tx, group_id, group.domains.clone())?;
@@ -776,6 +1078,7 @@ impl Database {
         }
 
         tx.commit()?;
+        self.publish_routing(&conn)?;
         Ok(summary)
     }
 
@@ -928,6 +1231,8 @@ impl Database {
                     name: row.get("name")?,
                     is_default: row.get("is_default")?,
                     enabled: row.get("enabled")?,
+                    algorithm_override: row.get("algorithm_override")?,
+                    sticky_failover_seconds: row.get("sticky_failover_seconds")?,
                     created_at: row.get("created_at")?,
                     updated_at: row.get("updated_at")?,
                     domains: Vec::new(),
@@ -956,19 +1261,23 @@ impl Database {
             .to_string();
         let is_default = i64::from(input.is_default.unwrap_or(0) != 0);
         let enabled = i64::from(input.enabled.unwrap_or(1) != 0);
+        let algorithm =
+            crate::routing::normalize_algorithm(input.algorithm_override.flatten().as_deref())?;
+        let hold = crate::routing::validate_hold(input.sticky_failover_seconds.unwrap_or(0))?;
         let mut conn = self.connection()?;
         let tx = conn.transaction()?;
         if is_default == 1 {
             tx.execute("UPDATE proxy_groups SET is_default = 0", [])?;
         }
         tx.execute(
-            "INSERT INTO proxy_groups (name, is_default, enabled) VALUES (?, ?, ?)",
-            params![name, is_default, enabled],
+            "INSERT INTO proxy_groups (name, is_default, enabled, algorithm_override, sticky_failover_seconds) VALUES (?, ?, ?, ?, ?)",
+            params![name, is_default, enabled, algorithm, hold],
         )?;
         let id = tx.last_insert_rowid();
         save_group_domains(&tx, id, input.domains.unwrap_or_default())?;
         save_group_members(&tx, id, input.proxy_ids.unwrap_or_default())?;
         tx.commit()?;
+        self.publish_routing(&conn)?;
         drop(conn);
         self.get_proxy_group(id)?
             .ok_or_else(|| anyhow!("代理分组创建后无法读取"))
@@ -977,15 +1286,21 @@ impl Database {
     pub fn update_proxy_group(&self, id: i64, input: ProxyGroupInput) -> Result<ProxyGroup> {
         let mut conn = self.connection()?;
         let tx = conn.transaction()?;
-        let existing: Option<(String, i64, i64)> = tx
+        let existing: Option<(String, i64, i64, Option<String>, i64)> = tx
             .query_row(
-                "SELECT name, is_default, enabled FROM proxy_groups WHERE id = ?",
+                "SELECT name, is_default, enabled, algorithm_override, sticky_failover_seconds FROM proxy_groups WHERE id = ?",
                 params![id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
             )
             .optional()?;
-        let (current_name, current_default, current_enabled) =
+        let (current_name, current_default, current_enabled, current_algorithm, current_hold) =
             existing.ok_or_else(|| anyhow!("分组不存在"))?;
+        let algorithm = match input.algorithm_override {
+            Some(value) => crate::routing::normalize_algorithm(value.as_deref())?,
+            None => current_algorithm,
+        };
+        let hold =
+            crate::routing::validate_hold(input.sticky_failover_seconds.unwrap_or(current_hold))?;
         let next_name = input
             .name
             .as_deref()
@@ -1005,7 +1320,7 @@ impl Database {
         tx.execute(
             r#"
             UPDATE proxy_groups
-            SET name = ?, is_default = ?, enabled = ?, updated_at = CURRENT_TIMESTAMP
+            SET name = ?, is_default = ?, enabled = ?, algorithm_override = ?, sticky_failover_seconds = ?, updated_at = CURRENT_TIMESTAMP
             WHERE id = ?
             "#,
             params![
@@ -1015,6 +1330,8 @@ impl Database {
                     .enabled
                     .map(|value| i64::from(value != 0))
                     .unwrap_or(current_enabled),
+                algorithm,
+                hold,
                 id
             ],
         )?;
@@ -1034,6 +1351,7 @@ impl Database {
             save_group_members(&tx, id, proxy_ids)?;
         }
         tx.commit()?;
+        self.publish_routing(&conn)?;
         drop(conn);
         self.get_proxy_group(id)?
             .ok_or_else(|| anyhow!("代理分组不存在"))
@@ -1051,6 +1369,8 @@ impl Database {
                         name: row.get("name")?,
                         is_default: row.get("is_default")?,
                         enabled: row.get("enabled")?,
+                        algorithm_override: row.get("algorithm_override")?,
+                        sticky_failover_seconds: row.get("sticky_failover_seconds")?,
                         created_at: row.get("created_at")?,
                         updated_at: row.get("updated_at")?,
                         domains: Vec::new(),
@@ -1071,9 +1391,11 @@ impl Database {
     pub fn delete_proxy_group(&self, id: i64) -> Result<()> {
         let conn = self.connection()?;
         conn.execute("DELETE FROM proxy_groups WHERE id = ?", params![id])?;
+        self.publish_routing(&conn)?;
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn group_proxy_selection(&self, target_host: &str) -> Result<Option<ProxyGroupSelection>> {
         let conn = self.connection()?;
         let mut stmt = conn.prepare(
@@ -1133,6 +1455,7 @@ impl Database {
         }))
     }
 
+    #[cfg(test)]
     pub fn log_request(&self, entry: &RequestLogEntry<'_>) -> Result<i64> {
         let conn = self.connection()?;
         conn.execute(
@@ -1161,86 +1484,92 @@ impl Database {
         let conn = self.connection()?;
         let deleted = conn.execute(
             r#"
-            DELETE FROM request_logs
-            WHERE created_at < datetime('now', '-' || ? || ' days')
+            DELETE FROM request_logs WHERE id IN (
+              SELECT id FROM request_logs WHERE created_at < datetime('now', '-' || ? || ' days') LIMIT 500
+            )
             "#,
             params![retention_days],
         )?;
         Ok(deleted)
     }
 
+    #[cfg(test)]
     pub fn traffic_logs(
         &self,
         page: i64,
         page_size: i64,
         proxy_search: Option<&str>,
     ) -> Result<(Vec<TrafficLog>, i64)> {
-        let page = page.max(1);
-        let page_size = page_size.max(1);
-        let offset = (page - 1) * page_size;
-        let conn = self.connection()?;
-        let proxy_search = proxy_search
-            .map(str::trim)
-            .filter(|value| !value.is_empty());
-
-        let (total, items) = if let Some(proxy_search) = proxy_search {
-            let pattern = like_pattern(proxy_search);
-            let total = conn.query_row(
-                r#"
-                SELECT COUNT(*)
-                FROM request_logs rl
-                LEFT JOIN proxies p ON p.id = rl.proxy_id
-                WHERE COALESCE(rl.result_type, '') NOT IN ('health_success', 'health_failure')
-                  AND COALESCE(p.name, '') LIKE ? ESCAPE '\'
-                "#,
-                params![pattern],
-                |row| row.get(0),
-            )?;
-            let mut stmt = conn.prepare(
-                r#"
-                SELECT rl.id, rl.proxy_id, p.name AS proxy_name, p.type AS proxy_type,
-                  p.host AS proxy_host, p.port AS proxy_port, rl.target_host, rl.target_port,
-                  rl.success, rl.response_time, rl.error_message, rl.result_type, rl.created_at
-                FROM request_logs rl
-                LEFT JOIN proxies p ON p.id = rl.proxy_id
-                WHERE COALESCE(rl.result_type, '') NOT IN ('health_success', 'health_failure')
-                  AND COALESCE(p.name, '') LIKE ? ESCAPE '\'
-                ORDER BY rl.id DESC
-                LIMIT ? OFFSET ?
-                "#,
-            )?;
-            let rows = stmt.query_map(params![pattern, page_size, offset], traffic_log_from_row)?;
-            (total, rows.collect::<rusqlite::Result<Vec<_>>>()?)
-        } else {
-            let total = conn.query_row(
-                r#"
-                SELECT COUNT(*)
-                FROM request_logs
-                WHERE COALESCE(result_type, '') NOT IN ('health_success', 'health_failure')
-                "#,
-                [],
-                |row| row.get(0),
-            )?;
-            let mut stmt = conn.prepare(
-                r#"
-                SELECT rl.id, rl.proxy_id, p.name AS proxy_name, p.type AS proxy_type,
-                  p.host AS proxy_host, p.port AS proxy_port, rl.target_host, rl.target_port,
-                  rl.success, rl.response_time, rl.error_message, rl.result_type, rl.created_at
-                FROM request_logs rl
-                LEFT JOIN proxies p ON p.id = rl.proxy_id
-                WHERE COALESCE(rl.result_type, '') NOT IN ('health_success', 'health_failure')
-                ORDER BY rl.id DESC
-                LIMIT ? OFFSET ?
-                "#,
-            )?;
-            let rows = stmt.query_map(params![page_size, offset], traffic_log_from_row)?;
-            (total, rows.collect::<rusqlite::Result<Vec<_>>>()?)
-        };
-
+        let (items, total, _) =
+            self.traffic_logs_snapshot(page, page_size, proxy_search, None, None)?;
         Ok((items, total))
     }
 
+    pub fn traffic_logs_snapshot(
+        &self,
+        page: i64,
+        page_size: i64,
+        proxy_search: Option<&str>,
+        snapshot_id: Option<i64>,
+        before_id: Option<i64>,
+    ) -> Result<(Vec<TrafficLog>, i64, i64)> {
+        if page < 1 || !(1..=200).contains(&page_size) {
+            return Err(anyhow!("页码必须为正数，每页条数必须在 1 到 200 之间"));
+        }
+        let offset = if before_id.is_some() {
+            0
+        } else {
+            (page - 1)
+                .checked_mul(page_size)
+                .ok_or_else(|| anyhow!("分页偏移超出范围"))?
+        };
+        if snapshot_id.is_some_and(|id| id < 0) || before_id.is_some_and(|id| id < 0) {
+            return Err(anyhow!("日志游标无效"));
+        }
+        let conn = self.connection()?;
+        let latest: i64 =
+            conn.query_row("SELECT COALESCE(MAX(id), 0) FROM request_logs", [], |row| {
+                row.get(0)
+            })?;
+        let snapshot = snapshot_id.unwrap_or(latest).min(latest);
+        let pattern = proxy_search
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(like_pattern);
+        let total = conn.query_row(
+            "SELECT COUNT(*) FROM request_logs rl LEFT JOIN proxies p ON p.id = rl.proxy_id
+             WHERE rl.id <= ?1 AND COALESCE(rl.result_type, '') NOT IN ('health_success', 'health_failure')
+             AND (?2 IS NULL OR COALESCE(p.name, '') LIKE ?2 ESCAPE '\\')",
+             params![snapshot, pattern], |row| row.get(0))?;
+        let mut statement = conn.prepare(
+            "SELECT rl.id, rl.proxy_id, p.name AS proxy_name, p.type AS proxy_type, p.host AS proxy_host,
+                    p.port AS proxy_port, rl.target_host, rl.target_port, rl.success, rl.response_time,
+                    rl.error_message, rl.result_type, rl.created_at
+             FROM request_logs rl LEFT JOIN proxies p ON p.id = rl.proxy_id
+             WHERE rl.id <= ?1 AND rl.id < ?2
+               AND COALESCE(rl.result_type, '') NOT IN ('health_success', 'health_failure')
+               AND (?3 IS NULL OR COALESCE(p.name, '') LIKE ?3 ESCAPE '\\')
+             ORDER BY rl.id DESC LIMIT ?4 OFFSET ?5")?;
+        let items = statement
+            .query_map(
+                params![
+                    snapshot,
+                    before_id.unwrap_or(i64::MAX),
+                    pattern,
+                    page_size,
+                    offset
+                ],
+                traffic_log_from_row,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok((items, total, snapshot))
+    }
+
     pub fn clear_traffic_logs(&self) -> Result<i64> {
+        self.query_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         let mut conn = self.connection()?;
         let tx = conn.transaction()?;
         let deleted = tx.execute(
@@ -1255,10 +1584,24 @@ impl Database {
             params![TRAFFIC_LOG_VISIBLE_AFTER_ID_KEY],
         )?;
         tx.commit()?;
+        self.query_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         Ok(deleted as i64)
     }
 
     pub fn scalar_json(&self, sql: &str) -> Result<Value> {
+        if let Some((created, value)) = self
+            .query_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(sql)
+        {
+            if created.elapsed() < Duration::from_secs(5) {
+                return Ok(value.clone());
+            }
+        }
         let conn = self.connection()?;
         let mut stmt = conn.prepare(sql)?;
         let column_count = stmt.column_count();
@@ -1276,47 +1619,32 @@ impl Database {
             Ok(Value::Object(map))
         })?;
         let values = rows.collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(Value::Array(values))
+        let value = Value::Array(values);
+        let mut cache = self.query_cache.lock().unwrap_or_else(|e| e.into_inner());
+        if cache.len() >= 16 {
+            cache.clear();
+        }
+        cache.insert(sql.to_string(), (std::time::Instant::now(), value.clone()));
+        Ok(value)
     }
 
     pub fn overview(&self, uptime: i64) -> Result<Value> {
-        let conn = self.connection()?;
-        let active: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM proxies WHERE status = 'active' AND enabled = 1",
-            [],
-            |row| row.get(0),
-        )?;
-        let (total, success, failed): (i64, i64, i64) = conn.query_row(
-            r#"
-            SELECT
-              COUNT(*),
-              COALESCE(SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END), 0),
-              COALESCE(SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END), 0)
-            FROM request_logs
-            WHERE created_at >= datetime('now', '-24 hours')
-              AND COALESCE(result_type, '') NOT IN ('health_success', 'health_failure')
-            "#,
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )?;
-        let avg: Option<f64> = conn.query_row(
-            r#"
-            SELECT AVG(response_time)
-            FROM request_logs
-            WHERE success = 1 AND created_at >= datetime('now', '-24 hours')
-              AND COALESCE(result_type, '') NOT IN ('health_success', 'health_failure')
-            "#,
-            [],
-            |row| row.get(0),
-        )?;
-        Ok(json!({
-            "activeProxies": active,
-            "totalRequests": total,
-            "successRequests": success,
-            "failedRequests": failed,
-            "avgResponseTime": avg.unwrap_or(0.0).round() as i64,
-            "uptime": uptime
-        }))
+        let rows = self.scalar_json(
+            "SELECT COUNT(*) AS totalRequests,
+               COALESCE(SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END), 0) AS successRequests,
+               COALESCE(SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END), 0) AS failedRequests,
+               COALESCE(ROUND(AVG(CASE WHEN success = 1 THEN response_time END)), 0) AS avgResponseTime
+             FROM request_logs WHERE created_at >= datetime('now', '-24 hours')
+               AND COALESCE(result_type, '') NOT IN ('health_success', 'health_failure', 'request_forwarded', 'forwarded_unverified', 'transfer_finished', 'transfer_error')")?;
+        let mut value = rows[0].clone();
+        value["uptime"] = json!(uptime);
+        value["activeProxies"] = json!(self
+            .routing_snapshot()
+            .proxies
+            .iter()
+            .filter(|p| p.status.as_deref() == Some("active"))
+            .count());
+        Ok(value)
     }
 }
 
@@ -1770,7 +2098,7 @@ fn normalize_dns_domain(domain: &str) -> Result<String> {
     {
         return Err(anyhow!("DNS 映射域名格式无效"));
     }
-    Ok(domain)
+    Ok(crate::routing::normalize_host(&domain))
 }
 
 fn validate_group_domain(domain: &str) -> Result<()> {
@@ -1855,6 +2183,7 @@ fn sql_value_to_json(row: &Row<'_>, index: usize) -> rusqlite::Result<Value> {
     }
 }
 
+#[cfg(test)]
 fn domain_matches(host: &str, pattern: &str) -> bool {
     let pattern = pattern.to_lowercase();
     if pattern == "*" {
@@ -1881,6 +2210,108 @@ mod tests {
     fn test_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn group_policy_migrates_defaults_roundtrips_and_preserves_partial_updates() {
+        use serde_json::json;
+        let db = Database::open_in_memory().unwrap();
+        let old: ProxyGroupInput =
+            serde_json::from_value(json!({"name":"old","domains":["old.test"]})).unwrap();
+        let group = db.create_proxy_group(old).unwrap();
+        assert!(group.algorithm_override.is_none());
+        assert_eq!(group.sticky_failover_seconds, 0);
+        let changed = db
+            .update_proxy_group(
+                group.id,
+                serde_json::from_value(
+                    json!({"algorithm_override":"sticky_host","sticky_failover_seconds":300}),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(changed.algorithm_override.as_deref(), Some("sticky_host"));
+        let partial = db
+            .update_proxy_group(
+                group.id,
+                serde_json::from_value(json!({"name":"renamed"})).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(partial.algorithm_override, changed.algorithm_override);
+        assert_eq!(partial.sticky_failover_seconds, 300);
+        let bundle = db.export_bundle(&[], &[], &[group.id]).unwrap();
+        let imported = Database::open_in_memory().unwrap();
+        imported.import_bundle(&bundle).unwrap();
+        assert_eq!(
+            imported.list_proxy_groups().unwrap()[0].sticky_failover_seconds,
+            300
+        );
+        assert_eq!(
+            imported.list_proxy_groups().unwrap()[0]
+                .algorithm_override
+                .as_deref(),
+            Some("sticky_host")
+        );
+        for value in [
+            json!({"algorithm_override":"unknown"}),
+            json!({"sticky_failover_seconds":-1}),
+            json!({"sticky_failover_seconds":86401}),
+        ] {
+            assert!(db
+                .update_proxy_group(group.id, serde_json::from_value(value).unwrap())
+                .is_err());
+        }
+        let reset = db
+            .update_proxy_group(
+                group.id,
+                serde_json::from_value(
+                    json!({"algorithm_override":null,"sticky_failover_seconds":0}),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(reset.algorithm_override.is_none());
+        assert_eq!(reset.sticky_failover_seconds, 0);
+    }
+
+    #[test]
+    fn log_snapshot_and_cursor_are_stable_and_page_sizes_are_bounded() {
+        let db = Database::open_in_memory().unwrap();
+        let entry = RequestLogEntry {
+            proxy_id: None,
+            target_host: "example.com",
+            target_port: 443,
+            success: true,
+            response_time: Some(1),
+            error_message: None,
+            result_type: "tunnel_established",
+        };
+        for _ in 0..30 {
+            db.log_request(&entry).unwrap();
+        }
+        let (first, total, snapshot) = db.traffic_logs_snapshot(1, 10, None, None, None).unwrap();
+        assert_eq!(total, 30);
+        for _ in 0..10 {
+            db.log_request(&entry).unwrap();
+        }
+        let (next, total, _) = db
+            .traffic_logs_snapshot(2, 10, None, Some(snapshot), Some(first.last().unwrap().id))
+            .unwrap();
+        assert_eq!(total, 30);
+        assert_eq!(next[0].id, first.last().unwrap().id - 1);
+        assert!(db.traffic_logs_snapshot(1, 201, None, None, None).is_err());
+        assert!(db
+            .traffic_logs_snapshot(i64::MAX, 200, None, None, None)
+            .is_err());
+        assert!(db.traffic_logs_snapshot(0, 25, None, None, None).is_err());
+        let _ = db.overview(0).unwrap();
+        db.clear_traffic_logs().unwrap();
+        assert_eq!(
+            db.overview(0).unwrap()["totalRequests"],
+            serde_json::json!(0)
+        );
+        let plan = db.scalar_json("EXPLAIN QUERY PLAN SELECT id FROM request_logs WHERE id < 100 ORDER BY id DESC LIMIT 25").unwrap().to_string();
+        assert!(plan.contains("INTEGER PRIMARY KEY"), "{plan}");
     }
 
     fn proxy_input(name: &str, host: &str, port: i64) -> ProxyInput {
@@ -2012,6 +2443,7 @@ mod tests {
                 proxy_ids: Some(vec![kept.id, dropped.id]),
                 is_default: Some(0),
                 enabled: Some(1),
+                ..Default::default()
             })
             .unwrap();
 
@@ -2141,6 +2573,7 @@ mod tests {
             proxy_ids: Some(vec![default_proxy.id]),
             is_default: Some(1),
             enabled: Some(1),
+            ..Default::default()
         })
         .unwrap();
         db.create_proxy_group(ProxyGroupInput {
@@ -2149,6 +2582,7 @@ mod tests {
             proxy_ids: Some(Vec::new()),
             is_default: Some(0),
             enabled: Some(1),
+            ..Default::default()
         })
         .unwrap();
 

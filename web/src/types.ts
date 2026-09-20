@@ -12,6 +12,7 @@ export interface ProxyServiceStatus {
 
 export interface TestResult {
   success: boolean
+  failureScope?: "proxy" | "target" | "network"
   responseTime: number
   statusCode?: number | null
   error?: string | null
@@ -72,11 +73,21 @@ export interface ProxyGroup {
   name: string
   is_default: number
   enabled: number
+  algorithm_override?: string | null
+  sticky_failover_seconds?: number
   domains: ProxyGroupDomain[]
   members: ProxyGroupMember[]
 }
 
 export interface Overview {
+  databaseQueue?: {
+    queueLength: number
+    capacity: number
+    droppedLogs: number
+    databaseErrors: number
+    writtenLogs: number
+    maxBatchDurationMs: number
+  }
   activeProxies: number
   totalRequests: number
   successRequests: number
@@ -102,6 +113,7 @@ export interface TrafficLog {
 }
 
 export interface TrafficLogPage {
+  snapshotId?: number
   items: TrafficLog[]
   page: number
   pageSize: number

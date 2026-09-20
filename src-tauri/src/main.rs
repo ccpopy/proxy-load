@@ -2,10 +2,14 @@
 
 mod commands;
 mod database;
+mod database_worker;
 mod models;
 mod proxy;
 mod proxy_tester;
+mod routing;
 mod state;
+mod update_auth;
+mod update_download;
 mod update_mirror;
 mod version;
 
@@ -158,6 +162,16 @@ pub fn run() {
         .expect("Tauri 应用启动失败");
 
     app.run(|_app_handle, _event| {
+        if matches!(_event, tauri::RunEvent::Exit) {
+            if let Some(state) = _app_handle.try_state::<Arc<AppState>>() {
+                if !state
+                    .proxy_runtime
+                    .flush_logs(std::time::Duration::from_secs(5))
+                {
+                    eprintln!("退出时日志队列未在 5 秒内完成刷新");
+                }
+            }
+        }
         // macOS：从程序坞点击图标（applicationShouldHandleReopen）时重新显示主窗口。
         #[cfg(target_os = "macos")]
         if let tauri::RunEvent::Reopen { .. } = _event {
