@@ -35,6 +35,7 @@ const MAX_METRIC_SAMPLES: usize = 2048;
 pub(crate) mod failure;
 mod http_observer;
 pub(crate) mod limits;
+pub(crate) mod probe_http;
 pub(crate) mod probe_tls;
 pub(crate) mod probe_transport;
 mod sticky_routes;

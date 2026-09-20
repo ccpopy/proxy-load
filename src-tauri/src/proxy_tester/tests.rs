@@ -367,11 +367,8 @@ async fn informational_fragmented_oversized_and_unterminated_headers_are_bounded
         b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 103 Early Hints\r\nLink: </x>\r\n\r\n".to_vec();
     informational.extend(response(200));
     let mock = mock("http", None, informational, true).await;
-    assert!(
-        test_proxy(&proxy(mock.port, "http"), "http://probe.test/", 2000)
-            .await
-            .success
-    );
+    let result = test_proxy(&proxy(mock.port, "http"), "http://probe.test/", 2000).await;
+    assert!(result.success, "informational response: {result:?}");
     mock.task.await.unwrap();
     for payload in [
         format!(
@@ -388,7 +385,7 @@ async fn informational_fragmented_oversized_and_unterminated_headers_are_bounded
             150,
         )
         .await;
-        assert!(!result.success);
+        assert!(!result.success, "invalid response: {result:?}");
         assert_eq!(result.failure_scope.as_deref(), Some("unknown"));
         assert!(!serde_json::to_string(&result)
             .unwrap()

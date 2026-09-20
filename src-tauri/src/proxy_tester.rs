@@ -6,6 +6,7 @@ use crate::{
             ConnectPhase as Phase, Evidence, FailureCode as Code, FailureScope as Scope,
             ProbeDiagnostics, ProbeFailure,
         },
+        probe_http::HeaderLimitedIo,
         probe_tls,
         probe_transport::{self, BoxIo, MAX_HEADERS},
     },
@@ -264,7 +265,7 @@ async fn request_headers(
     };
     let response = timeout_at(deadline, async {
         let (mut sender, connection) = http1::Builder::new().max_headers(128).max_buf_size(MAX_HEADERS)
-            .handshake(TokioIo::new(io)).await.map_err(|e| ProbeFailure::external(Phase::HttpWrite, e))?;
+            .handshake(TokioIo::new(HeaderLimitedIo::new(io))).await.map_err(|e| ProbeFailure::external(Phase::HttpWrite, e))?;
         // Poll both inline: cancellation drops both; no detached driver tasks or sockets.
         tokio::pin!(connection);
         let send = sender.send_request(request);
@@ -283,5 +284,7 @@ async fn request_headers(
     Ok(response)
 }
 
+#[cfg(test)]
+mod header_tests;
 #[cfg(test)]
 mod tests;
