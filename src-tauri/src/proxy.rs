@@ -366,8 +366,12 @@ impl ProxyRuntime {
         self.service_status.read().await.clone()
     }
 
+    #[cfg(test)]
     pub fn flush_logs(&self, budget: Duration) -> bool {
         self.database_worker.flush(budget)
+    }
+    pub fn clear_logs(&self, budget: Duration) -> Result<i64> {
+        self.database_worker.clear_logs(budget)
     }
     pub fn request_stop(&self) {
         self.shutdown.send_replace(true);
@@ -598,17 +602,21 @@ impl ProxyRuntime {
         excluded: &HashSet<i64>,
         commit_selection: bool,
     ) -> Result<Vec<ProxyRecord>> {
-        let mut proxies = snapshot.proxies.clone();
-        if proxies.is_empty() {
+        if snapshot.proxies.is_empty() {
             return Err(anyhow!("没有可用的代理"));
         }
 
         let group_key = crate::routing::normalize_host(&request.original_host);
-        let mut pool_id = 0;
-        if let Some(selection) = snapshot.pool(&group_key) {
-            pool_id = selection.id;
-            proxies.retain(|proxy| selection.members.contains(&proxy.id));
-            if proxies.is_empty() {
+        let pool = snapshot.pool(&group_key);
+        let pool_id = pool.map_or(0, |pool| pool.id);
+        // Filter references first; copy only candidates which can actually route.
+        let mut proxies = snapshot
+            .proxies
+            .iter()
+            .filter(|proxy| pool.is_none_or(|pool| pool.members.contains(&proxy.id)))
+            .peekable();
+        if let Some(selection) = pool {
+            if proxies.peek().is_none() {
                 return Err(anyhow!(
                     "目标 {} 匹配的代理分组「{}」没有可用代理",
                     group_key,
@@ -627,10 +635,7 @@ impl ProxyRuntime {
             .unwrap_or_else(|e| e.into_inner())
             .algorithm
             .clone();
-        if let Some(override_algorithm) = snapshot
-            .pool(&group_key)
-            .and_then(|pool| pool.algorithm_override.as_ref())
-        {
+        if let Some(override_algorithm) = pool.and_then(|pool| pool.algorithm_override.as_ref()) {
             algorithm.clone_from(override_algorithm);
         }
 
@@ -648,23 +653,26 @@ impl ProxyRuntime {
                 .target_circuits
                 .read()
                 .unwrap_or_else(|e| e.into_inner());
-            for mut proxy in proxies {
-                if let Some(status) = metrics.get(&proxy.id).and_then(|m| m.pushed_status.clone()) {
-                    proxy.status = Some(status);
+            for proxy in proxies {
+                if excluded.contains(&proxy.id) {
+                    continue;
                 }
                 let key = TargetRouteKey {
                     proxy_id: proxy.id,
                     ..base_key.clone()
                 };
-                if excluded.contains(&proxy.id)
-                    || !breakers
-                        .get(&proxy.id)
-                        .is_none_or(CircuitBreaker::can_attempt_snapshot)
+                if !breakers
+                    .get(&proxy.id)
+                    .is_none_or(CircuitBreaker::can_attempt_snapshot)
                     || !targets
                         .get(&key)
                         .is_none_or(|target| target.breaker.can_attempt_snapshot())
                 {
                     continue;
+                }
+                let mut proxy = proxy.clone();
+                if let Some(status) = metrics.get(&proxy.id).and_then(|m| m.pushed_status.clone()) {
+                    proxy.status = Some(status);
                 }
                 eligible.push(proxy);
             }
@@ -767,9 +775,18 @@ impl ProxyRuntime {
                     proxy.id == policy.preferred && proxy.status.as_deref() != Some("inactive")
                 })
             });
+        let mut initial_candidates = Some(candidates);
         loop {
-            let mut candidates =
-                self.select_from_snapshot(&snapshot, request, &unavailable, false)?;
+            let mut candidates = match initial_candidates.take() {
+                Some(candidates)
+                    if candidates
+                        .first()
+                        .is_none_or(|proxy| !unavailable.contains(&proxy.id)) =>
+                {
+                    candidates
+                }
+                _ => self.select_from_snapshot(&snapshot, request, &unavailable, false)?,
+            };
             if candidates.is_empty() {
                 break;
             }

@@ -6,6 +6,7 @@ import { createHash } from "node:crypto"
 import { mkdtemp, mkdir, copyFile, readFile, writeFile, readdir, unlink, rmdir } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
+import { fileURLToPath } from "node:url"
 
 test("release helper: two portable upgrades preserve stable entry/data; invalid executable rolls back", { skip: process.platform !== "win32" || !process.env.PORTABLE_UPDATE_HELPER }, async () => {
   const root = await mkdtemp(join(tmpdir(), "proxy portable 中文 "))
@@ -14,7 +15,7 @@ test("release helper: two portable upgrades preserve stable entry/data; invalid 
   // Only our mkdtemp tree; no recursive removal of arbitrary caller paths.
   async function cleanup(dir) { for (const item of await readdir(dir, { withFileTypes: true })) { const p = join(dir,item.name); if (item.isDirectory()) { await cleanup(p); await rmdir(p) } else await unlink(p) } }
   try {
-    execFileSync("rustc", ["--edition=2021", "-O", "src-tauri/tests/fixtures/portable_app.rs", "-o", fixture])
+    execFileSync("rustc", ["--edition=2021", "-O", fileURLToPath(new URL("../src-tauri/tests/fixtures/portable_app.rs", import.meta.url)), "-o", fixture])
     await copyFile(fixture, entry)
     await mkdir(join(root,"data")); await writeFile(join(root,"data/proxy.db"), "existing proxy/group/DNS/auth/log data")
     const originalData = await readFile(join(root,"data/proxy.db"))

@@ -69,10 +69,17 @@ struct StatusChange {
     status: String,
     time: Option<i64>,
 }
+struct ClearRequest {
+    // Number of queued logs preceding this barrier (in-flight batch also precedes it).
+    remaining: usize,
+    reply: std::sync::mpsc::SyncSender<std::result::Result<i64, String>>,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+}
 #[derive(Default)]
 struct Queue {
     jobs: VecDeque<OwnedLog>,
     statuses: HashMap<i64, StatusChange>,
+    clear: Option<ClearRequest>,
     enqueued: VecDeque<std::time::Instant>,
     stopped: bool,
     working: bool,
@@ -136,13 +143,39 @@ impl DatabaseWorker {
                 let mut last_event = std::time::Instant::now() - Duration::from_secs(1);
                 loop {
                     let mut queue = state.queue.lock().unwrap_or_else(|e| e.into_inner());
-                    while (queue.jobs.is_empty() && queue.statuses.is_empty() && !queue.stopped)
+                    while (queue.jobs.is_empty()
+                        && queue.statuses.is_empty()
+                        && queue.clear.is_none()
+                        && !queue.stopped)
                         || queue.paused_for_test()
                     {
                         queue = state.wake.wait(queue).unwrap_or_else(|e| e.into_inner());
                     }
-                    if queue.jobs.is_empty() && queue.statuses.is_empty() && queue.stopped {
+                    if queue.jobs.is_empty()
+                        && queue.statuses.is_empty()
+                        && queue.clear.is_none()
+                        && queue.stopped
+                    {
                         break;
+                    }
+                    if queue
+                        .clear
+                        .as_ref()
+                        .is_some_and(|clear| clear.remaining == 0)
+                    {
+                        let clear = queue.clear.take().unwrap();
+                        queue.working = true;
+                        drop(queue);
+                        if !clear.cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                            let result = writer
+                                .clear_traffic_logs()
+                                .map_err(|error| error.to_string());
+                            let _ = clear.reply.send(result);
+                        }
+                        let mut queue = state.queue.lock().unwrap_or_else(|e| e.into_inner());
+                        queue.working = false;
+                        state.drained.notify_all();
+                        continue;
                     }
                     // Coalesce bursts, bounded by 100 ms; exit flush skips the delay.
                     if queue.jobs.len() < BATCH_SIZE && !queue.stopped {
@@ -155,7 +188,15 @@ impl DatabaseWorker {
                     if queue.paused_for_test() {
                         continue;
                     }
-                    let count = queue.jobs.len().min(BATCH_SIZE);
+                    let count = queue.jobs.len().min(BATCH_SIZE).min(
+                        queue
+                            .clear
+                            .as_ref()
+                            .map_or(usize::MAX, |clear| clear.remaining),
+                    );
+                    if let Some(clear) = &mut queue.clear {
+                        clear.remaining -= count;
+                    }
                     let batch = queue.jobs.drain(..count).collect::<Vec<_>>();
                     let ids = queue
                         .statuses
@@ -189,7 +230,9 @@ impl DatabaseWorker {
                     let mut retry = Vec::new();
                     for change in statuses {
                         let persist = || {
-                            writer.update_passive_status(
+                            // Configuration and health publish the same routing
+                            // snapshot; serialize both on the main writer connection.
+                            db.update_passive_status(
                                 &change.proxy,
                                 change.generation,
                                 change.revision,
@@ -279,6 +322,11 @@ impl DatabaseWorker {
                 if let Some(index) = queue.jobs.iter().position(|queued| !queued.important()) {
                     queue.jobs.remove(index);
                     queue.enqueued.remove(index);
+                    if let Some(clear) = &mut queue.clear {
+                        if index < clear.remaining {
+                            clear.remaining -= 1;
+                        }
+                    }
                     queue.dropped_logs += 1;
                 } else {
                     queue.dropped_logs += 1;
@@ -353,19 +401,78 @@ impl DatabaseWorker {
             .shared
             .drained
             .wait_timeout_while(queue, budget, |q| {
-                !q.jobs.is_empty() || !q.statuses.is_empty() || q.working
+                !q.jobs.is_empty() || !q.statuses.is_empty() || q.clear.is_some() || q.working
             })
             .unwrap_or_else(|e| e.into_inner());
-        queue.jobs.is_empty() && queue.statuses.is_empty() && !queue.working
+        queue.jobs.is_empty()
+            && queue.statuses.is_empty()
+            && queue.clear.is_none()
+            && !queue.working
+    }
+    pub fn clear_logs(&self, budget: Duration) -> Result<i64> {
+        let (reply, result) = std::sync::mpsc::sync_channel(1);
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let mut queue = self
+                .0
+                .shared
+                .queue
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            anyhow::ensure!(
+                !queue.stopped && queue.clear.is_none(),
+                "日志写入已停止或另一次清空仍在排队"
+            );
+            queue.clear = Some(ClearRequest {
+                remaining: queue.jobs.len(),
+                reply,
+                cancelled: cancelled.clone(),
+            });
+        }
+        self.0.shared.wake.notify_one();
+        match result.recv_timeout(budget) {
+            Ok(result) => result.map_err(anyhow::Error::msg),
+            Err(error) => {
+                cancelled.store(true, std::sync::atomic::Ordering::Release);
+                let mut queue = self
+                    .0
+                    .shared
+                    .queue
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if queue
+                    .clear
+                    .as_ref()
+                    .is_some_and(|clear| Arc::ptr_eq(&clear.cancelled, &cancelled))
+                {
+                    queue.clear = None;
+                    anyhow::bail!("清空日志等待超时，尚未开始的清空已取消: {error}");
+                }
+                anyhow::bail!("清空日志等待超时，已开始的操作可能仍在执行: {error}")
+            }
+        }
     }
     pub fn seal_and_flush(&self, budget: Duration) -> bool {
-        self.0
-            .shared
-            .queue
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .stopped = true;
-        self.flush(budget)
+        let errors = {
+            let mut queue = self
+                .0
+                .shared
+                .queue
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            queue.stopped = true;
+            queue.errors
+        };
+        let drained = self.flush(budget);
+        drained
+            && self
+                .0
+                .shared
+                .queue
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .errors
+                == errors
     }
     pub fn stats(&self) -> Value {
         let queue = self
@@ -485,6 +592,102 @@ mod tests {
             });
         }
         assert_eq!(worker.stats()["queueLength"], CAPACITY - FAILURE_RESERVE);
+    }
+
+    fn log_named(worker: &DatabaseWorker, host: &str) {
+        worker.log(RequestLogEntry {
+            proxy_id: None,
+            target_host: host,
+            target_port: 80,
+            success: true,
+            response_time: Some(1),
+            error_message: None,
+            result_type: "tunnel_established",
+        });
+    }
+
+    #[test]
+    fn clear_barrier_removes_its_prefix_but_keeps_later_live_producers() {
+        let db = Database::open_in_memory().unwrap();
+        let (events, _) = broadcast::channel(16);
+        let worker = DatabaseWorker::new(db.clone(), events).unwrap();
+        let pause = worker.pause_for_test();
+        for _ in 0..200 {
+            log_named(&worker, "before-clear");
+        }
+        let clearing = thread::spawn({
+            let worker = worker.clone();
+            move || worker.clear_logs(Duration::from_secs(3))
+        });
+        let start = std::time::Instant::now();
+        while worker.0.shared.queue.lock().unwrap().clear.is_none() {
+            assert!(start.elapsed() < Duration::from_secs(1));
+            thread::sleep(Duration::from_millis(1));
+        }
+        for _ in 0..20 {
+            log_named(&worker, "after-clear");
+        }
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let producer = thread::spawn({
+            let worker = worker.clone();
+            let done = done.clone();
+            move || {
+                while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    log_named(&worker, "after-clear");
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+        });
+        drop(pause);
+        assert_eq!(clearing.join().unwrap().unwrap(), 200);
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        producer.join().unwrap();
+        assert!(worker.flush(Duration::from_secs(3)));
+        let (rows, count) = db.traffic_logs(1, 200, None).unwrap();
+        assert!(count >= 20);
+        assert_eq!(db.traffic_logs(1, 25, Some("before-clear")).unwrap().1, 0);
+        assert!(rows
+            .iter()
+            .all(|row| row.target_host.as_deref() == Some("after-clear")));
+    }
+
+    #[test]
+    fn queued_clear_timeout_cancels_without_a_late_delete() {
+        let db = Database::open_in_memory().unwrap();
+        let (events, _) = broadcast::channel(16);
+        let worker = DatabaseWorker::new(db.clone(), events).unwrap();
+        let pause = worker.pause_for_test();
+        log_named(&worker, "keep");
+        assert!(worker.clear_logs(Duration::from_millis(10)).is_err());
+        assert!(worker.0.shared.queue.lock().unwrap().clear.is_none());
+        drop(pause);
+        assert!(worker.flush(Duration::from_secs(1)));
+        assert_eq!(db.traffic_logs(1, 25, None).unwrap().1, 1);
+    }
+
+    #[test]
+    fn shutdown_does_not_report_success_when_final_status_write_fails() {
+        let db = Database::open_in_memory().unwrap();
+        let proxy = test_proxy(&db);
+        let generation = db.routing_snapshot().node_generations[&proxy.id];
+        let (events, _) = broadcast::channel(16);
+        let worker = DatabaseWorker::new(db.clone(), events).unwrap();
+        let pause = worker.pause_for_test();
+        worker.0.shared.queue.lock().unwrap().fail_status_writes = 1;
+        worker.status(proxy, generation, "active", Some(1));
+        let stopping = thread::spawn({
+            let worker = worker.clone();
+            move || worker.seal_and_flush(Duration::from_secs(2))
+        });
+        let started = std::time::Instant::now();
+        while !worker.0.shared.queue.lock().unwrap().stopped {
+            assert!(started.elapsed() < Duration::from_secs(1));
+            thread::sleep(Duration::from_millis(1));
+        }
+        drop(pause);
+        assert!(!stopping.join().unwrap());
+        assert_eq!(worker.stats()["droppedStatus"], 1);
+        assert_eq!(worker.stats()["databaseErrors"], 1);
     }
     #[test]
     fn full_queue_reserves_space_and_evicts_regular_logs_for_failures() {

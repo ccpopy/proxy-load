@@ -867,11 +867,11 @@ pub fn traffic_logs(
 }
 
 #[tauri::command]
-pub fn clear_traffic_logs(state: tauri::State<'_, Arc<AppState>>) -> CommandResult<Value> {
-    if !state.proxy_runtime.flush_logs(Duration::from_secs(5)) {
-        return Err(CommandError::new("日志正在写入，请稍后再清空"));
-    }
-    let deleted = state.db.clear_traffic_logs()?;
+pub async fn clear_traffic_logs(state: tauri::State<'_, Arc<AppState>>) -> CommandResult<Value> {
+    let runtime = state.proxy_runtime.clone();
+    let deleted = tokio::task::spawn_blocking(move || runtime.clear_logs(Duration::from_secs(5)))
+        .await
+        .map_err(|error| CommandError::new(error.to_string()))??;
     state.emit("traffic_logs_cleared", json!({ "deleted": deleted }));
     Ok(json!({ "deleted": deleted }))
 }

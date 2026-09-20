@@ -104,6 +104,27 @@ async fn mock(
                     let counter = MockTask(active.clone());
                     clients.spawn(async move {
                         let _counter = counter;
+                        if scenario == "slow_auth" {
+                            let result: std::io::Result<()> = async {
+                                let mut greeting = [0; 4];
+                                stream.read_exact(&mut greeting).await?;
+                                stream.write_all(&[5, 2]).await?;
+                                let mut auth = [0; 11]; // test user/pass, never real credentials
+                                stream.read_exact(&mut auth).await?;
+                                tokio::time::sleep(Duration::from_millis(if index == 0 { 50 } else { 1 })).await;
+                                stream.write_all(&[1, 0]).await?;
+                                let mut header = [0; 5];
+                                stream.read_exact(&mut header).await?;
+                                let mut address = vec![0; usize::from(header[4]) + 2];
+                                stream.read_exact(&mut address).await?;
+                                stream.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 80]).await?;
+                                let mut buffer = [0; 128];
+                                while stream.read(&mut buffer).await? > 0 {}
+                                Ok(())
+                            }.await;
+                            let _ = result;
+                            return;
+                        }
                         let Ok((header, _)) = read_http_request_header(&mut stream, Vec::new(), 1000).await else { return; };
                         if index == 0 && scenario == "timeout" {
                             tokio::time::sleep(Duration::from_secs(2)).await;
@@ -126,7 +147,7 @@ async fn mock(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "54-case loopback benchmark; run explicitly with --ignored --nocapture"]
+#[ignore = "90-case loopback benchmark; run explicitly with --ignored --nocapture"]
 async fn benchmark_loopback_matrix() {
     let started = Instant::now();
     let before = resources();
@@ -146,6 +167,10 @@ async fn benchmark_loopback_matrix() {
                 "auth_failure",
                 "timeout",
                 "target_failure",
+                "slow_auth",
+                "queue_full",
+                "global_half_open",
+                "target_half_open",
             ] {
                 if !selected(scenario, "PROXY_LOAD_BENCH_SCENARIOS") {
                     continue;
@@ -170,8 +195,64 @@ async fn benchmark_loopback_matrix() {
                         peak_mock_tasks.clone(),
                     )
                     .await;
-                    add_proxy(&runtime, port);
+                    let proxy = add_proxy(&runtime, port);
+                    if scenario == "slow_auth" {
+                        runtime
+                            .db
+                            .update_proxy(
+                                proxy.id,
+                                crate::models::ProxyInput {
+                                    name: proxy.name.clone(),
+                                    proxy_type: "socks5".into(),
+                                    host: proxy.host.clone(),
+                                    port: proxy.port,
+                                    username: Some("user".into()),
+                                    password: Some("pass".into()),
+                                    enabled: Some(1),
+                                    test_url: None,
+                                    test_timeout: None,
+                                    skip_cert_verify: None,
+                                },
+                            )
+                            .unwrap();
+                    }
                     servers.push(server);
+                }
+                let pause = if scenario == "queue_full" {
+                    let pause = runtime.database_worker.pause_for_test();
+                    for _ in 0..4096 {
+                        runtime.database_worker.log(RequestLogEntry {
+                            proxy_id: None,
+                            target_host: "queue-fixture",
+                            target_port: 80,
+                            success: false,
+                            response_time: None,
+                            error_message: None,
+                            result_type: "proxy_exhausted",
+                        });
+                    }
+                    Some(pause)
+                } else {
+                    None
+                };
+                if matches!(scenario, "global_half_open" | "target_half_open") {
+                    let mut config = runtime.runtime_settings.write().unwrap();
+                    config.algorithm = "round_robin".into();
+                    let mut breaker = CircuitBreaker::new(config.circuit);
+                    breaker.record_failure();
+                    breaker.next_attempt = 0;
+                    drop(config);
+                    if scenario == "global_half_open" {
+                        runtime.circuit_breakers.write().unwrap().insert(1, breaker);
+                    } else {
+                        runtime.target_circuits.write().unwrap().insert(
+                            TargetRouteKey::new(1, &request("blocked.test")),
+                            TargetCircuit {
+                                breaker,
+                                last_failure: monotonic_millis(),
+                            },
+                        );
+                    }
                 }
                 let done = Arc::new(AtomicBool::new(false));
                 let lag = tokio::spawn({
@@ -193,6 +274,8 @@ async fn benchmark_loopback_matrix() {
                         let mut updates = 0;
                         while !done.load(Ordering::Relaxed) {
                             db.overview(0).unwrap();
+                            // Same backend reads used by the visible charts/log page.
+                            db.traffic_logs(1, 25, None).unwrap();
                             if updates % 8 == 0 {
                                 db.update_proxy_priority(1, updates).unwrap();
                             }
@@ -247,6 +330,7 @@ async fn benchmark_loopback_matrix() {
                 done.store(true, Ordering::Relaxed);
                 let lag = lag.await.unwrap();
                 let updates = observer.await.unwrap();
+                drop(pause);
                 assert!(runtime.flush_logs(Duration::from_secs(5)));
                 assert!(runtime.active_connections.lock().unwrap().is_empty());
                 let mut distribution = HashMap::<i64, usize>::new();
