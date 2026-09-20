@@ -891,6 +891,7 @@ pub struct UpdateArtifact {
     kind: String,
     is_newer: bool,
     size: Option<u64>,
+    has_manifest: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -904,6 +905,8 @@ pub struct UpdateInfo {
     has_update: bool,
     latest: Option<UpdateArtifact>,
     artifacts: Vec<UpdateArtifact>,
+    automatic_install_available: bool,
+    manual_reason: Option<String>,
 }
 
 #[tauri::command]
@@ -928,6 +931,18 @@ pub async fn check_for_updates(
 ) -> CommandResult<UpdateInfo> {
     let mirror = update_mirror::selected_url(&state.db, use_mirror.unwrap_or(false))?;
     build_update_info(mirror.as_deref()).await
+}
+
+#[tauri::command]
+pub fn open_official_releases(app: AppHandle) -> CommandResult<()> {
+    use tauri_plugin_opener::OpenerExt;
+    app.opener()
+        .open_url(GITHUB_RELEASES_URL, None::<&str>)
+        .map_err(|error| CommandError::new(format!("无法打开官方发布页: {error}")))
+}
+
+fn manual_update_response(reason: &str) -> Value {
+    json!({"manual": true, "officialUrl": GITHUB_RELEASES_URL, "message": reason})
 }
 
 #[tauri::command]
@@ -966,6 +981,9 @@ pub async fn install_update(
     if !selected.is_newer {
         return Err(CommandError::new("选中的更新包版本不高于当前版本"));
     }
+    if let Some(reason) = artifact_manual_reason(&selected)? {
+        return Ok(manual_update_response(&reason));
+    }
 
     fs::create_dir_all(&download_dir)?;
     let selected_path = download_dir.join(&selected.file_name);
@@ -984,6 +1002,11 @@ pub async fn install_update(
     )
     .send()
     .await?;
+    if manifest_response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(manual_update_response(
+            "此更新包未提供签名清单，请前往官方 Releases 手动安装。",
+        ));
+    }
     let manifest = crate::update_auth::read_manifest(manifest_response).await?;
     let verified = crate::update_auth::verify(
         &manifest,
@@ -1478,6 +1501,11 @@ async fn build_update_info(mirror_base: Option<&str>) -> CommandResult<UpdateInf
         CommandError::new(format!("GitHub Release 标签不是有效版本号: {release_tag}"))
     })?;
 
+    let manifests = assets
+        .iter()
+        .filter_map(|asset| asset.name.strip_suffix(".manifest.json"))
+        .map(str::to_string)
+        .collect::<HashSet<_>>();
     let mut artifacts = assets
         .into_iter()
         .filter_map(|asset| {
@@ -1492,6 +1520,7 @@ async fn build_update_info(mirror_base: Option<&str>) -> CommandResult<UpdateInf
                 return None;
             }
             Some(UpdateArtifact {
+                has_manifest: manifests.contains(&asset.name),
                 file_name: asset.name,
                 path: asset.download_url.clone(),
                 download_url: asset.download_url,
@@ -1504,6 +1533,12 @@ async fn build_update_info(mirror_base: Option<&str>) -> CommandResult<UpdateInf
         .collect::<Vec<_>>();
     artifacts.sort_by(|left, right| compare_artifacts(right, left));
     let latest = artifacts.iter().find(|artifact| artifact.is_newer).cloned();
+    let manual_reason = latest
+        .as_ref()
+        .map(artifact_manual_reason)
+        .transpose()?
+        .flatten();
+    let automatic_install_available = latest.is_some() && manual_reason.is_none();
 
     Ok(UpdateInfo {
         current_version,
@@ -1518,7 +1553,24 @@ async fn build_update_info(mirror_base: Option<&str>) -> CommandResult<UpdateInf
         has_update: latest.is_some(),
         latest,
         artifacts,
+        automatic_install_available,
+        manual_reason,
     })
+}
+
+fn artifact_manual_reason(artifact: &UpdateArtifact) -> CommandResult<Option<String>> {
+    if let Some(reason) = crate::update_auth::manual_install_reason(artifact.has_manifest)? {
+        return Ok(Some(reason.into()));
+    }
+    if !matches!(
+        artifact.kind.as_str(),
+        "windows-portable" | "windows-nsis" | "windows-msi" | "macos-dmg"
+    ) {
+        return Ok(Some(
+            "请从官方 Releases 下载适合当前系统的安装包并手动安装。".into(),
+        ));
+    }
+    Ok(None)
 }
 
 fn current_app_dir() -> CommandResult<PathBuf> {

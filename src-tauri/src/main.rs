@@ -160,6 +160,7 @@ pub fn run() {
             commands::get_update_mirror_settings,
             commands::save_update_mirror_url,
             commands::check_for_updates,
+            commands::open_official_releases,
             commands::install_update
         ])
         .build(tauri::generate_context!())

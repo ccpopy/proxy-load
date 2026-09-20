@@ -3,6 +3,7 @@ import { createReadStream } from "node:fs"
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises"
 import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path"
 import { pathToFileURL } from "node:url"
+import { releaseMode } from "./release-policy.mjs"
 
 export function artifactKind(name) {
   const lower = name.toLowerCase()
@@ -58,10 +59,12 @@ async function main() {
     console.log("Signing key files created. Back up the private key securely; never commit it.")
     return
   }
-  const key = loadSigningKey()
+  const mode = releaseMode()
+  const key = mode === "signed" ? loadSigningKey() : null
   const { version } = JSON.parse(await readFile("package.json", "utf8"))
   if (process.env.RELEASE_TAG !== `v${version}`) throw new Error("Release tag must match the checked-out package version")
-  if (command === "check") { console.log("Update signing configuration verified"); return }
+  if (command === "check") { console.log(mode === "signed" ? "Update signing configuration verified" : "Explicit manual distribution: no automatic installation manifest will be produced"); return }
+  if (!key) throw new Error("Manual distribution cannot sign update manifests")
   if (command !== "sign" || args.length < 3) throw new Error("Usage: update-signing.mjs sign <platform> <arch> <artifact>...")
   const [platform, arch, ...files] = args
   for (const file of files) await signArtifact(file, { version, platform, arch, key })

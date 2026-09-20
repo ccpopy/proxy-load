@@ -19,6 +19,14 @@ test('same parameters still reject an older response', () => {
   assert.equal(latest(), true);
 });
 import { groupPolicyPayload } from "../web/src/lib/group-policy.ts"
+import { updateAction } from "../web/src/lib/update-action.ts"
+
+test("manual update UI never chooses unverified installation", () => {
+  assert.equal(updateAction(null),"none")
+  assert.equal(updateAction({latest:null,automaticInstallAvailable:false}),"none")
+  assert.equal(updateAction({latest:{version:"26.9.20"},automaticInstallAvailable:false}),"manual")
+  assert.equal(updateAction({latest:{version:"26.9.20"},automaticInstallAvailable:true}),"install")
+})
 
 test("group policy preserves inheritance and bounds the failover hold", () => {
   assert.deepEqual(groupPolicyPayload("inherit", "0"), {algorithm_override:null,sticky_failover_seconds:0})

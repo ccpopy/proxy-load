@@ -5,6 +5,26 @@ import { mkdtemp, readFile, rm, rmdir, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import { artifactKind, loadSigningKey, signArtifact } from "./update-signing.mjs"
+import { releaseMode, releaseNotes } from "./release-policy.mjs"
+import { spawnSync } from "node:child_process"
+
+test("release configuration CLI accepts keyless manual mode but rejects keyless signed mode", async () => {
+  const {version} = JSON.parse(await readFile("package.json","utf8"))
+  const env = {...process.env,RELEASE_TAG:`v${version}`,PROXY_LOAD_UPDATE_PRIVATE_KEY:"",PROXY_LOAD_UPDATE_PUBLIC_KEY:""}
+  const run = mode => spawnSync(process.execPath,["scripts/update-signing.mjs","check"],{env:{...env,RELEASE_MODE:mode},encoding:"utf8",windowsHide:true})
+  assert.equal(run("manual").status,0)
+  assert.notEqual(run("signed").status,0)
+  assert.notEqual(run("auto").status,0)
+})
+
+test("manual publishing is explicit and cannot silently replace signed mode", () => {
+  assert.equal(releaseMode({}),"signed")
+  assert.throws(()=>loadSigningKey({RELEASE_MODE:"signed"}))
+  assert.equal(releaseMode({RELEASE_MODE:"manual"}),"manual")
+  assert.throws(()=>releaseMode({RELEASE_MODE:"auto"}))
+  assert.match(releaseNotes("changes","manual"),/仅供.*手动安装/)
+  assert.match(releaseNotes("changes","signed"),/Ed25519/)
+})
 
 test("release signing binds the exact streamed bytes and rejects mismatched trust roots", async () => {
   const { privateKey, publicKey } = generateKeyPairSync("ed25519")

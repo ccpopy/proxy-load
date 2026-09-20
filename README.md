@@ -288,7 +288,14 @@ v*
 - macOS Apple Silicon
 - macOS Intel
 
-workflow 先运行三平台回归检查，随后构建并签名本地安装包，上传安装包及对应的 `.manifest.json`。所有选定平台成功后才将草稿发布为正式 GitHub Release；普通提交只运行检查，不触发发布。Release 内容来自仓库中的 `RELEASE_NOTES.md`，发布前应仅保留本次变更。
+workflow 先运行三平台回归检查，随后按明确选择的模式构建、上传本地安装包。所有选定平台成功后才将草稿发布为正式 GitHub Release；普通提交只运行检查，不触发发布。Release 内容来自 `RELEASE_NOTES.md`，只保留本次变更，工作流附加安装方式说明。
+
+- `signed`：需要项目公私钥齐全且匹配，构建后为最终产物生成 `.manifest.json`；缺钥、错钥直接失败，不悄悄改为 manual。
+- `manual`：无需项目私钥或 Apple Secrets，正常构建、上传供用户手动安装；不生成自动安装清单，客户端仍可检查更新，但只能打开固定官方 Releases 页面。
+
+手动运行 Release 时明确选择 `release_mode`（默认 manual）。tag 触发默认 signed；若希望 tag 使用 manual，需要事先明确设置仓库 Variable `PROXY_LOAD_RELEASE_MODE=manual`。同一 tag 不混用模式，避免旧清单与新产物错配。正式发布前同步 package/Cargo/tauri/version 定义与日期标签。
+
+macOS bundle 使用 `signingIdentity: "-"` 的 ad-hoc 签名，无需 Apple Developer ID 或公证身份；系统仍可能要求手动允许，不承诺没有 Gatekeeper 提示，也不要求全局关闭系统安全检查。配置依据 [Tauri ad-hoc 文档](https://v2.tauri.app/distribute/sign/macos/#ad-hoc-signing)，系统提示见 [Apple 说明](https://support.apple.com/en-us/102445)。HTTPS 证书校验保持开启。
 
 ### 更新验签配置（不需要应用商店证书）
 
@@ -304,7 +311,7 @@ node scripts/update-signing.mjs generate "$HOME/proxy-load-keys/update.private.p
 - Variable `PROXY_LOAD_UPDATE_PUBLIC_KEY`：相邻 `.pub` 文件的 Base64 公钥内容；构建时嵌入应用。
 - 可选 Secret `PROXY_LOAD_UPDATE_KEY_PASSWORD`：使用自行加密的 PEM 私钥时填写密码。
 
-缺少配置或公私钥不匹配会阻止 Release。私钥只传入签名步骤，不传给应用编译步骤。每份清单绑定版本、系统、架构、安装形式、文件名、长度及 SHA-256 摘要；镜像仅负责传输，不能提供或替换应用信任的公钥。缺签、验签失败或内容不符时拒绝安装，不降级为未验签更新。
+signed 模式缺少配置或公私钥不匹配会阻止 Release。私钥只传入签名步骤，不传给应用编译步骤。每份清单绑定版本、系统、架构、安装形式、文件名、长度及 SHA-256 摘要；镜像仅负责传输，不能提供或替换应用信任的公钥。没有可信公钥或旧包缺签时明确提供官方发布页手动路径；签名/摘要/平台校验失败时拒绝当前产物，不自动降级执行。
 
 首次启用前，应通过可信渠道手动安装包含正确公钥的版本；旧的未验签客户端不会因服务器增加清单而自动获得验签能力。后续发布必须沿用同一私钥；直接替换公钥会使旧客户端拒绝新包，密钥轮换需要单独设计过渡。未配置公钥的开发构建仍可运行，但不能自动安装更新。本仓库不包含生产私钥，也不会由脚本自动配置仓库 Secrets。
 
@@ -355,7 +362,7 @@ Rust 后端启动时会自动创建表，并补齐缺失字段。
 
 普通 HTTP 日志区分“已转发待响应”“上游已响应”和传输结束/错误，目标 HTTP 5xx 不直接判定代理全局故障；407 属于代理认证失败。传输记录包含双向字节数、持续时间和关闭原因。系统明确报告本地网络不可用时单独归类，不根据一批超时猜测本地断网。
 
-更新下载先验证不超过 16 KiB 的发布者签名清单，再写入独立会话目录中的流式 `.part` 文件，限制为 1 GiB，完成签名所绑定的摘要、大小及格式检查后才发布；取消与失败清理未完成文件。资产按系统、安装形式及 CPU 架构筛选，Windows 便携包验证 PE 架构，NSIS 允许为 64 位载荷使用 32 位安装器外壳。后端禁止重复安装，并保留 Windows 辅助进程等待旧进程退出的交接。未接入操作系统应用签名或 Apple 公证。
+允许应用内安装时，更新下载先验证不超过 16 KiB 的发布者签名清单，再写入独立会话目录中的流式 `.part` 文件，限制为 1 GiB，完成签名所绑定的摘要、大小及格式检查后才发布；取消与失败清理未完成文件。资产按系统、安装形式及 CPU 架构筛选，Windows 便携包验证 PE 架构，NSIS 允许为 64 位载荷使用 32 位安装器外壳。后端禁止重复安装，并保留 Windows 辅助进程等待旧进程退出的交接。macOS 使用 ad-hoc 签名，未接入 Apple Developer ID 或公证。
 
 Windows 便携更新由辅助进程在旧 PID 退出后替换原 EXE 入口，不直接启动 staging 中的文件，因此原快捷方式和默认 `data` 根目录保持不变；显式 `DATA_DIR` 也保留（相对路径在交接前固定为绝对路径）。旧 EXE 保存在原目录的唯一 `.rollback-*` 文件中，新版本 30 秒内未确认启动会恢复并重启旧入口。不复制运行中的 SQLite 数据目录；仅清理本次成功更新后空的 staging，保留回滚文件。升级/退出会停止接入、取消现有连接，并关闭后台日志入队后最多刷盘 5 秒，超时会记录失败而不是无限等待。
 

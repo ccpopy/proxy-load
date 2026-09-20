@@ -1,13 +1,15 @@
 // CI-only: sign local build outputs before uploading them; never sign mirror downloads.
 import { execFileSync } from "node:child_process"
-import { copyFile, mkdtemp, readFile, stat } from "node:fs/promises"
+import { copyFile, mkdtemp, readFile, stat, writeFile } from "node:fs/promises"
 import { basename, extname, join } from "node:path"
 import { artifactKind, loadSigningKey, signArtifact } from "./update-signing.mjs"
+import { releaseMode, releaseNotes } from "./release-policy.mjs"
 
 const { version } = JSON.parse(await readFile("package.json", "utf8"))
 const tag = process.env.RELEASE_TAG
 if (tag !== `v${version}`) throw new Error("Release tag/version mismatch")
-const key = loadSigningKey()
+const mode = releaseMode()
+const key = mode === "signed" ? loadSigningKey() : null
 const label = process.env.BUILD_LABEL
 const platform = label?.startsWith("windows-") ? "windows" : label?.startsWith("linux-") ? "linux" : label?.startsWith("macos-") ? "macos" : null
 if (!platform) throw new Error("Unknown build platform")
@@ -33,12 +35,17 @@ if (platform === "windows") {
 if (prepared.length === 0) throw new Error("No installable release artifacts produced")
 const uploads = []
 for (const file of prepared) {
-  uploads.push(file, await signArtifact(file, { version, platform, arch, key }))
+  uploads.push(file)
+  if (key) uploads.push(await signArtifact(file, { version, platform, arch, key }))
 }
+const notes = join(directory,"release-notes.md")
+await writeFile(notes,releaseNotes(await readFile("RELEASE_NOTES.md","utf8"),mode))
 const gh = (...args) => execFileSync("gh", args, { stdio: ["ignore", "pipe", "pipe"] })
 try { gh("release", "view", tag) } catch {
-  try { gh("release", "create", tag, "--verify-tag", "--draft", "--title", `proxy-load ${tag}`, "--notes-file", "RELEASE_NOTES.md") }
+  try { gh("release", "create", tag, "--verify-tag", "--draft", "--title", `proxy-load ${tag}`, "--notes-file", notes) }
   catch (error) { try { gh("release", "view", tag) } catch { throw error } }
 }
+const existing = JSON.parse(gh("release","view",tag,"--json","body").toString())
+if (!existing.body.includes(`<!-- proxy-load-release-mode: ${mode} -->`)) throw new Error("Release mode differs or is unknown; use a new version/tag instead of mixing signed and manual artifacts")
 gh("release", "upload", tag, ...uploads, "--clobber")
-console.log(`Uploaded ${prepared.length} signed update artifact(s) for ${label}`)
+console.log(`Uploaded ${prepared.length} ${mode} update artifact(s) for ${label}`)

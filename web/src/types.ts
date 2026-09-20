@@ -159,6 +159,7 @@ export interface UpdateArtifact {
   kind: string
   isNewer: boolean
   size?: number | null
+  hasManifest: boolean
 }
 
 export interface UpdateInfo {
@@ -170,6 +171,8 @@ export interface UpdateInfo {
   hasUpdate: boolean
   latest?: UpdateArtifact | null
   artifacts: UpdateArtifact[]
+  automaticInstallAvailable: boolean
+  manualReason?: string | null
 }
 
 export interface TransferCounts {

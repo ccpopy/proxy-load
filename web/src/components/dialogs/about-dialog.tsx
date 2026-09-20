@@ -2,6 +2,7 @@ import { type ReactNode } from "react"
 import { Download, Loader2, Network, RefreshCw } from "lucide-react"
 
 import { type ServiceInfo } from "@/lib/api"
+import { updateAction } from "@/lib/update-action"
 import { useUpdateMirrorSettings } from "@/lib/use-update-mirror-settings"
 import type { UpdateInfo, VersionInfo } from "@/types"
 import { Button } from "@/components/ui/button"
@@ -119,7 +120,7 @@ export function AboutDialog({
             <FieldContent>
               <FieldTitle>自动检查更新</FieldTitle>
               <FieldDescription>
-                默认关闭；开启后应用启动和运行期间会自动检查，发现新版本时弹出可直接更新的通知
+                默认关闭；开启后应用启动和运行期间会自动检查，发现新版本时弹出通知
               </FieldDescription>
             </FieldContent>
             <Switch
@@ -130,6 +131,11 @@ export function AboutDialog({
           </Field>
         </div>
 
+        {updateInfo?.hasUpdate && updateInfo.manualReason && (
+          <p role="status" className="rounded-md border bg-muted/40 p-3 text-sm text-muted-foreground">
+            {updateInfo.manualReason}
+          </p>
+        )}
         <DialogFooter>
           <Button variant="outline" onClick={onCheckUpdates} disabled={checking || installing || mirror.saving}>
             {checking ? (
@@ -148,7 +154,7 @@ export function AboutDialog({
             ) : (
               <Download data-icon="inline-start" />
             )}
-            {updateInfo?.installMode === "portable" ? "下载并重启" : "安装更新"}
+            {updateAction(updateInfo) === "manual" ? "前往官方发布页" : updateInfo?.installMode === "portable" ? "下载并重启" : "安装更新"}
           </Button>
         </DialogFooter>
       </DialogContent>

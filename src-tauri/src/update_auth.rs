@@ -46,6 +46,30 @@ pub fn public_key() -> Result<Vec<u8>> {
     decode_key(option_env!("PROXY_LOAD_UPDATE_PUBLIC_KEY").unwrap_or_default())
 }
 
+pub fn manual_install_reason(has_manifest: bool) -> Result<Option<&'static str>> {
+    installation_policy(
+        option_env!("PROXY_LOAD_UPDATE_MODE").unwrap_or("signed"),
+        option_env!("PROXY_LOAD_UPDATE_PUBLIC_KEY").unwrap_or_default(),
+        has_manifest,
+    )
+}
+
+fn installation_policy(mode: &str, key: &str, has_manifest: bool) -> Result<Option<&'static str>> {
+    if !matches!(mode, "signed" | "manual") {
+        bail!("当前构建的更新模式无效");
+    }
+    if mode == "manual" || key.trim().is_empty() {
+        return Ok(Some("此版本使用手动更新，请从官方 Releases 下载并安装。"));
+    }
+    decode_key(key)?;
+    if !has_manifest {
+        return Ok(Some(
+            "此更新包未提供签名清单，请前往官方 Releases 手动安装。",
+        ));
+    }
+    Ok(None)
+}
+
 fn decode_key(encoded: &str) -> Result<Vec<u8>> {
     let key = STANDARD
         .decode(encoded.trim())
@@ -128,6 +152,19 @@ mod tests {
         signature::{Ed25519KeyPair, KeyPair},
     };
     use serde_json::{json, Value};
+
+    #[test]
+    fn update_policy_allows_manual_distribution_but_never_unsigned_execution() {
+        let key = STANDARD.encode([1; 32]);
+        assert!(installation_policy("manual", "", false).unwrap().is_some());
+        assert!(installation_policy("signed", "", true).unwrap().is_some());
+        assert!(installation_policy("signed", &key, false)
+            .unwrap()
+            .is_some());
+        assert!(installation_policy("signed", &key, true).unwrap().is_none());
+        assert!(installation_policy("signed", "invalid", true).is_err());
+        assert!(installation_policy("unknown", &key, true).is_err());
+    }
 
     fn signed(key: &Ed25519KeyPair, payload: &Value) -> Vec<u8> {
         let bytes = serde_json::to_vec(payload).unwrap();

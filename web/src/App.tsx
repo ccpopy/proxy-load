@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react"
 import { toast } from "sonner"
 import { createLatestRequestGuard } from "@/lib/latest-request"
+import { updateAction } from "@/lib/update-action"
 
 import {
   api,
@@ -248,11 +249,20 @@ export function App() {
       updateInstallingRef.current = true
       setUpdateInstalling(true)
       try {
-        const result = await command<{ message?: string }>("install_update", {
+        if (updateAction(info) === "manual") {
+          await command("open_official_releases")
+          return
+        }
+        const result = await command<{ message?: string; manual?: boolean }>("install_update", {
           artifactPath: info.latest.path,
           useMirror,
         })
-        toast.success(result.message ?? "已启动更新安装程序")
+        if (result.manual) {
+          toast.info(result.message ?? "请从官方发布页手动安装")
+          await command("open_official_releases")
+        } else {
+          toast.success(result.message ?? "已启动更新安装程序")
+        }
         setAboutOpen(false)
       } catch (error) {
         toast.error(commandErrorMessage(error, "安装更新失败"))
@@ -273,7 +283,7 @@ export function App() {
       notifiedUpdateVersions.current.add(latestVersion)
       toast.info(`发现新版本：v${latestVersion}`, {
         action: {
-          label: "更新",
+          label: updateAction(info) === "manual" ? "前往发布页" : "更新",
           onClick: () => {
             void installUpdate(info, useMirror)
           },

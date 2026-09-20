@@ -21,12 +21,21 @@ on:
           - linux-x64
           - macos-aarch64
           - macos-x64
+      release_mode:
+        description: "signed requires project keys; manual only permits manual installation"
+        required: true
+        type: choice
+        default: manual
+        options:
+          - manual
+          - signed
 
 permissions:
   contents: write
 
 env:
   RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+  RELEASE_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.release_mode || vars.PROXY_LOAD_RELEASE_MODE || 'signed' }}
 
 jobs:
   checks:
@@ -116,7 +125,7 @@ jobs:
         run: |
           node -e "const fs = require('fs'); const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8')); console.log('version=' + pkg.version)" >> "$GITHUB_OUTPUT"
 
-      - name: Validate update signing configuration
+      - name: Validate explicit publication mode and signing configuration
         env:
           PROXY_LOAD_UPDATE_PRIVATE_KEY: ${{ secrets.PROXY_LOAD_UPDATE_PRIVATE_KEY }}
           PROXY_LOAD_UPDATE_PUBLIC_KEY: ${{ vars.PROXY_LOAD_UPDATE_PUBLIC_KEY }}
@@ -127,12 +136,13 @@ jobs:
         id: tauri-build
         uses: tauri-apps/tauri-action@action-v0.6.2
         env:
-          PROXY_LOAD_UPDATE_PUBLIC_KEY: ${{ vars.PROXY_LOAD_UPDATE_PUBLIC_KEY }}
+          PROXY_LOAD_UPDATE_PUBLIC_KEY: ${{ env.RELEASE_MODE == 'signed' && vars.PROXY_LOAD_UPDATE_PUBLIC_KEY || '' }}
+          PROXY_LOAD_UPDATE_MODE: ${{ env.RELEASE_MODE }}
         with:
           tauriScript: npm run tauri
           args: ${{ matrix.args }}
 
-      - name: Sign and upload local build artifacts
+      - name: Publish local artifacts in the selected mode
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ env.RELEASE_TAG }}
@@ -144,15 +154,20 @@ jobs:
         run: node scripts/publish-signed-release.mjs
 
   publish:
-    name: Publish signed release
+    name: Publish release
     needs: build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref }}
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
       - name: Publish only after every selected build succeeds
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release edit "$RELEASE_TAG" --draft=false --notes-file RELEASE_NOTES.md
+        run: |
+          node scripts/release-policy.mjs notes RELEASE_NOTES.md "$RUNNER_TEMP/release-notes.md"
+          gh release edit "$RELEASE_TAG" --draft=false --notes-file "$RUNNER_TEMP/release-notes.md"
 
