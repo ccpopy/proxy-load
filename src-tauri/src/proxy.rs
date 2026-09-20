@@ -584,7 +584,7 @@ impl ProxyRuntime {
         request: &TargetRequest,
         excluded: &HashSet<i64>,
     ) -> Result<Vec<ProxyRecord>> {
-        self.select_from_snapshot(&self.db.routing_snapshot(), request, excluded)
+        self.select_from_snapshot(&self.db.routing_snapshot(), request, excluded, true)
     }
 
     fn select_from_snapshot(
@@ -592,6 +592,7 @@ impl ProxyRuntime {
         snapshot: &crate::routing::RoutingSnapshot,
         request: &TargetRequest,
         excluded: &HashSet<i64>,
+        commit_selection: bool,
     ) -> Result<Vec<ProxyRecord>> {
         let mut proxies = snapshot.proxies.clone();
         if proxies.is_empty() {
@@ -665,7 +666,13 @@ impl ProxyRuntime {
             }
         }
 
-        let mut ordered = self.order_proxies_in_pool(eligible, &algorithm, &group_key, pool_id)?;
+        let mut ordered = self.order_proxies_in_pool(
+            eligible,
+            &algorithm,
+            &group_key,
+            pool_id,
+            commit_selection,
+        )?;
         if let Some(policy) = sticky_routes::Policy::for_request(snapshot, request, &algorithm) {
             self.sticky_routes
                 .lock()
@@ -725,20 +732,45 @@ impl ProxyRuntime {
         let selection_started = Instant::now();
         let snapshot = self.db.routing_snapshot();
         let mut saturated = false;
-        let candidates = self.select_from_snapshot(&snapshot, request, excluded)?;
-        let algorithm = self
-            .runtime_settings
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .algorithm
-            .clone();
+        let mut unavailable = excluded.clone();
+        {
+            let slots = self.dial_slots.lock().unwrap_or_else(|e| e.into_inner());
+            for (id, capacity) in slots.iter() {
+                if capacity.available_permits() == 0 {
+                    unavailable.insert(*id);
+                }
+            }
+        }
+        // Remember whether THIS pool has eligible but temporarily full nodes.
+        let candidates = self.select_from_snapshot(&snapshot, request, excluded, false)?;
+        saturated |= candidates
+            .iter()
+            .any(|proxy| unavailable.contains(&proxy.id));
+        let group_key = crate::routing::normalize_host(&request.original_host);
+        let pool = snapshot.pool(&group_key);
+        let algorithm = pool
+            .and_then(|pool| pool.algorithm_override.clone())
+            .unwrap_or_else(|| {
+                self.runtime_settings
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .algorithm
+                    .clone()
+            });
         let failover_policy = sticky_routes::Policy::for_request(&snapshot, request, &algorithm)
             .filter(|policy| {
                 !candidates.iter().any(|proxy| {
                     proxy.id == policy.preferred && proxy.status.as_deref() != Some("inactive")
                 })
             });
-        for proxy in candidates {
+        loop {
+            let mut candidates =
+                self.select_from_snapshot(&snapshot, request, &unavailable, false)?;
+            if candidates.is_empty() {
+                break;
+            }
+            let proxy = candidates.swap_remove(0);
+            unavailable.insert(proxy.id);
             let Some(generation) = snapshot.node_generations.get(&proxy.id).copied() else {
                 continue;
             };
@@ -758,6 +790,7 @@ impl ProxyRuntime {
             };
             let token = Arc::new(());
             if self.try_begin_attempt_token(proxy.id, request, Some(&token)) {
+                self.commit_pool_selection(pool.map_or(0, |pool| pool.id), &algorithm, proxy.id);
                 self.increment_active(proxy.id);
                 self.telemetry.record(
                     "selection_hold",
@@ -793,7 +826,29 @@ impl ProxyRuntime {
         algorithm: &str,
         host_key: &str,
     ) -> Result<Vec<ProxyRecord>> {
-        self.order_proxies_in_pool(proxies, algorithm, host_key, 0)
+        self.order_proxies_in_pool(proxies, algorithm, host_key, 0, true)
+    }
+
+    fn commit_pool_selection(&self, pool_id: i64, algorithm: &str, proxy_id: i64) {
+        let advance_cursor = match algorithm {
+            "least_connections" | "round_robin" => true,
+            "sticky_host" => false,
+            _ => {
+                let mut sequences = self
+                    .adaptive_sequence
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let sequence = sequences.entry(pool_id).or_default();
+                *sequence = sequence.wrapping_add(1);
+                sequence.is_multiple_of(16)
+            }
+        };
+        if advance_cursor {
+            self.round_robin_index
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(pool_id, proxy_id);
+        }
     }
 
     fn order_proxies_in_pool(
@@ -802,10 +857,14 @@ impl ProxyRuntime {
         algorithm: &str,
         host_key: &str,
         pool_id: i64,
+        commit_selection: bool,
     ) -> Result<Vec<ProxyRecord>> {
+        if proxies.is_empty() {
+            return Ok(proxies);
+        }
         match algorithm {
             "least_connections" => {
-                let mut cursors = self
+                let cursors = self
                     .round_robin_index
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
@@ -824,14 +883,13 @@ impl ProxyRuntime {
                     )
                 }) {
                     proxies.swap(0, index);
-                    cursors.insert(pool_id, proxies[0].id);
                 }
             }
             "round_robin" => {
                 // Stable ID ring: health/exclusion skips do not redefine cursor positions.
                 // Priority edits do not move the ring; a removed cursor resumes at its successor.
                 proxies.sort_by_key(|proxy| proxy.id);
-                let mut cursors = self
+                let cursors = self
                     .round_robin_index
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
@@ -843,7 +901,6 @@ impl ProxyRuntime {
                         .unwrap_or(0);
                     proxies.rotate_left(selected);
                     proxies = prioritize_route_status(proxies);
-                    cursors.insert(pool_id, proxies[0].id);
                 }
             }
             "sticky_host" => {
@@ -866,10 +923,13 @@ impl ProxyRuntime {
                             .iter()
                             .any(|p| p.id == *pool)
                 });
-                let sequence = sequences.entry(pool_id).or_default();
-                *sequence = sequence.wrapping_add(1);
-                let learning_turn = (*sequence).is_multiple_of(16);
-                let mut cursors = self
+                let sequence = sequences
+                    .get(&pool_id)
+                    .copied()
+                    .unwrap_or_default()
+                    .wrapping_add(1);
+                let learning_turn = sequence.is_multiple_of(16);
+                let cursors = self
                     .round_robin_index
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
@@ -920,13 +980,14 @@ impl ProxyRuntime {
                 });
                 if let Some(index) = best {
                     proxies.swap(0, index);
-                    if learning_turn {
-                        cursors.insert(pool_id, proxies[0].id);
-                    }
                 }
             }
         }
-        Ok(prioritize_route_status(proxies))
+        let proxies = prioritize_route_status(proxies);
+        if commit_selection {
+            self.commit_pool_selection(pool_id, algorithm, proxies[0].id);
+        }
+        Ok(proxies)
     }
 
     #[cfg(test)]

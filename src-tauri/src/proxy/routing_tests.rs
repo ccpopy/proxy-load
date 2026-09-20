@@ -450,6 +450,89 @@ async fn saturated_dial_capacity_waits_without_holding_selection_or_leaking_on_c
     );
 }
 
+#[tokio::test]
+async fn saturated_best_node_reselects_the_best_available_candidate() {
+    for algorithm in ["least_connections", "adaptive"] {
+        let runtime = runtime();
+        runtime.runtime_settings.write().unwrap().algorithm = algorithm.into();
+        let a = add_proxy(&runtime, 19001);
+        let target = request("example.com");
+        let mut pending = Vec::new();
+        for _ in 0..32 {
+            pending.push(
+                runtime
+                    .reserve_proxy(&target, &HashSet::new())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        let b = add_proxy(&runtime, 19002);
+        let c = add_proxy(&runtime, 19003);
+        runtime
+            .active_connections
+            .lock()
+            .unwrap()
+            .extend([(b.id, 100), (c.id, 40)]);
+        runtime.adaptive_sequence.lock().unwrap().insert(0, 0); // not a learning turn
+        assert_eq!(runtime.active_connections.lock().unwrap()[&a.id], 32);
+        assert_eq!(
+            runtime.dial_slots.lock().unwrap()[&a.id].available_permits(),
+            0
+        );
+        let selected = runtime
+            .reserve_proxy(&target, &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            selected.id, c.id,
+            "{algorithm} must reselect C, not unsorted B"
+        );
+        assert!(runtime.metrics.read().unwrap().is_empty());
+        drop(selected);
+        drop(pending);
+        assert_eq!(runtime.global_dial_slots.available_permits(), 64);
+        assert_eq!(
+            runtime.dial_slots.lock().unwrap()[&a.id].available_permits(),
+            32
+        );
+    }
+}
+
+#[tokio::test]
+async fn saturated_selection_does_not_advance_round_robin_or_learning_cursors() {
+    for algorithm in ["round_robin", "adaptive"] {
+        let runtime = runtime();
+        runtime.runtime_settings.write().unwrap().algorithm = algorithm.into();
+        add_proxy(&runtime, 19001);
+        let target = request("example.com");
+        let mut pending = Vec::new();
+        for _ in 0..32 {
+            pending.push(
+                runtime
+                    .reserve_proxy(&target, &HashSet::new())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        let cursor = runtime.round_robin_index.lock().unwrap().clone();
+        let learning = runtime.adaptive_sequence.lock().unwrap().clone();
+        assert!(timeout(
+            Duration::from_millis(20),
+            runtime.reserve_proxy(&target, &HashSet::new())
+        )
+        .await
+        .is_err());
+        assert_eq!(*runtime.round_robin_index.lock().unwrap(), cursor);
+        assert_eq!(*runtime.adaptive_sequence.lock().unwrap(), learning);
+        assert!(runtime.selection_lock.try_lock().is_ok());
+        drop(pending);
+        assert_eq!(runtime.global_dial_slots.available_permits(), 64);
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hot_routing_and_logging_do_not_wait_for_the_database_connection() {
     let runtime = runtime();
