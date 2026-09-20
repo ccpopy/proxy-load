@@ -231,6 +231,7 @@ async fn changed_test_settings_or_shutdown_discard_inflight_probe_without_health
         "change", "aba", "stop", "dns", "disable", "delete", "policy", "node_aba",
     ] {
         let state = state();
+        let mut diagnostic_events = state.events.subscribe();
         state
             .db
             .save_settings(
@@ -317,6 +318,17 @@ async fn changed_test_settings_or_shutdown_discard_inflight_probe_without_health
         release.notify_one();
         assert!(task.await.unwrap().is_err());
         server.await.unwrap();
+        let discarded = std::iter::from_fn(|| diagnostic_events.try_recv().ok())
+            .find(|event| event.event_type == "proxy_probe_discarded")
+            .unwrap();
+        assert_eq!(
+            discarded.data["outcome"],
+            if action == "stop" {
+                "cancelled"
+            } else {
+                "stale"
+            }
+        );
         if let Some(updated) = state.db.get_proxy(proxy.id).unwrap() {
             assert_eq!(updated.success_count, 0);
             assert_eq!(updated.fail_count, 0);

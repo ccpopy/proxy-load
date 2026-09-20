@@ -1528,7 +1528,10 @@ impl ProxyRuntime {
             != generation
             || self.db.probe_settings_revision() != settings_revision
         {
-            return Err(anyhow!("代理配置代号在测试期间已变化，已丢弃旧测试结果"));
+            return Err(crate::probe_health::abort(
+                crate::probe_health::ProbeAbortKind::Stale,
+                "代理配置代号在测试期间已变化，已丢弃旧测试结果",
+            ));
         }
         let traffic_proved_alive = self
             .metrics
@@ -1611,8 +1614,9 @@ impl ProxyRuntime {
             tokio::task::spawn_blocking(move || db.persist_probe_observation(&observed, &write))
                 .await??;
         if !updated {
-            return Err(anyhow!(
-                "代理配置在测试结果写入前发生变化，已丢弃旧测试结果"
+            return Err(crate::probe_health::abort(
+                crate::probe_health::ProbeAbortKind::Stale,
+                "代理配置在测试结果写入前发生变化，已丢弃旧测试结果",
             ));
         }
         Ok((applied_status.map(str::to_string), traffic_proved_alive))

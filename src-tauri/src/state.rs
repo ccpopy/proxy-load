@@ -492,6 +492,30 @@ impl AppState {
         scheduled_proxy: ProxyRecord,
         origin: ProbeOrigin,
     ) -> Result<Option<TestResult>> {
+        let id = scheduled_proxy.id;
+        let result = self.perform_proxy_probe(scheduled_proxy, origin).await;
+        if let Err(error) = &result {
+            // Lifecycle failures are separate from valid remote observations. In particular,
+            // never write a stale result into a newly edited/deleted node's health record.
+            let outcome = error
+                .downcast_ref::<crate::probe_health::ProbeAbort>()
+                .map(|error| json!(error.kind))
+                .unwrap_or_else(|| json!("unknown"));
+            self.emit(
+                "proxy_probe_discarded",
+                json!({"id": id, "outcome": outcome,
+                "observedAt": now_millis(), "message": error.to_string()}),
+            );
+        }
+        result
+    }
+
+    async fn perform_proxy_probe(
+        &self,
+        scheduled_proxy: ProxyRecord,
+        origin: ProbeOrigin,
+    ) -> Result<Option<TestResult>> {
+        use crate::probe_health::{abort, ProbeAbortKind as Abort};
         let queued_at = time::Instant::now();
         let queue_deadline = queued_at + Duration::from_secs(5);
         let probe_lock = {
@@ -506,19 +530,19 @@ impl AppState {
                 .clone()
         };
         let _probe_guard = tokio::select! {
-            _ = self.proxy_runtime.cancelled() => return Err(anyhow!("服务已停止，测活已取消")),
+            _ = self.proxy_runtime.cancelled() => return Err(abort(Abort::Cancelled, "服务已停止，测活已取消")),
             guard = time::timeout_at(queue_deadline, probe_lock.lock()) =>
-                guard.map_err(|_| anyhow!("同节点测活排队超时，请稍后重试"))?,
+                guard.map_err(|_| abort(Abort::QueueTimeout, "同节点测活排队超时，请稍后重试"))?,
         };
         // Includes manual probes; no separate unlimited manual concurrency path.
         let _global_permit = tokio::select! {
-            _ = self.proxy_runtime.cancelled() => return Err(anyhow!("服务已停止，测活已取消")),
+            _ = self.proxy_runtime.cancelled() => return Err(abort(Abort::Cancelled, "服务已停止，测活已取消")),
             permit = time::timeout_at(
             queue_deadline,
             self.probe_slots
                 .clone()
                 .acquire_many_owned(64u32.div_ceil(self.probe_schedule()?.concurrency as u32)),
-        ) => permit.map_err(|_| anyhow!("测活队列繁忙，请稍后重试"))??,
+        ) => permit.map_err(|_| abort(Abort::QueueTimeout, "测活队列繁忙，请稍后重试"))??,
         };
         let Some(proxy) = self.db.get_proxy(scheduled_proxy.id)? else {
             return Ok(None);
@@ -568,9 +592,13 @@ impl AppState {
             .and_then(|value| u64::try_from(value).ok())
             .map(|value| value * 1000)
             .unwrap_or(global_timeout);
-        let target = Url::parse(&test_url).context("测试地址无效")?;
+        let target =
+            Url::parse(&test_url).map_err(|_| abort(Abort::Configuration, "测试地址无效"))?;
         if target.host_str().is_none() || !matches!(target.scheme(), "http" | "https") {
-            return Err(anyhow!("测试地址必须是包含主机名的 HTTP 或 HTTPS URL"));
+            return Err(abort(
+                Abort::Configuration,
+                "测试地址必须是包含主机名的 HTTP 或 HTTPS URL",
+            ));
         }
 
         let probe_started_at = proxy::monotonic_millis();
@@ -585,15 +613,15 @@ impl AppState {
         }
 
         let result = tokio::select! {
-            _ = self.proxy_runtime.cancelled() => return Err(anyhow!("服务已停止，测活已取消")),
+            _ = self.proxy_runtime.cancelled() => return Err(abort(Abort::Cancelled, "服务已停止，测活已取消")),
             result = proxy_tester::test_proxy_mapped(&proxy, &test_url, timeout, &dns_mappings) => result,
         };
         let _settings_guard = self.settings_update_guard().await;
         if self.proxy_runtime.is_stopping() {
-            return Err(anyhow!("服务已停止，测活结果已丢弃"));
+            return Err(abort(Abort::Cancelled, "服务已停止，测活结果已丢弃"));
         }
         let Some(latest) = self.db.get_proxy(proxy.id)? else {
-            return Err(anyhow!("代理已删除，测活结果已丢弃"));
+            return Err(abort(Abort::Stale, "代理已删除，测活结果已丢弃"));
         };
         let latest_settings = self.db.settings_map()?;
         if self.db.probe_settings_revision() != settings_revision
@@ -601,7 +629,10 @@ impl AppState {
             || latest_settings.get("test_url") != settings.get("test_url")
             || latest_settings.get("timeout") != settings.get("timeout")
         {
-            return Err(anyhow!("代理配置在测试期间发生变化，已丢弃旧测试结果"));
+            return Err(abort(
+                Abort::Stale,
+                "代理配置在测试期间发生变化，已丢弃旧测试结果",
+            ));
         }
 
         let recent_success = self.proxy_runtime.recent_success_map().await;

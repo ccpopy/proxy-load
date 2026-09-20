@@ -224,6 +224,7 @@ pub struct HealthEntry {
     pub health: ProbeHealth,
 }
 
+#[derive(Clone)]
 pub struct ProbeWrite {
     pub observation_revision: u64,
     pub generation: Option<u64>,
@@ -232,4 +233,77 @@ pub struct ProbeWrite {
     pub status: Option<String>,
     pub response_time: Option<i64>,
     pub health: ProbeHealth,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProbeAbortKind {
+    Cancelled,
+    QueueTimeout,
+    Configuration,
+    Stale,
+}
+
+#[derive(Debug)]
+pub struct ProbeAbort {
+    pub kind: ProbeAbortKind,
+    message: &'static str,
+}
+impl std::fmt::Display for ProbeAbort {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.message)
+    }
+}
+impl std::error::Error for ProbeAbort {}
+pub fn abort(kind: ProbeAbortKind, message: &'static str) -> anyhow::Error {
+    ProbeAbort { kind, message }.into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn local_and_unknown_results_never_count_as_remote_failure_or_recovery() {
+        for scope in [
+            FailureScope::LocalResource,
+            FailureScope::LocalRoute,
+            FailureScope::Configuration,
+            FailureScope::Unknown,
+        ] {
+            let policy = HealthPolicy {
+                mode: HealthMode::RequiredProbe,
+                ..Default::default()
+            };
+            let old = ProbeHealth {
+                readiness_status: Readiness::NotReady,
+                consecutive_failures: 2,
+                ..Default::default()
+            };
+            let result = TestResult {
+                success: false,
+                response_time: 10,
+                status_code: None,
+                error: None,
+                failure_scope: Some(scope.legacy().into()),
+                diagnostics: crate::proxy::failure::ProbeDiagnostics {
+                    scope: Some(scope),
+                    ..Default::default()
+                },
+            };
+            let next = old.observe(
+                &policy,
+                &result,
+                "http://vpn.test/health?token=private",
+                "node",
+                crate::state::now_millis(),
+            );
+            assert_eq!(next.probe_success_count, 0);
+            assert_eq!(next.probe_failure_count, 0);
+            assert_eq!(next.probe_excluded_count, 1);
+            assert_eq!(next.consecutive_failures, 2);
+            assert_eq!(next.readiness_status, Readiness::NotReady);
+            assert!(!next.eligible(&policy));
+            assert!(!serde_json::to_string(&next).unwrap().contains("private"));
+        }
+    }
 }

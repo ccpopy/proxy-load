@@ -393,7 +393,7 @@ export function App() {
         scheduleRuntimeRefresh(true)
         return
       }
-      if (message.type === "proxy_testing" || message.type === "proxy_tested") {
+      if (["proxy_testing", "proxy_tested", "proxy_probe_discarded"].includes(message.type)) {
         scheduleRuntimeRefresh(false)
         return
       }

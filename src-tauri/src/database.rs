@@ -2598,9 +2598,11 @@ mod tests {
             HealthMode::TransportOnly
         );
 
+        let stale_write = write.clone();
         let mut expired = write;
         expired.health.last_success_at = Some(crate::state::now_millis() - 601_000);
         expired.observation_revision = db.publish_probe_health(proxy.id, &expired);
+        assert!(!db.persist_probe_observation(&proxy, &stale_write).unwrap());
         assert!(!db.probe_is_ready(&proxy, expired.generation));
         assert!(!db.get_proxy(proxy.id).unwrap().unwrap().probe_health.fresh);
         db.invalidate_probe_settings();

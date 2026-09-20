@@ -346,3 +346,41 @@ async fn probe_uses_business_dns_mapping_and_original_http_host() {
     state.proxy_runtime.refresh_dns_cache().await.unwrap();
     assert!(!state.db.current_probe_health(&proxy).fresh);
 }
+
+#[tokio::test]
+async fn startup_always_validates_required_nodes_but_never_disabled_ones() {
+    let state = state();
+    let (port, _, count, server) = socks_fixture().await;
+    let proxy = dedicated(&state, port, 2);
+    let general = add(&state, if port == 19991 { 19990 } else { 19991 });
+    let disabled = dedicated(&state, if port == 19992 { 19993 } else { 19992 }, 2);
+    let mut input: ProxyInput = serde_json::from_value(json!(disabled)).unwrap();
+    input.enabled = Some(0);
+    state.db.update_proxy(disabled.id, input).unwrap();
+    let mut schedule = state.probe_schedule().unwrap();
+    schedule.startup_probe_enabled = false;
+    state
+        .run_startup_probe(&schedule, &mut HashMap::new())
+        .await
+        .unwrap();
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        state
+            .db
+            .get_proxy(proxy.id)
+            .unwrap()
+            .unwrap()
+            .probe_health
+            .probe_success_count,
+        1
+    );
+    assert_eq!(
+        state.db.get_proxy(general.id).unwrap().unwrap().last_test,
+        None
+    );
+    assert_eq!(
+        state.db.get_proxy(disabled.id).unwrap().unwrap().last_test,
+        None
+    );
+    server.abort();
+}
