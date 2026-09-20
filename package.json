@@ -1,6 +1,6 @@
 {
   "name": "proxy-load",
-  "version": "26.9.2002",
+  "version": "26.9.2003",
   "description": "代理负载均衡管理系统",
   "scripts": {
     "test:frontend": "node --experimental-default-type=module --experimental-strip-types --test scripts/frontend-state.test.mjs",
