@@ -5,7 +5,7 @@ import { toast } from "sonner"
 
 import { api } from "@/lib/api"
 import { cn } from "@/lib/utils"
-import { proxyHealthView, probeHealthDetails, entryHandshakeMillis } from "@/lib/proxy-health"
+import { proxyMatchesFilter, proxyHealthView, probeHealthDetails, entryHandshakeMillis } from "@/lib/proxy-health"
 import type { ProxyRecord, TestResult } from "@/types"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -46,12 +46,7 @@ export function ProxiesSection({
   const [testingIds, setTestingIds] = useState<Set<number>>(() => new Set())
   const filtered = useMemo(() => {
     return [...proxies]
-      .filter((proxy) => {
-        if (filter === "all") return true
-        if (filter === "enabled") return proxy.enabled === 1
-        if (filter === "disabled") return proxy.enabled !== 1
-        return proxy.enabled === 1 && proxyHealthView(proxy).key === filter
-      })
+      .filter((proxy) => proxyMatchesFilter(proxy, filter))
       .sort(compareProxyHealth)
   }, [filter, proxies])
 

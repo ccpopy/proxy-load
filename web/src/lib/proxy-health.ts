@@ -25,6 +25,21 @@ export function proxyHealthView(proxy: ProxyRecord): { key: ProxyStatus; label: 
   return { key, label: { active: "在线", inactive: "离线", testing: "测试中", unknown: "未知", degraded: "测活异常" }[key], entry }
 }
 
+export function proxyMatchesFilter(proxy: ProxyRecord, filter: string): boolean {
+  if (filter === "all") return true
+  if (filter === "enabled") return proxy.enabled === 1
+  if (filter === "disabled") return proxy.enabled !== 1
+  return proxyHealthView(proxy).key === filter
+}
+
+export function countProxyHealth(proxies: readonly ProxyRecord[]): Record<ProxyStatus, number> {
+  const counts = { active: 0, inactive: 0, degraded: 0, unknown: 0, testing: 0 }
+  for (const proxy of proxies) {
+    counts[proxyHealthView(proxy).key] += 1
+  }
+  return counts
+}
+
 export function readinessAllowsNewConnections(proxy: ProxyRecord): boolean {
   if (proxy.enabled !== 1) return false
   if (proxy.health_policy?.mode !== "required_probe") return true

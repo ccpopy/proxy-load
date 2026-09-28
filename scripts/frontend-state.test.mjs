@@ -3,7 +3,63 @@ import assert from 'node:assert/strict';
 import { createLatestRequestGuard } from '../web/src/lib/latest-request.ts';
 import * as constants from '../web/src/lib/constants.ts';
 import { advancedSettingsPayload, businessLimitError } from '../web/src/lib/advanced-settings.ts';
-import { proxyHealthView, readinessAllowsNewConnections, probeHealthDescription, probeHealthDetails } from '../web/src/lib/proxy-health.ts';
+import { countProxyHealth, proxyMatchesFilter, proxyHealthView, readinessAllowsNewConnections, probeHealthDescription, probeHealthDetails } from '../web/src/lib/proxy-health.ts';
+
+test('proxy metrics and status filters include disabled proxies shown as offline', () => {
+  const proxies = [
+    { id: 1, enabled: 1, status: 'active' },
+    { id: 2, enabled: 1, status: 'active' },
+    { id: 3, enabled: 1, status: 'active' },
+    { id: 4, enabled: 0, status: 'inactive' },
+    { id: 5, enabled: 0, status: 'inactive' },
+    { id: 6, enabled: 1, status: 'degraded' },
+    { id: 7, enabled: 1, status: 'unknown' },
+    { id: 8, enabled: 1, status: 'testing' },
+  ];
+  const counts = countProxyHealth(proxies);
+  assert.deepEqual(counts, { active: 3, inactive: 2, degraded: 1, unknown: 1, testing: 1 });
+  for (const [status, count] of Object.entries(counts)) {
+    assert.equal(proxies.filter(proxy => proxyMatchesFilter(proxy, status)).length, count);
+  }
+  assert.deepEqual(proxies.filter(proxy => proxyMatchesFilter(proxy, 'inactive')).map(proxy => proxy.id), [4, 5]);
+  assert.equal(proxies.filter(proxy => proxyMatchesFilter(proxy, 'all')).length, 8);
+  assert.equal(proxies.filter(proxy => proxyMatchesFilter(proxy, 'enabled')).length, 6);
+  assert.equal(proxies.filter(proxy => proxyMatchesFilter(proxy, 'disabled')).length, 2);
+  for (const proxy of proxies.filter(proxy => proxy.enabled === 0)) {
+    assert.equal(readinessAllowsNewConnections(proxy), false);
+  }
+});
+
+test('proxy health statistics are independent of the enable switch and handle an empty list', () => {
+  const statuses = ['active', 'inactive', 'degraded', 'unknown', 'testing'];
+  const enabled = statuses.map(status => ({ enabled: 1, status }));
+  const disabled = enabled.map(proxy => ({ ...proxy, enabled: 0 }));
+  const expected = { active: 1, inactive: 1, degraded: 1, unknown: 1, testing: 1 };
+  assert.deepEqual(countProxyHealth(enabled), expected);
+  assert.deepEqual(countProxyHealth(disabled), expected);
+  assert.deepEqual(countProxyHealth([]), { active: 0, inactive: 0, degraded: 0, unknown: 0, testing: 0 });
+  for (const proxy of disabled) {
+    assert.equal(proxyMatchesFilter(proxy, proxy.status), true);
+    assert.equal(proxyMatchesFilter(proxy, 'enabled'), false);
+    assert.equal(proxyMatchesFilter(proxy, 'disabled'), true);
+  }
+});
+
+test('proxy statistics follow health badges without treating all probe failures as offline', () => {
+  const failed = { enabled: 1, status: 'active',
+    probe_health: { fresh: true, transport_status: 'reachable', last_probe_result: { outcome: 'failure' } } };
+  const unreachable = { ...failed, probe_health: { ...failed.probe_health, transport_status: 'unreachable' } };
+  const unready = { ...failed, health_policy: { mode: 'required_probe' },
+    probe_health: { ...failed.probe_health, readiness_status: 'not_ready' } };
+  const stale = { ...unready, probe_health: { ...unready.probe_health, fresh: false } };
+  const proxies = [failed, unreachable, unready, stale];
+  assert.deepEqual(countProxyHealth(proxies), { active: 0, inactive: 2, degraded: 1, unknown: 1, testing: 0 });
+  for (const proxy of proxies) {
+    assert.equal(proxyMatchesFilter(proxy, proxyHealthView(proxy).key), true);
+  }
+  assert.equal(proxyMatchesFilter(failed, 'inactive'), false);
+  assert.equal(proxyMatchesFilter(stale, 'inactive'), false);
+});
 
 test('readiness badges, filters and admission distinguish failed probe from reachable entry', () => {
   const proxy = { enabled: 1, status: 'active', success_count: 99, fail_count: 7,

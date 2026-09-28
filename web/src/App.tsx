@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react"
 import { toast } from "sonner"
 import { createLatestRequestGuard } from "@/lib/latest-request"
 import { updateAction } from "@/lib/update-action"
-import { proxyHealthView } from "@/lib/proxy-health"
+import { countProxyHealth } from "@/lib/proxy-health"
 
 import {
   api,
@@ -464,12 +464,7 @@ export function App() {
 
   const currentTitle =
     navItems.find((item) => item.key === section)?.label ?? "代理配置"
-  const activeCount = proxies.filter(
-    (proxy) => proxy.enabled === 1 && proxyHealthView(proxy).key === "active"
-  ).length
-  const failedCount = proxies.filter(
-    (proxy) => proxy.enabled === 1 && proxyHealthView(proxy).key === "inactive"
-  ).length
+  const { active: activeCount, inactive: failedCount } = countProxyHealth(proxies)
 
   async function handleRefresh() {
     setLoading(true)
