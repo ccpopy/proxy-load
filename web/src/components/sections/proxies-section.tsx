@@ -1,12 +1,12 @@
 import { useMemo, useState, type ReactNode } from "react"
-import { ChevronRight, Edit, Loader2, Plus, Server, Trash2, Zap } from "lucide-react"
+import { ChevronDown, Edit, Loader2, Plus, Server, Trash2, Zap } from "lucide-react"
 import { Collapsible } from "radix-ui"
 import { toast } from "sonner"
 
 import { api } from "@/lib/api"
 import { cn } from "@/lib/utils"
 import { proxyMatchesFilter, proxyHealthView, probeHealthDetails, entryHandshakeMillis } from "@/lib/proxy-health"
-import type { ProxyRecord, TestResult } from "@/types"
+import type { ProxyRecord, ProxyStatus, TestResult } from "@/types"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
@@ -30,6 +30,14 @@ const FILTERS = [
   ["testing", "测试中"],
   ["disabled", "未启用"],
 ] as const
+
+const HEALTH_ACCENT: Record<ProxyStatus, string> = {
+  active: "bg-success",
+  inactive: "bg-destructive",
+  degraded: "bg-warning",
+  testing: "bg-warning",
+  unknown: "bg-muted-foreground/40",
+}
 
 export function ProxiesSection({
   proxies,
@@ -112,86 +120,97 @@ export function ProxiesSection({
             ))}
           </TabsList>
           <TabsContent value={filter} className="mt-4">
-            <div className="grid gap-2.5">
+            <div className="grid gap-2">
               {filtered.map((proxy) => {
                 const isTesting = testingIds.has(proxy.id)
+                const disabled = proxy.enabled !== 1
+                const health = proxyHealthView(proxy)
                 return (
                   <Collapsible.Root
                     key={proxy.id}
-                    className="group relative grid gap-3 rounded-md border bg-card/40 p-4 transition-colors hover:border-primary/40 hover:bg-card lg:grid-cols-[1fr_auto] lg:items-center"
+                    className="group/proxy relative overflow-hidden rounded-md border bg-card/40 transition-[border-color,background-color,box-shadow] duration-200 hover:border-primary/40 hover:bg-card data-[state=open]:border-primary/40 data-[state=open]:bg-card data-[state=open]:shadow-sm"
                   >
-                  <div className="min-w-0">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <span className="truncate font-medium">{proxy.name}</span>
-                      <StatusBadge proxy={proxy} />
-                      <span className="text-xs text-muted-foreground">{proxyHealthView(proxy).entry}</span>
-                      <span className="rounded-sm border border-border bg-muted/50 px-1.5 py-0.5 font-mono text-[0.7rem] uppercase tracking-wider text-muted-foreground">
-                        {proxy.type}
-                      </span>
-                      {proxy.enabled !== 1 && (
-                        <Badge variant="secondary">未启用</Badge>
+                    <span
+                      aria-hidden="true"
+                      className={cn(
+                        "absolute inset-y-0 left-0 w-1",
+                        disabled ? "bg-muted-foreground/25" : HEALTH_ACCENT[health.key],
+                        isTesting && "animate-pulse"
                       )}
+                    />
+                    <div className="grid items-center gap-x-6 gap-y-3 py-3 pr-3 pl-5 sm:grid-cols-[minmax(0,1fr)_auto] lg:grid-cols-[minmax(0,1fr)_6.5rem_8rem_auto]">
+                      <div className={cn("flex min-w-0 flex-col gap-1", disabled && "opacity-60")}>
+                        <div className="flex min-w-0 items-center gap-2">
+                          <span className="truncate font-medium">{proxy.name}</span>
+                          <StatusBadge proxy={proxy} />
+                          {disabled && <Badge variant="secondary">未启用</Badge>}
+                        </div>
+                        <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
+                          <span className="rounded-sm bg-muted px-1 font-mono text-[0.65rem] uppercase tracking-wider">
+                            {proxy.type}
+                          </span>
+                          <span className="truncate font-mono">{proxy.host}:{proxy.port}</span>
+                          <EntryStatus proxy={proxy} label={health.entry} />
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-1 max-sm:justify-end sm:col-start-2 sm:row-start-1 lg:col-start-4">
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          disabled={isTesting}
+                          aria-busy={isTesting}
+                          onClick={() => testProxy(proxy)}
+                        >
+                          {isTesting ? <Loader2 className="animate-spin" /> : <Zap />}
+                          {isTesting ? "测试中" : "测试"}
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="icon-sm"
+                          aria-label="编辑"
+                          title="编辑"
+                          className="text-muted-foreground hover:text-foreground"
+                          onClick={() => onEdit(proxy)}
+                        >
+                          <Edit />
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="icon-sm"
+                          aria-label="删除"
+                          title="删除"
+                          className="text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
+                          onClick={() => deleteProxy(proxy)}
+                        >
+                          <Trash2 />
+                        </Button>
+                        <Collapsible.Trigger asChild>
+                          <Button
+                            variant="ghost"
+                            size="icon-sm"
+                            aria-label="测活详情"
+                            title="测活详情"
+                            className="text-muted-foreground hover:text-foreground data-[state=open]:bg-muted data-[state=open]:text-foreground"
+                          >
+                            <ChevronDown className="transition-transform duration-200 group-data-[state=open]/proxy:rotate-180 motion-reduce:transition-none" />
+                          </Button>
+                        </Collapsible.Trigger>
+                      </div>
+                      <div className="flex flex-wrap items-center gap-x-6 gap-y-2 sm:col-span-2 lg:col-span-2 lg:col-start-2 lg:row-start-1 lg:grid lg:grid-cols-subgrid">
+                        <HandshakeMetric value={entryHandshakeMillis(proxy)} dimmed={disabled} />
+                        <ProbeMetric
+                          success={proxy.probe_health?.probe_success_count ?? 0}
+                          failure={proxy.probe_health?.probe_failure_count ?? 0}
+                          dimmed={disabled}
+                        />
+                      </div>
                     </div>
-                    <div className="mt-2.5 grid gap-x-6 gap-y-1.5 md:grid-cols-2 xl:grid-cols-[minmax(16rem,1.8fr)_minmax(6rem,0.7fr)_minmax(6rem,0.7fr)_minmax(6rem,0.7fr)]">
-                      <Stat label="地址" value={`${proxy.host}:${proxy.port}`} />
-                      <Stat
-                        label="入口握手"
-                        value={
-                          entryHandshakeMillis(proxy) != null
-                            ? `${entryHandshakeMillis(proxy)} ms`
-                            : "—"
-                        }
-                      />
-                      <Stat label="测活成功" value={proxy.probe_health?.probe_success_count ?? 0} tone="success" />
-                      <Stat label="测活失败" value={proxy.probe_health?.probe_failure_count ?? 0} tone="danger" />
-                    </div>
-                    <Collapsible.Trigger className="group/probe-details mt-2 flex w-fit cursor-pointer items-center gap-1 rounded-sm text-xs text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background">
-                      <ChevronRight
-                        aria-hidden="true"
-                        className="size-3.5 shrink-0 transition-transform duration-150 group-data-[state=open]/probe-details:rotate-90 motion-reduce:transition-none"
-                      />
-                      测活详情
-                    </Collapsible.Trigger>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      disabled={isTesting}
-                      aria-busy={isTesting}
-                      onClick={() => testProxy(proxy)}
-                    >
-                      {isTesting ? <Loader2 className="animate-spin" /> : <Zap />}
-                      {isTesting ? "测试中" : "测试"}
-                    </Button>
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={() => onEdit(proxy)}
-                    >
-                      <Edit />
-                      编辑
-                    </Button>
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      className="text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
-                      onClick={() => deleteProxy(proxy)}
-                    >
-                      <Trash2 />
-                      删除
-                    </Button>
-                  </div>
-                  <Collapsible.Content className="min-w-0 border-t pt-3 text-xs text-muted-foreground lg:col-span-2">
-                    <ul aria-label="测活详情" className="flex flex-wrap gap-x-8 gap-y-1.5 leading-relaxed">
-                      {probeHealthDetails(proxy).map((detail, index) => (
-                        <li key={index} className="min-w-fit max-w-full grow basis-[calc(50%_-_1rem)] [overflow-wrap:anywhere]">
-                          {detail}
-                        </li>
-                      ))}
-                    </ul>
-                  </Collapsible.Content>
-                </Collapsible.Root>
+                    <Collapsible.Content className="overflow-hidden data-[state=closed]:animate-collapsible-up data-[state=open]:animate-collapsible-down motion-reduce:animate-none">
+                      <div className="border-t border-dashed bg-muted/25 py-3 pr-4 pl-5">
+                        <ProbeDetails details={probeHealthDetails(proxy)} />
+                      </div>
+                    </Collapsible.Content>
+                  </Collapsible.Root>
                 )
               })}
               {filtered.length === 0 && (
@@ -205,30 +224,86 @@ export function ProxiesSection({
   )
 }
 
-function Stat({
-  label,
-  value,
-  tone,
-}: {
-  label: string
-  value: ReactNode
-  tone?: "success" | "danger"
-}) {
+function MetricLabel({ children }: { children: ReactNode }) {
+  return <span className="whitespace-nowrap text-[0.7rem] text-muted-foreground/80">{children}</span>
+}
+
+function HandshakeMetric({ value, dimmed }: { value: number | null; dimmed: boolean }) {
   return (
-    <span className="grid min-w-0 grid-cols-[2.75rem_minmax(0,1fr)] items-baseline gap-1.5 text-sm">
-      <span className="whitespace-nowrap text-[0.7rem] uppercase tracking-wider text-muted-foreground/70">
-        {label}
-      </span>
-      <span
-        className={cn(
-          "truncate font-mono tabular-nums text-foreground/90",
-          tone === "success" && "text-success",
-          tone === "danger" && "text-destructive"
+    <div className={cn("flex items-baseline gap-2 lg:flex-col lg:gap-1", dimmed && "opacity-60")}>
+      <MetricLabel>入口握手</MetricLabel>
+      <span className="font-mono text-base tabular-nums leading-none">
+        {value != null ? (
+          <>
+            {value}
+            <span className="ml-0.5 text-xs text-muted-foreground">ms</span>
+          </>
+        ) : (
+          <span className="text-muted-foreground/60">—</span>
         )}
-      >
-        {value}
       </span>
+    </div>
+  )
+}
+
+function ProbeMetric({ success, failure, dimmed }: { success: number; failure: number; dimmed: boolean }) {
+  const total = success + failure
+  return (
+    <div className={cn("flex items-baseline gap-2 lg:flex-col lg:gap-1", dimmed && "opacity-60")}>
+      <MetricLabel>测活 成功 / 失败</MetricLabel>
+      <span className="font-mono text-sm tabular-nums leading-none">
+        <span className={success > 0 ? "text-success" : "text-muted-foreground/60"}>{success}</span>
+        <span className="px-1 text-muted-foreground/50">/</span>
+        <span className={failure > 0 ? "text-destructive" : "text-muted-foreground/60"}>{failure}</span>
+      </span>
+      <span aria-hidden="true" className="hidden h-1 w-full overflow-hidden rounded-full bg-muted lg:flex">
+        {total > 0 && (
+          <>
+            <span className="bg-success" style={{ width: `${(success / total) * 100}%` }} />
+            <span className="bg-destructive/70" style={{ width: `${(failure / total) * 100}%` }} />
+          </>
+        )}
+      </span>
+    </div>
+  )
+}
+
+function EntryStatus({ proxy, label }: { proxy: ProxyRecord; label: string }) {
+  const status = proxy.probe_health?.transport_status
+  return (
+    <span className="inline-flex items-center gap-1.5 whitespace-nowrap">
+      <span
+        aria-hidden="true"
+        className={cn(
+          "size-1.5 rounded-full",
+          status === "reachable" ? "bg-success" : status === "unreachable" ? "bg-destructive" : "bg-muted-foreground/50"
+        )}
+      />
+      {label}
     </span>
+  )
+}
+
+function ProbeDetails({ details }: { details: string[] }) {
+  return (
+    <dl aria-label="测活详情" className="grid gap-x-8 gap-y-3 text-xs sm:grid-cols-2 xl:grid-cols-3">
+      {details.map((detail, index) => {
+        const separator = detail.indexOf("：")
+        if (separator < 0) {
+          return (
+            <dd key={index} className="rounded-sm bg-muted/60 px-2 py-1 text-muted-foreground [overflow-wrap:anywhere] sm:col-span-full">
+              {detail}
+            </dd>
+          )
+        }
+        return (
+          <div key={index} className="flex min-w-0 flex-col gap-0.5">
+            <dt className="text-[0.7rem] text-muted-foreground/80">{detail.slice(0, separator)}</dt>
+            <dd className="text-foreground/85 [overflow-wrap:anywhere]">{detail.slice(separator + 1)}</dd>
+          </div>
+        )
+      })}
+    </dl>
   )
 }
 
