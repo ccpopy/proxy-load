@@ -2046,6 +2046,9 @@ mod tests {
 
     #[test]
     fn compares_new_calendar_day_after_previous_revision() {
+        assert!(
+            VersionParts::parse("26.9.28").unwrap() > VersionParts::parse("26.9.2101").unwrap()
+        );
         assert!(VersionParts::parse("26.6.10").unwrap() > VersionParts::parse("26.6.501").unwrap());
         assert!(
             VersionParts::parse("26.6.16").unwrap() > VersionParts::parse("26.6.1002").unwrap()
